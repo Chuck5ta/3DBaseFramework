@@ -5,8 +5,8 @@ new class, `MyGame`, so the original `DemoGame` stays available for comparison. 
 every step you can build and run the game and see the result.
 
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
-textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad, and
-animation on the fixed timestep with interpolation.
+textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
+animation on the fixed timestep with interpolation, and a 2D text HUD on top of the 3D scene.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -19,6 +19,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [4](#step-4--a-fly-camera) | Mouse/keyboard/gamepad camera | Fly around the scene |
 | [5](#step-5--many-objects-and-animation) | Spheres, a crate ring, fixed-step animation | The full demo scene, moving |
 | [6](#step-6--a-moving-sun-wireframe-and-vsync) | Moving sun, wireframe, vsync toggles | Shifting light; debug views |
+| [7](#step-7--a-text-hud) | A 2D overlay with a font | Stats, wireframe tag and a help panel |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -32,6 +33,14 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 A game is a class derived from `core::Game`. `core::Application` owns the window, input
 and GPU, runs the main loop and calls your class's hooks (`onInit`, `onUpdate`,
 `onRender`, …). Every hook is optional; this first version only uses `onUpdate` to quit.
+
+> **Adding files in Visual Studio.** You never need to edit CMake for new source files:
+> anything under `src/` is picked up automatically on the next build. Create the files from
+> **File Explorer**, or in Solution Explorer switch to **Folder View** (the *Switch between
+> solutions and available views* button) and use *Add → New File* on `src/game`.
+> **Avoid *Add → New Item* in the *CMake Targets View*:** Visual Studio then tries to add
+> the file to a CMake target itself, and can edit the wrong CMake script (for example
+> `cmake/Dependencies.cmake`), which breaks the configure step.
 
 Create **`src/game/MyGame.h`**:
 
@@ -597,6 +606,125 @@ Things to notice:
 **Run it:** watch the light and shading on the crates shift as the sun circles; F1 for
 wireframe, V for vsync.
 
+---
+
+## Step 7 — A text HUD
+
+Game3D includes the same `render2d` module as Game2D: `SpriteBatch`, `Camera2D` and
+**`Font`**. A `SpriteBatch` can draw inside the 3D main pass (it ignores the depth buffer),
+so a HUD is just a second set of draw calls after the meshes, with a 2D camera where one
+unit is one screen pixel.
+
+A **`render2d::Font`** loads a TrueType/OpenType file and bakes its characters into a
+texture atlas with stb_truetype; **`SpriteBatch::drawText`** draws the characters as small
+quads. The project ships **Roboto Medium** in `assets/fonts/` (Apache 2.0 licence; see the
+README there).
+
+In **`MyGame.h`**, add the includes
+
+```cpp
+#include "render2d/Camera2D.h"
+#include "render2d/SpriteBatch.h"
+```
+
+and the overlay members:
+
+```cpp
+    // 2D overlay for the HUD, drawn on top of the 3D scene.
+    std::unique_ptr<render2d::SpriteBatch> hud_;
+    render2d::Camera2D hudCamera_;
+    render2d::Font font_;
+    bool showHelp_ = true;
+```
+
+In **`MyGame.cpp`**, add `#include <cstdio>`. Create the overlay in `onInit` (before the
+camera setup):
+
+```cpp
+    // 2D overlay: a SpriteBatch works inside the 3D pass too (it ignores depth).
+    hud_ = std::make_unique<render2d::SpriteBatch>(gpu, app.renderer());
+    font_ = render2d::Font::load(gpu, core::assetPath("fonts/Roboto-Medium.ttf"));
+```
+
+destroy it in `onShutdown` next to the mesh renderer,
+
+```cpp
+    hud_.reset();
+```
+
+and toggle the help panel with **H** in `onUpdate`, after the other toggles:
+
+```cpp
+    if (in.keyPressed(SDL_SCANCODE_H))
+        showHelp_ = !showHelp_;
+```
+
+Then, in `onRender`, draw the HUD after `meshRenderer_->end();`:
+
+```cpp
+    // ===== HUD: 2D text and shapes on top, with a camera where 1 unit = 1 pixel =====
+    const glm::vec2 viewport(float(frame.extent.width), float(frame.extent.height));
+    hudCamera_.setViewport(viewport.x, viewport.y);
+    hudCamera_.position = viewport * 0.5f;
+    hud_->begin(frame, hudCamera_.viewProjection());
+
+    const float ui = std::max(1.0f, viewport.y / 720.0f);
+    render2d::TextStyle text;
+    text.size = 16.0f * ui;
+    text.snapToPixel = true;
+
+    // Top left: performance and camera info, with a soft shadow for readability.
+    char info[160];
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %.1f, %.1f, %.1f",
+                  double(app.fps()), meshRenderer_->drawCalls(), double(camera_.position.x),
+                  double(camera_.position.y), double(camera_.position.z));
+    render2d::TextStyle shadow = text;
+    shadow.color = {0.0f, 0.0f, 0.0f, 0.5f};
+    hud_->drawText(font_, info, glm::vec2(17.0f, 13.0f) * ui, shadow);
+    hud_->drawText(font_, info, glm::vec2(16.0f, 12.0f) * ui, text);
+
+    // Top right: wireframe indicator.
+    if (meshRenderer_->wireframe()) {
+        render2d::TextStyle tag = text;
+        tag.align = render2d::TextAlign::Right;
+        tag.color = render2d::colors::Yellow;
+        hud_->drawText(font_, "WIREFRAME", {viewport.x - 16.0f * ui, 12.0f * ui}, tag);
+    }
+
+    // Bottom: a help panel, sized to fit its text.
+    if (showHelp_) {
+        const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
+                           "Shift: fast      F1 / (Y): wireframe      V: vsync      H: hide help";
+        render2d::TextStyle style = text;
+        style.align = render2d::TextAlign::Center;
+        const glm::vec2 size = font_.measure(help, style.size);
+        const glm::vec2 top(viewport.x * 0.5f, viewport.y - size.y - 24.0f * ui);
+        const glm::vec2 margin(14.0f * ui, 8.0f * ui);
+        hud_->drawRect({top.x - size.x * 0.5f - margin.x, top.y - margin.y}, size + margin * 2.0f,
+                       {0.0f, 0.0f, 0.0f, 0.5f});
+        hud_->drawText(font_, help, top, style);
+    }
+
+    hud_->end();
+```
+
+Things to notice:
+
+- **Order matters, depth doesn't.** The HUD is drawn after the scene, and the sprite
+  pipeline doesn't test depth, so it always appears on top.
+- **`TextStyle`** controls size (pixels here), colour, alignment (`Left`, `Center`,
+  `Right` relative to the position) and line spacing; `'\n'` starts a new line.
+  `snapToPixel` keeps glyphs on whole pixels for crisp HUD text.
+- **A shadow** is the same text drawn one pixel down-right in translucent black first: a
+  cheap way to keep text readable over bright scenery.
+- **`font.measure`** gives the size of a block of text before drawing it, used here to fit
+  the help panel's background.
+- **Baked size vs drawn size.** The font is rasterised once at 48 px and scaled when drawn;
+  text is sharpest at or a little below that size. Change it with `FontDesc::pixelHeight`.
+
+**Run it:** frame rate, draw calls and the camera position at the top left, a yellow
+"WIREFRAME" tag when F1 is on, and a help panel at the bottom (**H** hides it).
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -619,3 +747,5 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
    buffer; essential for forests, crowds and particles.
 7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
+8. **World-space labels.** Project a 3D position to the screen with
+   `camera.viewProjection()` and draw a name tag there with the HUD batch.

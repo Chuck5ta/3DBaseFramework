@@ -34,13 +34,16 @@ The code is split into four layers. Each layer only depends on the layers below 
 flowchart TD
     game["game/  (DemoGame or your game)"]
     r3d["render3d/  MeshRenderer · Mesh · Camera3D"]
+    r2d["render2d/  SpriteBatch · Camera2D · Font (HUD)"]
     core["core/  Application · Window · Input · Paths · Log"]
     gfx["gfx/  VulkanContext · Swapchain · Renderer · Buffer · Image · Texture · Pipeline · Descriptors"]
     third["Third party: SDL3 · volk · Vulkan-Headers · VMA · GLM · stb_image"]
 
     game --> r3d
+    game --> r2d
     game --> core
     r3d --> gfx
+    r2d --> gfx
     core --> gfx
     gfx --> third
     core --> third
@@ -50,6 +53,7 @@ flowchart TD
 |---|---|---|---|
 | `src/core` | `core` | Program lifetime, main loop, window, input, file paths, logging | Yes, identical |
 | `src/gfx` | `gfx` | Everything Vulkan: device, swapchain, frames, memory, textures, pipelines | Yes, identical |
+| `src/render2d` | `render2d` | 2D overlay: sprites, cameras, text (used for the HUD) | Yes, identical |
 | `src/render3d` | `render3d` | 3D-specific rendering on top of `gfx` | No |
 | `src/game` | (global) | The actual game; replaceable | No |
 
@@ -70,7 +74,7 @@ src/
     Log.h                     LOG_* macros, core::fatal()
   gfx/
     VkCommon.h                single Vulkan include (vulkan.h + volk + VMA), VK_CHECK
-    Implementations.cpp       VMA and stb_image implementation units
+    Implementations.cpp       VMA, stb_image and stb_truetype implementation units
     VulkanContext.h/.cpp      instance, debug messenger, GPU selection, device, VMA
     Swapchain.h/.cpp          swapchain + image views + per-image semaphores
     Renderer.h/.cpp           frames in flight, acquire/submit/present, main pass
@@ -79,6 +83,10 @@ src/
     Texture.h/.cpp            Image + sampler + descriptor set, mip generation
     Pipeline.h/.cpp           Pipeline (RAII) + PipelineBuilder, SPIR-V loading
     Descriptors.h/.cpp        layout builder, growable allocator, writer
+  render2d/                   shared with Game2D; used here for the HUD
+    Camera2D.h/.cpp           orthographic camera (screen space for the HUD)
+    SpriteBatch.h/.cpp        batched textured quads, drawText
+    Font.h/.cpp               TrueType font baked into an atlas (stb_truetype)
   render3d/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
@@ -88,6 +96,7 @@ src/
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
   mesh.vert, mesh.frag        the mesh shaders
+  sprite.vert, sprite.frag    the 2D overlay shaders (shared with Game2D)
 assets/                       runtime data (copied next to the executable)
 cmake/                        Dependencies.cmake, Shaders.cmake
 ```
@@ -226,6 +235,23 @@ API: `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`, `end
 - `SceneLighting`: sun direction/colour/intensity, sky and ground ambient colours with an
   ambient intensity, fog colour and density. All colours are sRGB.
 
+### 3.4 render2d (HUD)
+
+Game3D includes Game2D's `render2d` module unchanged. A `SpriteBatch` can draw inside the
+3D main pass: its pipeline is created with the renderer's depth format but doesn't test or
+write depth, so a HUD drawn after the meshes always appears on top. The demo uses a
+`Camera2D` positioned at the screen centre (one unit = one pixel) for its HUD.
+
+**`render2d::SpriteBatch`**: batched textured quads; `draw`, `drawRect`, `drawLine`,
+`drawText`. **`render2d::Camera2D`**: orthographic camera (+Y down).
+
+**`render2d::Font`**: a TrueType/OpenType font baked into a texture atlas (details in
+§6.4). `Font::load(gpu, path, FontDesc)` rasterises a contiguous range of characters
+(default: printable ASCII + Latin-1) at `FontDesc::pixelHeight` (default 48 px).
+`measure(text, size)`, `lineHeight(size)` and `ascent(size)` support layout. Text is drawn
+with `SpriteBatch::drawText(font, utf8, position, TextStyle)`; `TextStyle` sets size,
+colour, alignment (`Left`/`Center`/`Right`), line spacing and pixel snapping.
+
 ---
 
 ## 4. Object ownership and lifetime
@@ -246,6 +272,7 @@ flowchart LR
     g --> mr["MeshRenderer"]
     g --> meshes["Meshes (vertex + index Buffer)"]
     g --> tex["Textures"]
+    g --> hud["SpriteBatch + Font (HUD)"]
     mr --> pipe["Pipeline (solid) + Pipeline (wireframe)"]
     mr --> ubo["frame uniform Buffer[N] + descriptor sets"]
 ```
@@ -448,6 +475,30 @@ The clear colour is set to the (linearised) fog colour, so distant geometry fade
 into the background. Shared declarations live in `shaders/common.glsl`, included by both
 stages with `GL_GOOGLE_include_directive`.
 
+### 6.5 Text
+
+```mermaid
+flowchart LR
+    ttf["assets/fonts/*.ttf"] -->|"Font::load: stb_truetype packs glyphs"| atlas["Atlas texture<br/>RGB white, A = coverage<br/>+ glyph table (UVs, offsets, advance)"]
+    atlas --> draw["SpriteBatch::drawText<br/>UTF-8 decode, kerning, alignment<br/>one quad per visible glyph"]
+    draw --> batch["Same sprite pipeline & batching<br/>(text = textured quads)"]
+```
+
+- **Baking (load time).** `stbtt_PackFontRange` rasterises every character in the range into
+  the smallest square atlas that fits (256 to 4096 px), with 2× horizontal oversampling for
+  smoother sub-pixel placement. Coverage goes into the alpha channel of a white RGBA texture,
+  so the ordinary sprite shader draws and tints text: no extra pipeline or shader.
+- **Mipmaps and filtering.** Smooth fonts (`FontDesc::smooth`, the default) use linear
+  filtering and mipmaps, so text drawn below the baked size stays clean. Pixel fonts use
+  nearest filtering and should be drawn at whole multiples of their size.
+- **Layout (draw time).** `drawText` decodes UTF-8, applies kerning between pairs, handles
+  `'\n'`, and aligns each line left, centre or right of the given position, which is the
+  **top** of the first line. Characters outside the baked range render as `?`.
+- **Crisp HUD text.** With a 1:1 screen-space camera, `TextStyle::snapToPixel` rounds the
+  start position and baselines to whole pixels.
+- **Cost.** Text is just more quads in the batch; consecutive text and sprites from the same
+  atlas share draw calls. The font keeps the `.ttf` data in memory for kerning lookups.
+
 ---
 
 ## 7. Coordinate systems and colour
@@ -508,7 +559,7 @@ maps, roughness, masks) must use `TextureDesc::srgb = false`.
 | volk | SDK 1.4.350.0 | runtime Vulkan loader | compiled into `third_party` |
 | VMA | 3.3.0 | GPU memory allocation | header (impl in `Implementations.cpp`) |
 | GLM | 1.0.1 | vector/matrix math | headers |
-| stb | pinned commit | image loading | header (impl in `Implementations.cpp`) |
+| stb | pinned commit | image loading (stb_image), font rasterisation (stb_truetype) | header (impl in `Implementations.cpp`) |
 
 Global definitions: `VK_NO_PROTOTYPES`, `GLM_FORCE_DEPTH_ZERO_TO_ONE`,
 `GLM_FORCE_RADIANS`.
@@ -581,7 +632,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Blinn-Phong + hemisphere ambient + fog | Small, readable shader that looks good immediately | Not PBR; replace when materials need it |
 | Wait-idle on swapchain recreation | Simplest correct approach | Brief stall on resize only |
 | Fixed-timestep simulation | Deterministic gameplay, frame-rate independent | Needs interpolation for smooth rendering |
-| Identical `core/` + `gfx/` in 2D and 3D | Each project stands alone and is easy to understand | Changes must be copied between projects (or factored into a shared library later) |
+| Identical `core/`, `gfx/` and `render2d/` in 2D and 3D | Each project stands alone and is easy to understand | Changes must be copied between projects (or factored into a shared library later) |
 
 ---
 
@@ -593,7 +644,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - No anti-aliasing (MSAA, FXAA or TAA).
 - No frustum culling or instancing; one draw call per object.
 - No skybox (the fog-coloured clear colour stands in for the sky).
-- No text rendering, audio or debug UI (Dear ImGui with `imgui_impl_sdl3` +
+- No audio or debug UI (Dear ImGui with `imgui_impl_sdl3` +
   `imgui_impl_vulkan` integrates cleanly).
 - No deferred resource destruction; destroy GPU objects only when idle (see §4).
 - Single queue for graphics/transfer; uploads are blocking (`immediateSubmit`).

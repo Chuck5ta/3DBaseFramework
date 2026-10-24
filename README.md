@@ -10,12 +10,14 @@ scene showing how they fit together.
 | Platform | Window, keyboard/mouse, gamepads (incl. Steam Deck controls), hi-DPI | SDL3 |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
+| HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Math / images | Vectors & matrices, PNG/JPG loading | GLM, stb_image |
 
 All dependencies are downloaded automatically by CMake at a pinned version.
 
 For a deeper look at how it all fits together, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Step-by-step build instructions for Windows, Linux and Steam Deck are in [docs/BUILDING.md](docs/BUILDING.md).
+To learn the framework by rebuilding the demo step by step, follow [docs/TUTORIAL.md](docs/TUTORIAL.md).
 
 ---
 
@@ -103,6 +105,9 @@ src/
     Texture             image + sampler + ready-to-bind descriptor set
     Pipeline            PipelineBuilder (dynamic rendering, no render passes)
     Descriptors         layout builder, growable allocator, writer
+  render2d/             shared with Game2D, used for the HUD
+    SpriteBatch         batched quads + drawText
+    Font                .ttf/.otf baked into a texture atlas
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
     MeshRenderer        lit textured meshes (frame UBO, per-object push constants)
@@ -111,12 +116,12 @@ src/
     DemoGame            the example — replace with your game
 shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatically
                         (*.glsl files are shared includes, e.g. common.glsl)
-assets/                 copied next to the exe
+assets/                 copied next to the exe (fonts/ has Roboto Medium, Apache 2.0)
 cmake/                  dependency + shader build logic
 ```
 
-`core/` and `gfx/` are identical in Game2D and Game3D, so improvements can be copied
-between them (or later moved into a shared library).
+`core/`, `gfx/` and `render2d/` are identical in Game2D and Game3D, so improvements can be
+copied between them (or later moved into a shared library).
 
 ---
 
@@ -193,6 +198,7 @@ Tips
 | Up / down | Space or E / Ctrl or Q | Right / left trigger |
 | Move faster | Shift | Click left stick |
 | Wireframe | F1 | Y |
+| Show/hide help | H | |
 | Toggle vsync | V | |
 | Fullscreen | F11 / Alt+Enter | |
 | Quit | Esc (first press releases the mouse) | View (Back) |
