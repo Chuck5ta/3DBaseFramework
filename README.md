@@ -2,7 +2,7 @@
 
 A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**.
 You own all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a
-depth buffer, and a lit, textured mesh renderer with a fly camera, plus a demo
+depth buffer, a lit, textured mesh renderer with a fly camera and 3D audio, plus a demo
 scene showing how they fit together.
 
 | Layer | What it does | Library |
@@ -11,6 +11,7 @@ scene showing how they fit together.
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
+| Audio | 3D positional sound, effects, streamed music with crossfades, mixer, mute | miniaudio |
 | Math / images | Vectors & matrices, PNG/JPG loading | GLM, stb_image |
 
 All dependencies are downloaded automatically by CMake at a pinned version.
@@ -91,13 +92,15 @@ For a distributable folder: `cmake --install build/release --prefix dist`.
 ```
 src/
   main.cpp              configure window/renderer, run the game
-  core/                 platform layer (shared with Game3D)
+  core/                 platform layer (shared with Game2D)
     Application         owns everything, runs the main loop
     Window              SDL window, Vulkan surface, fullscreen
     Input               keyboard, mouse, gamepad (pressed / down / released)
     Paths               shaderPath(), assetPath()
     Log.h               LOG_INFO/WARN/ERROR, core::fatal()
-  gfx/                  Vulkan layer (shared with Game3D)
+  audio/                sound effects, music, 3D sound (shared with Game2D)
+    AudioEngine         miniaudio: cached effects, streamed music, listener, mixer
+  gfx/                  Vulkan layer (shared with Game2D)
     VulkanContext       instance, GPU selection, device, queues, VMA, immediateSubmit
     Swapchain           creation/recreation, per-image semaphores
     Renderer            frames in flight, acquire/submit/present, main pass
@@ -116,11 +119,12 @@ src/
     DemoGame            the example — replace with your game
 shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatically
                         (*.glsl files are shared includes, e.g. common.glsl)
-assets/                 copied next to the exe (fonts/ has Roboto Medium, Apache 2.0)
+assets/                 copied next to the exe (fonts/: Roboto Medium, Apache 2.0;
+                        sounds/: demo sounds, CC0)
 cmake/                  dependency + shader build logic
 ```
 
-`core/`, `gfx/` and `render2d/` are identical in Game2D and Game3D, so improvements can be
+`core/`, `gfx/`, `audio/` and `render2d/` are identical in Game2D and Game3D, so improvements can be
 copied between them (or later moved into a shared library).
 
 ---
@@ -187,6 +191,9 @@ Tips
   before the main pass begins.
 - Destroying a texture/buffer that an in-flight frame still uses is an error; call
   `app.renderer().waitIdle()` first (or destroy in `onShutdown`).
+- Sound: `app.audio().play(path, {.spatial = true, .position = p})` for 3D sound, with
+  `app.audio().setListener(camera.position, camera.forward(), camera.up())` each frame;
+  music: `app.audio().playMusic(core::assetPath("music/theme.ogg"))`. WAV, FLAC, MP3, OGG.
 - Validation layers are on in Debug builds (set `GAME_VALIDATION=0/1` to override). Keep
   the console clean of validation errors.
 
@@ -198,6 +205,7 @@ Tips
 | Up / down | Space or E / Ctrl or Q | Right / left trigger |
 | Move faster | Shift | Click left stick |
 | Wireframe | F1 | Y |
+| Mute sound | M | |
 | Show/hide help | H | |
 | Toggle vsync | V | |
 | Fullscreen | F11 / Alt+Enter | |
@@ -244,5 +252,5 @@ limits (Steam's performance overlay helps), suspend/resume (swapchain recreation
 - **MSAA or FXAA/TAA** for smoother edges.
 - **Debug UI:** Dear ImGui (`imgui_impl_sdl3` + `imgui_impl_vulkan` work with dynamic rendering).
 - **Physics:** Jolt Physics.
-- **Audio:** SDL3 audio streams, or miniaudio.
+- **Music:** add a track to `assets/music/` and call `app.audio().playMusic(...)`.
 - **Frustum culling and instancing** once scenes get large.

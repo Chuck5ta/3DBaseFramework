@@ -62,6 +62,21 @@ void DemoGame::onInit(core::Application& app)
     hud_ = std::make_unique<render2d::SpriteBatch>(gpu, app.renderer());
     font_ = render2d::Font::load(gpu, core::assetPath("fonts/Roboto-Medium.ttf"));
 
+    // Sounds: a hum that loops forever, placed on the big crate (spatial = 3D), and
+    // a chime to play from the spheres. preload() decodes it now, avoiding a delay
+    // the first time it plays.
+    audio::PlayParams hum;
+    hum.volume = 0.6f;
+    hum.loop = true;
+    hum.spatial = true;
+    hum.position = {0.0f, 1.5f, 0.0f};
+    hum.minDistance = 2.0f;  // full volume within 2 units
+    hum.maxDistance = 60.0f;
+    crateHum_ = app.audio().play(core::assetPath("sounds/hum_loop.wav"), hum);
+
+    pingSound_ = core::assetPath("sounds/ping.wav");
+    app.audio().preload(pingSound_);
+
     camera_.position = {0.0f, 3.0f, 10.0f};
     camera_.lookAt({0.0f, 1.0f, 0.0f});
 }
@@ -73,13 +88,30 @@ void DemoGame::onShutdown(core::Application&)
     hud_.reset();
 }
 
-void DemoGame::onFixedUpdate(core::Application&, float dt)
+void DemoGame::onFixedUpdate(core::Application& app, float dt)
 {
     // Animation advances at a fixed rate, independent of the frame rate.
     prevSpin_ = spin_;
     prevSimTime_ = simTime_;
     spin_ += dt * 0.6f; // radians per second
     simTime_ += dt;
+
+    // Every 2 seconds the next sphere chimes from where it stands, each on its own
+    // note of a pentatonic scale (pitch = playback rate).
+    pingTimer_ -= dt;
+    if (pingTimer_ <= 0.0f) {
+        pingTimer_ += 2.0f;
+        const float notes[6] = {1.0f, 1.125f, 1.25f, 1.5f, 1.6875f, 2.0f};
+        const int i = nextPing_;
+        nextPing_ = (nextPing_ + 1) % 6;
+        const float a = float(i) / 6.0f * glm::two_pi<float>() + 0.26f; // same layout as onRender
+        audio::PlayParams ping;
+        ping.volume = 0.8f;
+        ping.pitch = notes[i];
+        ping.spatial = true;
+        ping.position = {std::cos(a) * 4.0f, 0.8f, std::sin(a) * 4.0f};
+        app.audio().play(pingSound_, ping);
+    }
 }
 
 void DemoGame::onUpdate(core::Application& app, float dt)
@@ -100,8 +132,12 @@ void DemoGame::onUpdate(core::Application& app, float dt)
         meshRenderer_->setWireframe(!meshRenderer_->wireframe());
     if (in.keyPressed(SDL_SCANCODE_H))
         showHelp_ = !showHelp_;
+    if (in.keyPressed(SDL_SCANCODE_M))
+        app.audio().setMuted(!app.audio().muted());
 
     updateCamera(app, dt);
+    // The player hears the world from the camera.
+    app.audio().setListener(camera_.position, camera_.forward(), camera_.up());
 
     // Slowly move the sun around the scene.
     const float a = float(app.time()) * 0.1f;
@@ -226,18 +262,19 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     hud_->drawText(font_, info, glm::vec2(17.0f, 13.0f) * ui, shadow);
     hud_->drawText(font_, info, glm::vec2(16.0f, 12.0f) * ui, text);
 
-    // Top right: wireframe indicator.
-    if (meshRenderer_->wireframe()) {
-        render2d::TextStyle tag = text;
-        tag.align = render2d::TextAlign::Right;
-        tag.color = render2d::colors::Yellow;
+    // Top right: wireframe and mute indicators.
+    render2d::TextStyle tag = text;
+    tag.align = render2d::TextAlign::Right;
+    tag.color = render2d::colors::Yellow;
+    if (meshRenderer_->wireframe())
         hud_->drawText(font_, "WIREFRAME", {viewport.x - 16.0f * ui, 12.0f * ui}, tag);
-    }
+    if (app.audio().muted())
+        hud_->drawText(font_, "MUTED", {viewport.x - 16.0f * ui, 34.0f * ui}, tag);
 
     // Bottom: a help panel, sized to fit its text.
     if (showHelp_) {
         const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
-                           "Shift: fast      F1 / (Y): wireframe      V: vsync      H: hide help";
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;
         const glm::vec2 size = font_.measure(help, style.size);

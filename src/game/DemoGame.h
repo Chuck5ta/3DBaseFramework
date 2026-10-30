@@ -12,6 +12,7 @@
 #include "render3d/MeshRenderer.h"
 
 #include <memory>
+#include <string>
 
 class DemoGame : public core::Game {
 public:
@@ -46,4 +47,10 @@ private:
     float prevSpin_ = 0.0f;
     float simTime_ = 0.0f;
     float prevSimTime_ = 0.0f;
+
+    // 3D sound: a looping hum on the big crate, and chimes from the spheres.
+    std::string pingSound_;
+    audio::SoundHandle crateHum_;
+    float pingTimer_ = 1.0f; // seconds until the next chime
+    int nextPing_ = 0;       // which sphere chimes next
 };

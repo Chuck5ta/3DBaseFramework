@@ -6,7 +6,8 @@ every step you can build and run the game and see the result.
 
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
-animation on the fixed timestep with interpolation, and a 2D text HUD on top of the 3D scene.
+animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
+and 3D sound.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -20,6 +21,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [5](#step-5--many-objects-and-animation) | Spheres, a crate ring, fixed-step animation | The full demo scene, moving |
 | [6](#step-6--a-moving-sun-wireframe-and-vsync) | Moving sun, wireframe, vsync toggles | Shifting light; debug views |
 | [7](#step-7--a-text-hud) | A 2D overlay with a font | Stats, wireframe tag and a help panel |
+| [8](#step-8--3d-sound) | Positional audio with `app.audio()` | A humming crate and chiming spheres; **M** mutes |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -725,6 +727,164 @@ Things to notice:
 **Run it:** frame rate, draw calls and the camera position at the top left, a yellow
 "WIREFRAME" tag when F1 is on, and a help panel at the bottom (**H** hides it).
 
+---
+
+## Step 8 — 3D sound
+
+The framework plays audio with **miniaudio**. `Application` owns an
+**`audio::AudioEngine`**, reached with `app.audio()`. It opens the default output device
+at startup and releases finished sounds every frame for you. If the PC has no audio
+device, the game still runs: every audio call quietly does nothing.
+
+A sound played with `spatial = true` has a **position** in the world. The engine makes it
+quieter with distance and pans it between the speakers by its direction from a
+**listener**, which you place at the camera each frame. Walk around the crate and the
+hum moves from ear to ear.
+
+The project ships two sounds in `assets/sounds/`: `hum_loop.wav` (a seamless 2-second
+loop) and `ping.wav` (CC0; see the README there). WAV, FLAC, MP3 and OGG Vorbis all work.
+Use **mono** files for 3D sounds: the engine does the panning itself.
+
+| `PlayParams` field | Meaning |
+|---|---|
+| `volume`, `pitch` | Linear gain; playback rate (2 = an octave higher) |
+| `loop` | Plays until you call `app.audio().stop(handle)` |
+| `spatial` | Attenuate and pan relative to the listener |
+| `position` | World position of the sound (move it later with `setPosition`) |
+| `minDistance` | Full volume up to this distance |
+| `maxDistance` | Beyond this distance it gets no quieter |
+| `rolloff` | How quickly volume falls with distance (higher = faster) |
+
+In **`MyGame.h`**, add `#include <string>` to the includes and the sound state at the end
+of the members:
+
+```cpp
+    // 3D sound: a looping hum on the big crate, and chimes from the spheres.
+    std::string pingSound_;
+    audio::SoundHandle crateHum_;
+    float pingTimer_ = 1.0f; // seconds until the next chime
+    int nextPing_ = 0;       // which sphere chimes next
+```
+
+In **`MyGame.cpp`**, start the hum and load the chime in `onInit`, after the overlay from
+step 7:
+
+```cpp
+    // Sounds: a hum that loops forever, placed on the big crate (spatial = 3D), and
+    // a chime to play from the spheres. preload() decodes it now, avoiding a delay
+    // the first time it plays.
+    audio::PlayParams hum;
+    hum.volume = 0.6f;
+    hum.loop = true;
+    hum.spatial = true;
+    hum.position = {0.0f, 1.5f, 0.0f};
+    hum.minDistance = 2.0f;  // full volume within 2 units
+    hum.maxDistance = 60.0f;
+    crateHum_ = app.audio().play(core::assetPath("sounds/hum_loop.wav"), hum);
+
+    pingSound_ = core::assetPath("sounds/ping.wav");
+    app.audio().preload(pingSound_);
+```
+
+`play()` returns a **`SoundHandle`**. We keep the hum's handle so it could be moved,
+changed or stopped later (`setPosition`, `setVolume`, `stop(crateHum_, fadeSeconds)`). A
+looping sound plays until it is stopped or the game exits, so nothing is needed in
+`onShutdown`.
+
+The chimes are timed in `onFixedUpdate`, which now uses its `Application` parameter.
+Give it a name:
+
+```cpp
+void MyGame::onFixedUpdate(core::Application& app, float dt)
+```
+
+and add this at the end of the function:
+
+```cpp
+    // Every 2 seconds the next sphere chimes from where it stands, each on its own
+    // note of a pentatonic scale (pitch = playback rate).
+    pingTimer_ -= dt;
+    if (pingTimer_ <= 0.0f) {
+        pingTimer_ += 2.0f;
+        const float notes[6] = {1.0f, 1.125f, 1.25f, 1.5f, 1.6875f, 2.0f};
+        const int i = nextPing_;
+        nextPing_ = (nextPing_ + 1) % 6;
+        const float a = float(i) / 6.0f * glm::two_pi<float>() + 0.26f; // same layout as onRender
+        audio::PlayParams ping;
+        ping.volume = 0.8f;
+        ping.pitch = notes[i];
+        ping.spatial = true;
+        ping.position = {std::cos(a) * 4.0f, 0.8f, std::sin(a) * 4.0f};
+        app.audio().play(pingSound_, ping);
+    }
+```
+
+In `onUpdate`, toggle mute with **M** after the help toggle,
+
+```cpp
+    if (in.keyPressed(SDL_SCANCODE_M))
+        app.audio().setMuted(!app.audio().muted());
+```
+
+and move the listener with the camera, right after `updateCamera(app, dt);`:
+
+```cpp
+    // The player hears the world from the camera.
+    app.audio().setListener(camera_.position, camera_.forward(), camera_.up());
+```
+
+In `onRender`, replace the wireframe indicator with one that also shows when the game
+is muted:
+
+```cpp
+    // Top right: wireframe and mute indicators.
+    render2d::TextStyle tag = text;
+    tag.align = render2d::TextAlign::Right;
+    tag.color = render2d::colors::Yellow;
+    if (meshRenderer_->wireframe())
+        hud_->drawText(font_, "WIREFRAME", {viewport.x - 16.0f * ui, 12.0f * ui}, tag);
+    if (app.audio().muted())
+        hud_->drawText(font_, "MUTED", {viewport.x - 16.0f * ui, 34.0f * ui}, tag);
+```
+
+and add `M: mute` to the help text:
+
+```cpp
+        const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help";
+```
+
+Things to notice:
+
+- **The listener is the player's ears.** `setListener(position, forward, up)` uses the
+  same right-handed axes as `Camera3D`. Update it once per frame, after the camera moves.
+  For a third-person game, putting it at the character often sounds more natural.
+- **Distance.** Between `minDistance` and `maxDistance` the volume falls off as
+  `minDistance / distance` (with `rolloff = 1`). Raise `rolloff` for sounds that should fade
+  quickly, such as footsteps.
+- **Preloading.** A sound is decoded the first time it plays and then cached in memory.
+  `preload` does that work in `onInit`, so the first chime doesn't cause a small hitch.
+- **Not everything is 3D.** UI clicks and menu sounds should leave `spatial` off, so they
+  play at the same level wherever the camera is (with `pan` for left/right if you like).
+- **Volumes and mute.** `setMasterVolume`, `setSfxVolume` and `setMusicVolume` are ready
+  for an options menu. `setMuted` silences everything without changing those values.
+
+**Music.** The demo has no music track, but it's one line once you add a file (OGG
+Vorbis is a good choice: small and loops cleanly). Put it in `assets/music/` and call:
+
+```cpp
+app.audio().playMusic(core::assetPath("music/theme.ogg"), {.fadeInSeconds = 2.0f});
+```
+
+Music is streamed from disk rather than loaded whole, loops by default, is never
+positioned in 3D and has its own volume (`setMusicVolume`, 0.8 by default). Calling
+`playMusic` again crossfades to the new track. `stopMusic(seconds)`, `pauseMusic()` and
+`resumeMusic()` do what you'd expect.
+
+**Run it:** the crate hums, louder as you fly towards it and from the left or right as
+you turn. Every two seconds one of the spheres chimes from where it stands, walking up a
+scale. **M** mutes and "MUTED" appears at the top right.
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -747,5 +907,8 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
    buffer; essential for forests, crowds and particles.
 7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
-8. **World-space labels.** Project a 3D position to the screen with
+8. **Moving sound sources.** Give a moving object a looping spatial sound and call
+   `app.audio().setPosition(handle, position)` each frame, such as an engine on a
+   circling drone.
+9. **World-space labels.** Project a 3D position to the screen with
    `camera.viewProjection()` and draw a name tag there with the HUD batch.
