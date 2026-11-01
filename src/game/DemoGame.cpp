@@ -139,9 +139,11 @@ void DemoGame::onUpdate(core::Application& app, float dt)
     // The player hears the world from the camera.
     app.audio().setListener(camera_.position, camera_.forward(), camera_.up());
 
-    // Slowly move the sun around the scene.
-    const float a = float(app.time()) * 0.1f;
-    lighting_.sunDirection = glm::normalize(glm::vec3(std::cos(a), -0.8f, std::sin(a)));
+    // Slowly move the sun around the scene (unless switched off in the debug UI).
+    if (animateSun_) {
+        const float a = float(app.time()) * 0.1f;
+        lighting_.sunDirection = glm::normalize(glm::vec3(std::cos(a), -0.8f, std::sin(a)));
+    }
 }
 
 void DemoGame::updateCamera(core::Application& app, float dt)
@@ -195,6 +197,73 @@ void DemoGame::updateCamera(core::Application& app, float dt)
     camera_.position += (flatForward * move.z + camera_.right() * move.x + glm::vec3(0, 1, 0) * move.y) *
                         speed * dt;
     camera_.position.y = std::max(camera_.position.y, 0.2f); // stay above the ground
+}
+
+void DemoGame::onDebugUI(core::Application& app)
+{
+    // Our own window, at the top right the first time it appears, sized to fit
+    // its contents (but no taller than the screen). The framework's "Engine"
+    // window is drawn separately.
+    const float scale = ImGui::GetStyle().FontScaleDpi; // matches the screen's DPI setting
+    const ImVec2 screen = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowPos(ImVec2(screen.x - 12.0f * scale, 60.0f * scale), ImGuiCond_FirstUseEver, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(screen.x, screen.y - 100.0f * scale));
+    if (!ImGui::Begin("Game", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) { // collapsed: skip the contents
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("Draw calls: %u", meshRenderer_->drawCalls());
+    bool wireframe = meshRenderer_->wireframe();
+    if (ImGui::Checkbox("Wireframe", &wireframe))
+        meshRenderer_->setWireframe(wireframe);
+
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Position", &camera_.position.x, 0.1f, -100.0f, 100.0f, "%.1f");
+        ImGui::SliderAngle("Yaw", &camera_.yaw, -360.0f, 360.0f);
+        ImGui::SliderAngle("Pitch", &camera_.pitch, -89.0f, 89.0f);
+        ImGui::SliderAngle("Field of view", &camera_.fovY, 20.0f, 120.0f);
+        if (ImGui::Button("Look at the crate"))
+            camera_.lookAt({0.0f, 1.5f, 0.0f});
+    }
+
+    if (ImGui::CollapsingHeader("Lighting")) {
+        ImGui::Checkbox("Animate sun", &animateSun_);
+        if (ImGui::SliderFloat3("Sun direction", &lighting_.sunDirection.x, -1.0f, 1.0f)) {
+            animateSun_ = false; // dragging takes over from the animation
+            if (glm::length(lighting_.sunDirection) < 1e-3f)
+                lighting_.sunDirection = {0.0f, -1.0f, 0.0f};
+            lighting_.sunDirection = glm::normalize(lighting_.sunDirection);
+        }
+        ImGui::ColorEdit3("Sun colour", &lighting_.sunColor.x);
+        ImGui::SliderFloat("Sun intensity", &lighting_.sunIntensity, 0.0f, 6.0f);
+        ImGui::ColorEdit3("Sky colour", &lighting_.skyColor.x);
+        ImGui::ColorEdit3("Ground colour", &lighting_.groundColor.x);
+        ImGui::SliderFloat("Ambient", &lighting_.ambientIntensity, 0.0f, 2.0f);
+        // The clear colour must follow the fog colour, as set up in onInit.
+        if (ImGui::ColorEdit3("Fog colour", &lighting_.fogColor.x)) {
+            const glm::vec3 fog = lighting_.fogColor;
+            app.renderer().setClearColor({srgbToLinear(fog.r), srgbToLinear(fog.g), srgbToLinear(fog.b), 1.0f});
+        }
+        ImGui::SliderFloat("Fog density", &lighting_.fogDensity, 0.0f, 0.1f, "%.4f", ImGuiSliderFlags_Logarithmic);
+    }
+
+    if (ImGui::CollapsingHeader("Sound")) {
+        if (ImGui::SliderFloat("Crate hum", &humVolume_, 0.0f, 1.0f))
+            app.audio().setVolume(crateHum_, humVolume_);
+        if (ImGui::Button("Chime now"))
+            pingTimer_ = 0.0f; // onFixedUpdate plays it on the next step
+    }
+
+    // Our own textures, shown inside the UI.
+    if (ImGui::CollapsingHeader("Textures")) {
+        debugui::DebugUI& ui = *app.debugUI(); // never null inside onDebugUI
+        const ImVec2 size(96.0f * scale, 96.0f * scale);
+        ImGui::Image(ui.texture(crateTexture_), size);
+        ImGui::SameLine();
+        ImGui::Image(ui.texture(checkerTexture_), size);
+    }
+    ImGui::End();
 }
 
 void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
@@ -274,7 +343,8 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     // Bottom: a help panel, sized to fit its text.
     if (showHelp_) {
         const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
-                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help";
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help\n"
+                           "` (below Esc): debug UI";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;
         const glm::vec2 size = font_.measure(help, style.size);

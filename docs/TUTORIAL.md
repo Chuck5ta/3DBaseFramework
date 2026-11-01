@@ -7,7 +7,7 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-and 3D sound.
+3D sound and a debug UI.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -22,6 +22,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [6](#step-6--a-moving-sun-wireframe-and-vsync) | Moving sun, wireframe, vsync toggles | Shifting light; debug views |
 | [7](#step-7--a-text-hud) | A 2D overlay with a font | Stats, wireframe tag and a help panel |
 | [8](#step-8--3d-sound) | Positional audio with `app.audio()` | A humming crate and chiming spheres; **M** mutes |
+| [9](#step-9--a-debug-ui) | A Dear ImGui window with `onDebugUI` | Live camera, lighting and fog controls |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -885,6 +886,165 @@ positioned in 3D and has its own volume (`setMusicVolume`, 0.8 by default). Call
 you turn. Every two seconds one of the spheres chimes from where it stands, walking up a
 scale. **M** mutes and "MUTED" appears at the top right.
 
+---
+
+## Step 9 — A debug UI
+
+While you work on a game you constantly want to see a value, nudge a number or press a
+"do it now" button without restarting. The framework includes
+[Dear ImGui](https://github.com/ocornut/imgui) for exactly that. Lighting is the perfect
+example: tuning fog and colours by recompiling is slow, while dragging a slider takes
+seconds.
+
+Press **`** (the key below Esc) in any step of this tutorial and two things appear: the
+framework's **Engine** window (frame time graph, GPU, vsync, audio volumes, input) and,
+from the checkbox at its bottom, ImGui's own demo window, which shows every widget along
+with the code that makes it. Press **`** again to hide them.
+
+The debug UI exists in **Debug builds only** (`AppConfig::debugUI.enabled`), so players
+never see it. When you ship a Release build it isn't even created.
+
+ImGui is an *immediate-mode* UI: there are no widget objects to create or keep. Every
+frame you call functions that both draw a widget and report what happened to it:
+
+```cpp
+if (ImGui::Button("Respawn"))           // true on the frame it's clicked
+    respawn();
+ImGui::SliderFloat("Speed", &speed_, 0.0f, 50.0f); // edits speed_ directly
+```
+
+You write that code in a new hook, **`Game::onDebugUI`**. It runs once per frame after
+`onUpdate`, and only while the debug UI is visible. That's the only place to call ImGui.
+
+In **`MyGame.h`**, declare the hook after `onRender`,
+
+```cpp
+    void onDebugUI(core::Application& app) override;
+```
+
+and add two settings at the end of the members:
+
+```cpp
+    // Settings changed in the debug UI.
+    bool animateSun_ = true;
+    float humVolume_ = 0.6f;
+```
+
+In **`MyGame.cpp`**, let the debug UI stop the sun's movement. In `onUpdate`, replace the
+sun code from step 6 with:
+
+```cpp
+    // Slowly move the sun around the scene (unless switched off in the debug UI).
+    if (animateSun_) {
+        const float a = float(app.time()) * 0.1f;
+        lighting_.sunDirection = glm::normalize(glm::vec3(std::cos(a), -0.8f, std::sin(a)));
+    }
+```
+
+Add `onDebugUI` after `updateCamera`:
+
+```cpp
+void MyGame::onDebugUI(core::Application& app)
+{
+    // Our own window, at the top right the first time it appears, sized to fit
+    // its contents (but no taller than the screen). The framework's "Engine"
+    // window is drawn separately.
+    const float scale = ImGui::GetStyle().FontScaleDpi; // matches the screen's DPI setting
+    const ImVec2 screen = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowPos(ImVec2(screen.x - 12.0f * scale, 60.0f * scale), ImGuiCond_FirstUseEver, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(screen.x, screen.y - 100.0f * scale));
+    if (!ImGui::Begin("Game", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) { // collapsed: skip the contents
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("Draw calls: %u", meshRenderer_->drawCalls());
+    bool wireframe = meshRenderer_->wireframe();
+    if (ImGui::Checkbox("Wireframe", &wireframe))
+        meshRenderer_->setWireframe(wireframe);
+
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Position", &camera_.position.x, 0.1f, -100.0f, 100.0f, "%.1f");
+        ImGui::SliderAngle("Yaw", &camera_.yaw, -360.0f, 360.0f);
+        ImGui::SliderAngle("Pitch", &camera_.pitch, -89.0f, 89.0f);
+        ImGui::SliderAngle("Field of view", &camera_.fovY, 20.0f, 120.0f);
+        if (ImGui::Button("Look at the crate"))
+            camera_.lookAt({0.0f, 1.5f, 0.0f});
+    }
+
+    if (ImGui::CollapsingHeader("Lighting")) {
+        ImGui::Checkbox("Animate sun", &animateSun_);
+        if (ImGui::SliderFloat3("Sun direction", &lighting_.sunDirection.x, -1.0f, 1.0f)) {
+            animateSun_ = false; // dragging takes over from the animation
+            if (glm::length(lighting_.sunDirection) < 1e-3f)
+                lighting_.sunDirection = {0.0f, -1.0f, 0.0f};
+            lighting_.sunDirection = glm::normalize(lighting_.sunDirection);
+        }
+        ImGui::ColorEdit3("Sun colour", &lighting_.sunColor.x);
+        ImGui::SliderFloat("Sun intensity", &lighting_.sunIntensity, 0.0f, 6.0f);
+        ImGui::ColorEdit3("Sky colour", &lighting_.skyColor.x);
+        ImGui::ColorEdit3("Ground colour", &lighting_.groundColor.x);
+        ImGui::SliderFloat("Ambient", &lighting_.ambientIntensity, 0.0f, 2.0f);
+        // The clear colour must follow the fog colour, as set up in onInit.
+        if (ImGui::ColorEdit3("Fog colour", &lighting_.fogColor.x)) {
+            const glm::vec3 fog = lighting_.fogColor;
+            app.renderer().setClearColor({srgbToLinear(fog.r), srgbToLinear(fog.g), srgbToLinear(fog.b), 1.0f});
+        }
+        ImGui::SliderFloat("Fog density", &lighting_.fogDensity, 0.0f, 0.1f, "%.4f", ImGuiSliderFlags_Logarithmic);
+    }
+
+    if (ImGui::CollapsingHeader("Sound")) {
+        if (ImGui::SliderFloat("Crate hum", &humVolume_, 0.0f, 1.0f))
+            app.audio().setVolume(crateHum_, humVolume_);
+        if (ImGui::Button("Chime now"))
+            pingTimer_ = 0.0f; // onFixedUpdate plays it on the next step
+    }
+
+    // Our own textures, shown inside the UI.
+    if (ImGui::CollapsingHeader("Textures")) {
+        debugui::DebugUI& ui = *app.debugUI(); // never null inside onDebugUI
+        const ImVec2 size(96.0f * scale, 96.0f * scale);
+        ImGui::Image(ui.texture(crateTexture_), size);
+        ImGui::SameLine();
+        ImGui::Image(ui.texture(checkerTexture_), size);
+    }
+    ImGui::End();
+}
+```
+
+and add the key to the help text in `onRender` (it becomes three lines):
+
+```cpp
+        const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help\n"
+                           "` (below Esc): debug UI";
+```
+
+Things to notice:
+
+- **Widgets edit your variables directly.** `ColorEdit3("Sky colour", &lighting_.skyColor.x)`
+  reads and writes the three floats of the `glm::vec3`; there's no copying back and forth.
+  Functions return `true` when the value changed, for when you need to react: the fog
+  colour also updates the clear colour, and dragging the sun switches its animation off.
+- **`SliderAngle`** shows degrees while the variable stays in radians, which suits
+  `Camera3D`'s yaw, pitch and field of view.
+- **`Begin`/`End` make a window.** Always call `End`, even when `Begin` returns `false` (the
+  window is collapsed). `CollapsingHeader` sections keep a long window manageable.
+- **Labels are IDs.** Two widgets with the same label in one window clash. Add a hidden
+  suffix to tell them apart: `"Colour##sky"` shows as "Colour".
+- **Clicks don't leak into the game.** While the mouse is over a debug window, or you are
+  typing into a text field, those events don't reach `app.input()`. Right-clicking over a
+  window doesn't start the mouse look, and typing a number doesn't move the camera.
+- **Textures in the UI.** `app.debugUI()->texture(t)` turns any `gfx::Texture` into
+  something `ImGui::Image` can show.
+- **ImGui's colours are sRGB.** The framework's ImGui shader converts them for our sRGB
+  swapchain, so colours you pick in ImGui look the same as in any image editor.
+
+**Run it:** press **`**. A "Game" window at the top right lets you move and turn the
+camera, change the field of view, toggle wireframe, change the sun, sky, ground and fog,
+set the crate's hum volume and trigger a chime. Try a fog density of 0.05 with a dark fog
+colour for a night scene.
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -907,8 +1067,10 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
    buffer; essential for forests, crowds and particles.
 7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
-8. **Moving sound sources.** Give a moving object a looping spatial sound and call
+8. **Saving settings.** Write `lighting_` to a small text file from a "Save" button in
+   the debug UI and load it in `onInit`, so tuned values survive a restart.
+9. **Moving sound sources.** Give a moving object a looping spatial sound and call
    `app.audio().setPosition(handle, position)` each frame, such as an engine on a
    circling drone.
-9. **World-space labels.** Project a 3D position to the screen with
+10. **World-space labels.** Project a 3D position to the screen with
    `camera.viewProjection()` and draw a name tag there with the HUD batch.

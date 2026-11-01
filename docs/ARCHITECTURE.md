@@ -37,8 +37,9 @@ flowchart TD
     r2d["render2d/  SpriteBatch · Camera2D · Font (HUD)"]
     core["core/  Application · Window · Input · Paths · Log"]
     aud["audio/  AudioEngine (miniaudio)"]
+    dbg["debugui/  DebugUI (Dear ImGui)"]
     gfx["gfx/  VulkanContext · Swapchain · Renderer · Buffer · Image · Texture · Pipeline · Descriptors"]
-    third["Third party: SDL3 · volk · Vulkan-Headers · VMA · GLM · stb · miniaudio"]
+    third["Third party: SDL3 · volk · Vulkan-Headers · VMA · GLM · stb · miniaudio · Dear ImGui"]
 
     game --> r3d
     game --> r2d
@@ -47,6 +48,8 @@ flowchart TD
     r2d --> gfx
     core --> gfx
     core --> aud
+    core --> dbg
+    dbg --> gfx
     gfx --> third
     core --> third
     aud --> third
@@ -57,6 +60,7 @@ flowchart TD
 | `src/core` | `core` | Program lifetime, main loop, window, input, file paths, logging | Yes, identical |
 | `src/gfx` | `gfx` | Everything Vulkan: device, swapchain, frames, memory, textures, pipelines | Yes, identical |
 | `src/audio` | `audio` | Sound effects, music, 3D sound (miniaudio) | Yes, identical |
+| `src/debugui` | `debugui` | In-game debug overlay (Dear ImGui) | Yes, identical |
 | `src/render2d` | `render2d` | 2D overlay: sprites, cameras, text (used for the HUD) | Yes, identical |
 | `src/render3d` | `render3d` | 3D-specific rendering on top of `gfx` | No |
 | `src/game` | (global) | The actual game; replaceable | No |
@@ -79,6 +83,8 @@ src/
   audio/
     Audio.h/.cpp              AudioEngine: effects, music, 3D listener, mixer
     MiniaudioImpl.cpp         miniaudio + stb_vorbis implementation unit
+  debugui/
+    DebugUI.h/.cpp            Dear ImGui setup, input sharing, rendering, textures
   gfx/
     VkCommon.h                single Vulkan include (vulkan.h + volk + VMA), VK_CHECK
     Implementations.cpp       VMA, stb_image and stb_truetype implementation units
@@ -104,6 +110,7 @@ shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
   mesh.vert, mesh.frag        the mesh shaders
   sprite.vert, sprite.frag    the 2D overlay shaders (shared with Game2D)
+  imgui.frag                  Dear ImGui's fragment shader, sRGB-correct (debug UI)
 assets/                       runtime data (copied next to the executable)
   fonts/                      Roboto Medium + its licence
   sounds/                     demo sounds (CC0) + README
@@ -121,7 +128,7 @@ Construction order (and reverse destruction order) is significant:
 
 1. `SDL_Init(VIDEO | GAMEPAD)`
 2. `Window` → 3. `Input` → 4. `gfx::VulkanContext` → 5. `gfx::Renderer` →
-   6. `audio::AudioEngine`
+   6. `audio::AudioEngine` → 7. `debugui::DebugUI` (if enabled)
 
 Its destructor tears down in exactly the reverse order, then calls `SDL_Quit()`.
 
@@ -135,10 +142,12 @@ Its destructor tears down in exactly the reverse order, then calls `SDL_Quit()`.
 | `onPreRender(frame)` | before the main render pass begins | uploads, off-screen passes, compute |
 | `onRender(frame)` | inside the main pass (cleared, viewport set) | draw calls |
 | `onResize(w, h)` | swapchain size changed | resize render targets / UI |
+| `onDebugUI` | once per frame after `onUpdate`, only while the debug UI is visible | ImGui windows: stats, tweaks, buttons |
 | `onShutdown` | after `vkDeviceWaitIdle`, before teardown | destroy GPU resources |
 
 **`core::AppConfig`** groups configuration: window description, `gfx::RendererConfig`,
-fixed timestep, validation on/off, FPS-in-title and fullscreen hotkeys.
+`audio::AudioDesc`, `debugui::DebugUIDesc`, fixed timestep, validation on/off,
+FPS-in-title and fullscreen hotkeys.
 
 **`core::Window`** wraps `SDL_Window` (created with `SDL_WINDOW_VULKAN |
 SDL_WINDOW_HIGH_PIXEL_DENSITY`). It reports the *pixel* size (high-DPI aware), supplies
@@ -308,6 +317,61 @@ flowchart LR
 
 ---
 
+### 3.6 debugui
+
+**`debugui::DebugUI`** is an in-game debug overlay built on
+[Dear ImGui](https://github.com/ocornut/imgui) with its SDL3 and Vulkan backends.
+`Application` creates it after the audio engine when `AppConfig::debugUI.enabled` is
+set, which is the default in Debug builds only. Release builds don't create it at all,
+so `app.debugUI()` returns `nullptr` there.
+
+```mermaid
+sequenceDiagram
+    participant App as Application::run
+    participant UI as DebugUI
+    participant G as Game
+
+    App->>UI: processEvent(e) for every SDL event
+    Note over UI: ` toggles visibility. Presses that ImGui uses<br/>(mouse over a window, text field focused) are not passed to Input
+    App->>G: onFixedUpdate / onUpdate
+    alt visible
+        App->>UI: beginFrame() (ImGui::NewFrame)
+        App->>App: drawEnginePanel()
+        App->>G: onDebugUI(app)
+        App->>UI: endFrame() (ImGui::Render)
+    end
+    App->>G: onRender(frame)
+    App->>UI: render(cmd), last in the main pass
+```
+
+- **Games add windows in `Game::onDebugUI`**, called once per frame after `onUpdate`, only
+  while the UI is visible. Including `core/Application.h` brings in `imgui.h`.
+- **Input sharing.** Every event goes to ImGui first. A mouse-button press or wheel event
+  over a debug window, or a key press while a text field has focus, is not passed to
+  `core::Input`. Releases always are, so nothing gets stuck down. The toggle key
+  (`DebugUIDesc::toggleKey`, default the key below Esc) is consumed by the debug UI.
+- **Rendering.** ImGui's Vulkan backend draws with its own pipeline inside our main
+  pass (dynamic rendering, created with the swapchain colour format and the renderer's
+  depth format). It calls Vulkan through volk (`IMGUI_IMPL_VULKAN_USE_VOLK`). Its vertex
+  buffers are per frame in flight. When the font atlas changes, the backend uploads it with
+  its own command buffer and waits for the queue: a small, rare stall.
+- **Colour.** ImGui's colours are sRGB values. Our swapchain is sRGB, so it expects linear
+  values. `shaders/imgui.frag` replaces ImGui's fragment shader with one that converts
+  vertex colours to linear, so ImGui looks exactly as designed.
+- **Size.** The style and the font scale with the display's scale setting (e.g. 150% on
+  Windows) times `DebugUIDesc::scale`. The font is the project's Roboto Medium if present;
+  ImGui renders font glyphs on demand, so text stays sharp at any size.
+- **Textures.** `DebugUI::texture(gfx::Texture)` registers a texture with the ImGui
+  backend once (a descriptor set from its own pool, room for 64) and returns an
+  `ImTextureID` for `ImGui::Image`.
+- **The Engine panel** (`Application::drawEnginePanel`) shows a frame-time graph, GPU and
+  swapchain details, vsync/fullscreen toggles, audio status and volumes, input devices, and
+  a switch for ImGui's demo window. Turn it off with `DebugUIDesc::showEnginePanel`.
+- `imgui.ini` is not written (`io.IniFilename = nullptr`), so window positions reset each
+  run and nothing is written next to the executable.
+
+---
+
 ## 4. Object ownership and lifetime
 
 ```mermaid
@@ -319,6 +383,8 @@ flowchart LR
     app --> ctx["gfx::VulkanContext"]
     app --> ren["gfx::Renderer"]
     app --> aud["audio::AudioEngine"]
+    app --> dbg["debugui::DebugUI (Debug builds)"]
+    dbg --> imgui["ImGui context + backends<br/>own pipeline, descriptor pool, font atlas"]
     aud --> voices["Voices + sound cache + music stream"]
     ren --> sc["Swapchain"]
     ren --> fr["Frame[N]: cmd pool, cmd buffer, imageAvailable, fence"]
@@ -368,12 +434,16 @@ sequenceDiagram
         end
         App->>G: onUpdate(dt)
         App->>App: audio.update() (release finished sounds)
+        opt debug UI visible
+            App->>G: onDebugUI() (between ImGui NewFrame and Render)
+        end
         App->>R: beginFrame()
         alt frame available
             App->>G: onResize() (if extent changed)
             App->>G: onPreRender(frame)
             App->>R: beginMainPass()
             App->>G: onRender(frame)
+            App->>App: debug UI draw (if visible)
             App->>R: endMainPass() + endFrame()
         else minimised / swapchain out of date
             Note over App,R: skip rendering this frame
@@ -618,6 +688,7 @@ maps, roughness, masks) must use `TextureDesc::srgb = false`.
 | GLM | 1.0.1 | vector/matrix math | headers |
 | stb | pinned commit | image loading (stb_image), font rasterisation (stb_truetype) | header (impl in `Implementations.cpp`) |
 | miniaudio | 0.11.23 | audio output, mixing, decoding (WAV/FLAC/MP3, OGG via its bundled stb_vorbis), 3D sound | header (impl in `audio/MiniaudioImpl.cpp`) |
+| Dear ImGui | 1.92.9 | debug UI, with its SDL3 and Vulkan backends | static library `imgui` |
 
 Global definitions: `VK_NO_PROTOTYPES`, `GLM_FORCE_DEPTH_ZERO_TO_ONE`,
 `GLM_FORCE_RADIANS`. On Linux, `third_party` also links `pthread`, `dl` and `m` for
@@ -696,7 +767,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Blinn-Phong + hemisphere ambient + fog | Small, readable shader that looks good immediately | Not PBR; replace when materials need it |
 | Wait-idle on swapchain recreation | Simplest correct approach | Brief stall on resize only |
 | Fixed-timestep simulation | Deterministic gameplay, frame-rate independent | Needs interpolation for smooth rendering |
-| Identical `core/`, `gfx/`, `audio/` and `render2d/` in 2D and 3D | Each project stands alone and is easy to understand | Changes must be copied between projects (or factored into a shared library later) |
+| Dear ImGui for debug tools, in Debug builds only | The standard for in-engine tools: tiny code to write a panel, huge widget set, backends for SDL3 + Vulkan | Not meant for player-facing UI (the game's own HUD/menus use `render2d`) |
+| Identical `core/`, `gfx/`, `audio/`, `debugui/` and `render2d/` in 2D and 3D | Each project stands alone and is easy to understand | Changes must be copied between projects (or factored into a shared library later) |
 
 ---
 
@@ -708,8 +780,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - No anti-aliasing (MSAA, FXAA or TAA).
 - No frustum culling or instancing; one draw call per object.
 - No skybox (the fog-coloured clear colour stands in for the sky).
-- No debug UI (Dear ImGui with `imgui_impl_sdl3` + `imgui_impl_vulkan` integrates
-  cleanly).
+- The debug UI uses one window (no ImGui docking or multi-viewport) and doesn't save its
+  layout.
 - Audio: no effects (reverb, occlusion, filters), no Doppler, one listener; music is one
   track at a time.
 - No deferred resource destruction; destroy GPU objects only when idle (see §4).

@@ -21,6 +21,7 @@ public:
     void onFixedUpdate(core::Application& app, float dt) override;
     void onUpdate(core::Application& app, float dt) override;
     void onRender(core::Application& app, gfx::FrameContext& frame) override;
+    void onDebugUI(core::Application& app) override;
 
 private:
     void updateCamera(core::Application& app, float dt);
@@ -53,4 +54,8 @@ private:
     audio::SoundHandle crateHum_;
     float pingTimer_ = 1.0f; // seconds until the next chime
     int nextPing_ = 0;       // which sphere chimes next
+
+    // Settings changed in the debug UI.
+    bool animateSun_ = true;
+    float humVolume_ = 0.6f;
 };

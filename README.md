@@ -12,6 +12,7 @@ scene showing how they fit together.
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound, effects, streamed music with crossfades, mixer, mute | miniaudio |
+| Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
 | Math / images | Vectors & matrices, PNG/JPG loading | GLM, stb_image |
 
 All dependencies are downloaded automatically by CMake at a pinned version.
@@ -100,6 +101,8 @@ src/
     Log.h               LOG_INFO/WARN/ERROR, core::fatal()
   audio/                sound effects, music, 3D sound (shared with Game2D)
     AudioEngine         miniaudio: cached effects, streamed music, listener, mixer
+  debugui/              debug overlay, ` key (shared with Game2D)
+    DebugUI             Dear ImGui setup; your windows go in Game::onDebugUI
   gfx/                  Vulkan layer (shared with Game2D)
     VulkanContext       instance, GPU selection, device, queues, VMA, immediateSubmit
     Swapchain           creation/recreation, per-image semaphores
@@ -124,7 +127,7 @@ assets/                 copied next to the exe (fonts/: Roboto Medium, Apache 2.
 cmake/                  dependency + shader build logic
 ```
 
-`core/`, `gfx/`, `audio/` and `render2d/` are identical in Game2D and Game3D, so improvements can be
+`core/`, `gfx/`, `audio/`, `debugui/` and `render2d/` are identical in Game2D and Game3D, so improvements can be
 copied between them (or later moved into a shared library).
 
 ---
@@ -194,6 +197,9 @@ Tips
 - Sound: `app.audio().play(path, {.spatial = true, .position = p})` for 3D sound, with
   `app.audio().setListener(camera.position, camera.forward(), camera.up())` each frame;
   music: `app.audio().playMusic(core::assetPath("music/theme.ogg"))`. WAV, FLAC, MP3, OGG.
+- Debug UI: press **`** (below Esc) in a Debug build. Add your own windows by overriding
+  `onDebugUI(core::Application&)` and calling ImGui there, e.g.
+  `ImGui::SliderFloat("Speed", &speed_, 0.0f, 500.0f);`.
 - Validation layers are on in Debug builds (set `GAME_VALIDATION=0/1` to override). Keep
   the console clean of validation errors.
 
@@ -206,6 +212,7 @@ Tips
 | Move faster | Shift | Click left stick |
 | Wireframe | F1 | Y |
 | Mute sound | M | |
+| Debug UI (Debug builds) | ` (key below Esc) | |
 | Show/hide help | H | |
 | Toggle vsync | V | |
 | Fullscreen | F11 / Alt+Enter | |
@@ -250,7 +257,7 @@ limits (Steam's performance overlay helps), suspend/resume (swapchain recreation
 - **Shadows:** a depth-only pass for the sun in `onPreRender`, sampled in `mesh.frag`.
 - **PBR materials:** metallic/roughness + image-based lighting.
 - **MSAA or FXAA/TAA** for smoother edges.
-- **Debug UI:** Dear ImGui (`imgui_impl_sdl3` + `imgui_impl_vulkan` work with dynamic rendering).
+- **Tools in the debug UI:** grow `onDebugUI` into a level editor or a tuning panel that saves to a file.
 - **Physics:** Jolt Physics.
 - **Music:** add a track to `assets/music/` and call `app.audio().playMusic(...)`.
 - **Frustum culling and instancing** once scenes get large.
