@@ -58,4 +58,7 @@ private:
     // Settings changed in the debug UI.
     bool animateSun_ = true;
     float humVolume_ = 0.6f;
+
+    int reverbPreset_ = 0;         // index into audio::ReverbPreset (0 = off), cycled with R
+    bool lastChimeBlocked_ = false; // was the last chime behind the big crate?
 };

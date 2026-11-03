@@ -11,7 +11,7 @@ scene showing how they fit together.
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
-| Audio | 3D positional sound, effects, streamed music with crossfades, mixer, mute | miniaudio |
+| Audio | 3D positional sound, effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
 | Math / images | Vectors & matrices, PNG/JPG loading | GLM, stb_image |
 
@@ -197,6 +197,10 @@ Tips
 - Sound: `app.audio().play(path, {.spatial = true, .position = p})` for 3D sound, with
   `app.audio().setListener(camera.position, camera.forward(), camera.up())` each frame;
   music: `app.audio().playMusic(core::assetPath("music/theme.ogg"))`. WAV, FLAC, MP3, OGG.
+- Effects: `app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset::Hall))`;
+  muffle one sound behind a wall with `app.audio().setLowPass(handle, 1200.0f)`, or every
+  effect with `setLowPass(audio::Bus::Sfx, ...)`. Changes glide smoothly. Try them live in the
+  debug UI (Engine → Audio → Audio effects).
 - Debug UI: press **`** (below Esc) in a Debug build. Add your own windows by overriding
   `onDebugUI(core::Application&)` and calling ImGui there, e.g.
   `ImGui::SliderFloat("Speed", &speed_, 0.0f, 500.0f);`.
@@ -212,6 +216,7 @@ Tips
 | Move faster | Shift | Click left stick |
 | Wireframe | F1 | Y |
 | Mute sound | M | |
+| Reverb: off / room / hall / cave | R | |
 | Debug UI (Debug builds) | ` (key below Esc) | |
 | Show/hide help | H | |
 | Toggle vsync | V | |

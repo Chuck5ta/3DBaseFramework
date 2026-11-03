@@ -7,7 +7,7 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-3D sound and a debug UI.
+3D sound, audio effects and a debug UI.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -23,6 +23,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [7](#step-7--a-text-hud) | A 2D overlay with a font | Stats, wireframe tag and a help panel |
 | [8](#step-8--3d-sound) | Positional audio with `app.audio()` | A humming crate and chiming spheres; **M** mutes |
 | [9](#step-9--a-debug-ui) | A Dear ImGui window with `onDebugUI` | Live camera, lighting and fog controls |
+| [10](#step-10--reverb-and-muffled-sounds) | Audio effects: reverb presets, a per-sound low-pass | **R** changes the room; chimes behind the crate are muffled |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -1044,6 +1045,121 @@ Things to notice:
 camera, change the field of view, toggle wireframe, change the sun, sky, ground and fog,
 set the crate's hum volume and trigger a chime. Try a fog density of 0.05 with a dark fog
 colour for a night scene.
+
+---
+
+## Step 10 — Reverb and muffled sounds
+
+Effects make a place sound like a place. The audio engine has four:
+
+| Effect | What it does | Typical use |
+|---|---|---|
+| **Low-pass** | Lets only the low frequencies through ("muffles") | Behind a wall, under water, a pause menu |
+| **High-pass** | Lets only the high frequencies through ("thin") | A radio, a phone, a tiny speaker |
+| **Echo** | Distinct repeats after a delay | A canyon, a long corridor |
+| **Reverb** | A room's reflections blending into a tail | A cave, a hall, a bathroom |
+
+Low-pass, high-pass and echo work on a **bus**: `audio::Bus::Sfx` (all sound effects),
+`Bus::Music` or `Bus::Master` (everything). The **reverb** is shared: every sound effect
+sends some of itself to it, and music never does. A sound can also have its **own**
+low-pass, set when it's played (`PlayParams::lowPassHz`) or changed later with
+`setLowPass(handle, hz)`.
+
+Every change **glides** to the new value (0.3 seconds by default for buses), because a
+filter that snaps on sounds like a glitch.
+
+This step does two things: **R** steps through the reverb presets (off, room, hall, cave),
+and a chime from a sphere *behind the big crate* (as seen from the camera) is muffled, the
+way a real obstacle blocks the high frequencies first.
+
+In **`MyGame.h`**, add at the end of the members:
+
+```cpp
+    int reverbPreset_ = 0;         // index into audio::ReverbPreset (0 = off), cycled with R
+    bool lastChimeBlocked_ = false; // was the last chime behind the big crate?
+```
+
+In **`MyGame.cpp`**, add a small geometry helper in the unnamed namespace, after
+`srgbToLinear`:
+
+```cpp
+// True if the straight line from `a` to `b` passes through a sphere: a cheap
+// stand-in for "is the big crate in the way?" when deciding to muffle a sound.
+bool lineHitsSphere(glm::vec3 a, glm::vec3 b, glm::vec3 centre, float radius)
+{
+    const glm::vec3 ab = b - a;
+    const float t = std::clamp(glm::dot(centre - a, ab) / glm::dot(ab, ab), 0.0f, 1.0f);
+    return glm::distance(a + ab * t, centre) < radius;
+}
+```
+
+In `onFixedUpdate`, decide whether each chime is blocked. Add this just before
+`app.audio().play(pingSound_, ping);`:
+
+```cpp
+        // Behind the big crate (seen from the camera)? Then muffle it, as a real
+        // obstacle would: walls let the low frequencies through best.
+        lastChimeBlocked_ = lineHitsSphere(camera_.position, ping.position, {0.0f, 1.5f, 0.0f}, 1.3f);
+        if (lastChimeBlocked_)
+            ping.lowPassHz = 1200.0f;
+```
+
+In `onUpdate`, cycle the reverb with **R**, after the mute toggle:
+
+```cpp
+    if (in.keyPressed(SDL_SCANCODE_R)) { // Off -> Room -> Hall -> Cave -> Off
+        reverbPreset_ = (reverbPreset_ + 1) % 4;
+        app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
+    }
+```
+
+In `onRender`, show the reverb at the top right, after the "MUTED" tag,
+
+```cpp
+    const char* reverbNames[] = {"", "REVERB: ROOM", "REVERB: HALL", "REVERB: CAVE"};
+    if (reverbPreset_ > 0)
+        hud_->drawText(font_, reverbNames[reverbPreset_], {viewport.x - 16.0f * ui, 56.0f * ui}, tag);
+```
+
+and replace the help text:
+
+```cpp
+        const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      R: reverb      V: vsync\n"
+                           "H: hide help      ` (below Esc): debug UI";
+```
+
+Finally, in `onDebugUI`, add to the **Sound** section, after the "Chime now" button:
+
+```cpp
+        ImGui::Text("Last chime: %s", lastChimeBlocked_ ? "muffled (behind the crate)" : "clear");
+        const char* presets[] = {"Off", "Room", "Hall", "Cave"};
+        if (ImGui::Combo("Reverb", &reverbPreset_, presets, 4))
+            app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
+```
+
+Things to notice:
+
+- **Occlusion is the game's decision.** The audio engine doesn't know about walls; it
+  muffles what you tell it to. Here a sphere stands in for the crate. In a real game you'd
+  cast a ray with your physics or collision code, and use `setLowPass(handle, ...)` to
+  update long-playing sounds while things move.
+- **A muffled sound is mostly quieter.** The chime is close to a pure tone, so cutting
+  above 1200 Hz takes away about two thirds of its level and leaves a softer sound. On
+  noisy sounds (footsteps, engines) a low-pass sounds more obviously "dull".
+- **Presets are plain numbers.** `ReverbParams::preset(ReverbPreset::Hall)` returns a
+  `ReverbParams` (`level`, `roomSize`, `damping`, `width`) that you can tweak before
+  passing it to `setReverb`.
+- **Only sound effects reverberate.** The hum and the chimes are effects, so both pick up
+  the reverb. Music never does, and a sound played with `{.reverbSend = 0.0f}` stays dry,
+  which suits interface sounds.
+- **Try every effect live.** In the debug UI, open **Engine → Audio → Audio effects** for
+  sliders on each bus, reverb presets and a reset button.
+
+**Run it:** press **R** a few times and listen to the hum and the chimes move from a dry
+field to a room, a hall and a cave. Then fly around so the big crate is between you and
+the spheres: chimes from behind it are softer and duller. The debug UI's Sound section
+says whether the last chime was blocked.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.

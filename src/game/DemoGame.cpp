@@ -40,6 +40,15 @@ float srgbToLinear(float c)
     return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
+// True if the straight line from `a` to `b` passes through a sphere: a cheap
+// stand-in for "is the big crate in the way?" when deciding to muffle a sound.
+bool lineHitsSphere(glm::vec3 a, glm::vec3 b, glm::vec3 centre, float radius)
+{
+    const glm::vec3 ab = b - a;
+    const float t = std::clamp(glm::dot(centre - a, ab) / glm::dot(ab, ab), 0.0f, 1.0f);
+    return glm::distance(a + ab * t, centre) < radius;
+}
+
 } // namespace
 
 void DemoGame::onInit(core::Application& app)
@@ -110,6 +119,11 @@ void DemoGame::onFixedUpdate(core::Application& app, float dt)
         ping.pitch = notes[i];
         ping.spatial = true;
         ping.position = {std::cos(a) * 4.0f, 0.8f, std::sin(a) * 4.0f};
+        // Behind the big crate (seen from the camera)? Then muffle it, as a real
+        // obstacle would: walls let the low frequencies through best.
+        lastChimeBlocked_ = lineHitsSphere(camera_.position, ping.position, {0.0f, 1.5f, 0.0f}, 1.3f);
+        if (lastChimeBlocked_)
+            ping.lowPassHz = 1200.0f;
         app.audio().play(pingSound_, ping);
     }
 }
@@ -134,6 +148,10 @@ void DemoGame::onUpdate(core::Application& app, float dt)
         showHelp_ = !showHelp_;
     if (in.keyPressed(SDL_SCANCODE_M))
         app.audio().setMuted(!app.audio().muted());
+    if (in.keyPressed(SDL_SCANCODE_R)) { // Off -> Room -> Hall -> Cave -> Off
+        reverbPreset_ = (reverbPreset_ + 1) % 4;
+        app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
+    }
 
     updateCamera(app, dt);
     // The player hears the world from the camera.
@@ -253,6 +271,10 @@ void DemoGame::onDebugUI(core::Application& app)
             app.audio().setVolume(crateHum_, humVolume_);
         if (ImGui::Button("Chime now"))
             pingTimer_ = 0.0f; // onFixedUpdate plays it on the next step
+        ImGui::Text("Last chime: %s", lastChimeBlocked_ ? "muffled (behind the crate)" : "clear");
+        const char* presets[] = {"Off", "Room", "Hall", "Cave"};
+        if (ImGui::Combo("Reverb", &reverbPreset_, presets, 4))
+            app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
     }
 
     // Our own textures, shown inside the UI.
@@ -339,12 +361,15 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
         hud_->drawText(font_, "WIREFRAME", {viewport.x - 16.0f * ui, 12.0f * ui}, tag);
     if (app.audio().muted())
         hud_->drawText(font_, "MUTED", {viewport.x - 16.0f * ui, 34.0f * ui}, tag);
+    const char* reverbNames[] = {"", "REVERB: ROOM", "REVERB: HALL", "REVERB: CAVE"};
+    if (reverbPreset_ > 0)
+        hud_->drawText(font_, reverbNames[reverbPreset_], {viewport.x - 16.0f * ui, 56.0f * ui}, tag);
 
     // Bottom: a help panel, sized to fit its text.
     if (showHelp_) {
         const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
-                           "Shift: fast      F1 / (Y): wireframe      M: mute      V: vsync      H: hide help\n"
-                           "` (below Esc): debug UI";
+                           "Shift: fast      F1 / (Y): wireframe      M: mute      R: reverb      V: vsync\n"
+                           "H: hide help      ` (below Esc): debug UI";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;
         const glm::vec2 size = font_.measure(help, style.size);
