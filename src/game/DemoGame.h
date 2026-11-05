@@ -61,4 +61,10 @@ private:
 
     int reverbPreset_ = 0;         // index into audio::ReverbPreset (0 = off), cycled with R
     bool lastChimeBlocked_ = false; // was the last chime behind the big crate?
+
+    // A drone circling the scene with a buzzing motor: listen to its pitch as it passes.
+    audio::SoundHandle droneSound_;
+    float droneAngle_ = 0.0f;     // position on its circle (radians), advanced in onFixedUpdate
+    float prevDroneAngle_ = 0.0f;
+    float droneSpeed_ = 18.0f;    // units per second
 };

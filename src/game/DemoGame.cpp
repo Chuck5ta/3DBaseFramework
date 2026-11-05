@@ -49,6 +49,15 @@ bool lineHitsSphere(glm::vec3 a, glm::vec3 b, glm::vec3 centre, float radius)
     return glm::distance(a + ab * t, centre) < radius;
 }
 
+// The drone's flight path: a 12-unit circle around the scene, bobbing up and down.
+// It passes just behind the camera's starting position.
+constexpr float kDroneRadius = 12.0f;
+
+glm::vec3 droneAt(float angle)
+{
+    return {std::cos(angle) * kDroneRadius, 4.0f + std::sin(angle * 2.0f) * 0.8f, std::sin(angle) * kDroneRadius};
+}
+
 } // namespace
 
 void DemoGame::onInit(core::Application& app)
@@ -86,6 +95,19 @@ void DemoGame::onInit(core::Application& app)
     pingSound_ = core::assetPath("sounds/ping.wav");
     app.audio().preload(pingSound_);
 
+    // The drone's motor: a 3D sound that follows it (see onUpdate). Its Doppler is
+    // doubled: realistic Doppler at these speeds is subtle, and games usually
+    // exaggerate it a little.
+    audio::PlayParams drone;
+    drone.volume = 0.7f;
+    drone.loop = true;
+    drone.spatial = true;
+    drone.position = droneAt(droneAngle_);
+    drone.minDistance = 3.0f;
+    drone.maxDistance = 80.0f;
+    drone.doppler = 2.0f;
+    droneSound_ = app.audio().play(core::assetPath("sounds/drone_loop.wav"), drone);
+
     camera_.position = {0.0f, 3.0f, 10.0f};
     camera_.lookAt({0.0f, 1.0f, 0.0f});
 }
@@ -104,6 +126,8 @@ void DemoGame::onFixedUpdate(core::Application& app, float dt)
     prevSimTime_ = simTime_;
     spin_ += dt * 0.6f; // radians per second
     simTime_ += dt;
+    prevDroneAngle_ = droneAngle_;
+    droneAngle_ += droneSpeed_ / kDroneRadius * dt; // angle = distance / radius
 
     // Every 2 seconds the next sphere chimes from where it stands, each on its own
     // note of a pentatonic scale (pitch = playback rate).
@@ -156,6 +180,10 @@ void DemoGame::onUpdate(core::Application& app, float dt)
     updateCamera(app, dt);
     // The player hears the world from the camera.
     app.audio().setListener(camera_.position, camera_.forward(), camera_.up());
+    // Move the drone's sound with the drone. The audio engine works out its
+    // velocity from these positions, and from that the Doppler pitch.
+    const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, app.interpolationAlpha());
+    app.audio().setPosition(droneSound_, droneAt(droneAngle));
 
     // Slowly move the sun around the scene (unless switched off in the debug UI).
     if (animateSun_) {
@@ -275,6 +303,13 @@ void DemoGame::onDebugUI(core::Application& app)
         const char* presets[] = {"Off", "Room", "Hall", "Cave"};
         if (ImGui::Combo("Reverb", &reverbPreset_, presets, 4))
             app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
+        ImGui::SeparatorText("Doppler");
+        ImGui::SliderFloat("Drone speed", &droneSpeed_, 0.0f, 40.0f, "%.0f units/s");
+        float factor = app.audio().dopplerFactor();
+        if (ImGui::SliderFloat("Doppler factor", &factor, 0.0f, 4.0f, "%.1f"))
+            app.audio().setDopplerFactor(factor);
+        const float pitch = app.audio().dopplerPitch(droneSound_);
+        ImGui::Text("Drone pitch: %+.1f%%", double((pitch - 1.0f) * 100.0f));
     }
 
     // Our own textures, shown inside the UI.
@@ -329,6 +364,20 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
         s = glm::scale(s, glm::vec3(1.2f));
         meshRenderer_->draw(sphere_, s, {nullptr, palette[i]});
     }
+
+    // The drone: a dark body facing along its path, four rotor discs and a red light.
+    const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, alpha);
+    glm::mat4 d = glm::translate(glm::mat4(1.0f), droneAt(droneAngle));
+    d = glm::rotate(d, -droneAngle, glm::vec3(0, 1, 0));
+    const glm::vec4 dark(0.18f, 0.2f, 0.24f, 1.0f);
+    meshRenderer_->draw(cube_, glm::scale(d, glm::vec3(0.7f, 0.18f, 0.45f)), {nullptr, dark});
+    for (int i = 0; i < 4; ++i) {
+        const glm::vec3 corner((i & 1) ? 0.55f : -0.55f, 0.12f, (i & 2) ? 0.4f : -0.4f);
+        meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, corner), glm::vec3(0.6f, 0.05f, 0.6f)),
+                            {nullptr, {0.35f, 0.38f, 0.42f, 1.0f}});
+    }
+    meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, {0.0f, 0.12f, 0.0f}), glm::vec3(0.18f)),
+                        {nullptr, {1.0f, 0.15f, 0.1f, 1.0f}});
 
     meshRenderer_->end();
 

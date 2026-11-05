@@ -11,7 +11,7 @@ scene showing how they fit together.
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
-| Audio | 3D positional sound, effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
+| Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
 | Math / images | Vectors & matrices, PNG/JPG loading | GLM, stb_image |
 
@@ -20,6 +20,8 @@ All dependencies are downloaded automatically by CMake at a pinned version.
 For a deeper look at how it all fits together, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Step-by-step build instructions for Windows, Linux and Steam Deck are in [docs/BUILDING.md](docs/BUILDING.md).
 To learn the framework by rebuilding the demo step by step, follow [docs/TUTORIAL.md](docs/TUTORIAL.md).
+Starting a chat with an AI assistant about a game built on this framework? Attach
+[docs/AI_BRIEFING.md](docs/AI_BRIEFING.md): a compact summary of the API, conventions and workflow.
 
 ---
 
@@ -201,6 +203,9 @@ Tips
   muffle one sound behind a wall with `app.audio().setLowPass(handle, 1200.0f)`, or every
   effect with `setLowPass(audio::Bus::Sfx, ...)`. Changes glide smoothly. Try them live in the
   debug UI (Engine → Audio → Audio effects).
+- Doppler is automatic for 3D sounds: move a sound with `app.audio().setPosition(handle, p)`
+  every frame and it rises in pitch as it approaches. Set `AppConfig::audio.speedOfSound` to
+  match your units (343 = metres) and `dopplerFactor` to exaggerate it.
 - Debug UI: press **`** (below Esc) in a Debug build. Add your own windows by overriding
   `onDebugUI(core::Application&)` and calling ImGui there, e.g.
   `ImGui::SliderFloat("Speed", &speed_, 0.0f, 500.0f);`.

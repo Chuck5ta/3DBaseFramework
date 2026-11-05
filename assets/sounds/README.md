@@ -4,6 +4,7 @@
 |---|---|
 | `hum_loop.wav` | Machine hum, 2 s, loops seamlessly (used as a 3D sound on the spinning crate) |
 | `ping.wav` | Small bell chime (played from the spheres, positioned in 3D) |
+| `drone_loop.wav` | Buzzing propeller motor, 1 s, loops seamlessly (the flying drone; you hear the Doppler effect as it passes) |
 
 These sounds were synthesised for this project (sine tones, filtered noise and simple
 envelopes; mono, 48 kHz, 16-bit WAV). They are released into the public domain (CC0):

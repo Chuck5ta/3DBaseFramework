@@ -7,7 +7,7 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-3D sound, audio effects and a debug UI.
+3D sound with Doppler, audio effects and a debug UI.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -24,6 +24,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [8](#step-8--3d-sound) | Positional audio with `app.audio()` | A humming crate and chiming spheres; **M** mutes |
 | [9](#step-9--a-debug-ui) | A Dear ImGui window with `onDebugUI` | Live camera, lighting and fog controls |
 | [10](#step-10--reverb-and-muffled-sounds) | Audio effects: reverb presets, a per-sound low-pass | **R** changes the room; chimes behind the crate are muffled |
+| [11](#step-11--a-passing-drone-doppler) | A moving sound and the Doppler effect | A buzzing drone that rises in pitch as it approaches and drops as it passes |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -1160,6 +1161,143 @@ Things to notice:
 field to a room, a hall and a cave. Then fly around so the big crate is between you and
 the spheres: chimes from behind it are softer and duller. The debug UI's Sound section
 says whether the last chime was blocked.
+
+---
+
+## Step 11 — A passing drone (Doppler)
+
+When a car or a plane passes you, its sound jumps from high to low. That's the **Doppler
+effect**: a sound moving towards you is squeezed to a higher pitch, and one moving away
+is stretched lower. It's one of the strongest cues that something is *moving*, rather
+than just being somewhere.
+
+The audio engine does it for every 3D (spatial) sound. You don't give it any speeds: each
+frame it works out how fast each sound and the listener moved from your `setPosition` and
+`setListener` calls. So a moving sound only needs its position updated every frame, which
+is what a moving sound needs anyway.
+
+| Setting | Where | Meaning |
+|---|---|---|
+| `speedOfSound` | `AudioDesc`, or `setSpeedOfSound` | In *your* world units per second. 343 if one unit is a metre (the default) |
+| `dopplerFactor` | `AudioDesc`, or `setDopplerFactor` | For every sound: 0 = off, 1 = realistic, 2-3 = exaggerated |
+| `PlayParams::doppler` | Per sound | Multiplies the engine's factor for this sound; 0 = never shifts |
+
+This step adds a drone that circles the scene with a buzzing motor. The project ships its
+sound, `assets/sounds/drone_loop.wav` (a seamless 1-second loop, CC0 like the others).
+
+In **`MyGame.h`**, add at the end of the members:
+
+```cpp
+    // A drone circling the scene with a buzzing motor: listen to its pitch as it passes.
+    audio::SoundHandle droneSound_;
+    float droneAngle_ = 0.0f;     // position on its circle (radians), advanced in onFixedUpdate
+    float prevDroneAngle_ = 0.0f;
+    float droneSpeed_ = 18.0f;    // units per second
+```
+
+In **`MyGame.cpp`**, add the drone's flight path in the unnamed namespace, after
+`lineHitsSphere`:
+
+```cpp
+// The drone's flight path: a 12-unit circle around the scene, bobbing up and down.
+// It passes just behind the camera's starting position.
+constexpr float kDroneRadius = 12.0f;
+
+glm::vec3 droneAt(float angle)
+{
+    return {std::cos(angle) * kDroneRadius, 4.0f + std::sin(angle * 2.0f) * 0.8f, std::sin(angle) * kDroneRadius};
+}
+```
+
+Start its sound in `onInit`, after the chime is preloaded:
+
+```cpp
+    // The drone's motor: a 3D sound that follows it (see onUpdate). Its Doppler is
+    // doubled: realistic Doppler at these speeds is subtle, and games usually
+    // exaggerate it a little.
+    audio::PlayParams drone;
+    drone.volume = 0.7f;
+    drone.loop = true;
+    drone.spatial = true;
+    drone.position = droneAt(droneAngle_);
+    drone.minDistance = 3.0f;
+    drone.maxDistance = 80.0f;
+    drone.doppler = 2.0f;
+    droneSound_ = app.audio().play(core::assetPath("sounds/drone_loop.wav"), drone);
+```
+
+Fly it in `onFixedUpdate`, after `simTime_ += dt;`:
+
+```cpp
+    prevDroneAngle_ = droneAngle_;
+    droneAngle_ += droneSpeed_ / kDroneRadius * dt; // angle = distance / radius
+```
+
+Move its sound with it in `onUpdate`, after `setListener`:
+
+```cpp
+    // Move the drone's sound with the drone. The audio engine works out its
+    // velocity from these positions, and from that the Doppler pitch.
+    const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, app.interpolationAlpha());
+    app.audio().setPosition(droneSound_, droneAt(droneAngle));
+```
+
+Draw it in `onRender`, after the spheres and before `meshRenderer_->end();`:
+
+```cpp
+    // The drone: a dark body facing along its path, four rotor discs and a red light.
+    const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, alpha);
+    glm::mat4 d = glm::translate(glm::mat4(1.0f), droneAt(droneAngle));
+    d = glm::rotate(d, -droneAngle, glm::vec3(0, 1, 0));
+    const glm::vec4 dark(0.18f, 0.2f, 0.24f, 1.0f);
+    meshRenderer_->draw(cube_, glm::scale(d, glm::vec3(0.7f, 0.18f, 0.45f)), {nullptr, dark});
+    for (int i = 0; i < 4; ++i) {
+        const glm::vec3 corner((i & 1) ? 0.55f : -0.55f, 0.12f, (i & 2) ? 0.4f : -0.4f);
+        meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, corner), glm::vec3(0.6f, 0.05f, 0.6f)),
+                            {nullptr, {0.35f, 0.38f, 0.42f, 1.0f}});
+    }
+    meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, {0.0f, 0.12f, 0.0f}), glm::vec3(0.18f)),
+                        {nullptr, {1.0f, 0.15f, 0.1f, 1.0f}});
+```
+
+And in `onDebugUI`, at the end of the **Sound** section:
+
+```cpp
+        ImGui::SeparatorText("Doppler");
+        ImGui::SliderFloat("Drone speed", &droneSpeed_, 0.0f, 40.0f, "%.0f units/s");
+        float factor = app.audio().dopplerFactor();
+        if (ImGui::SliderFloat("Doppler factor", &factor, 0.0f, 4.0f, "%.1f"))
+            app.audio().setDopplerFactor(factor);
+        const float pitch = app.audio().dopplerPitch(droneSound_);
+        ImGui::Text("Drone pitch: %+.1f%%", double((pitch - 1.0f) * 100.0f));
+```
+
+Things to notice:
+
+- **Positions every frame are all it takes.** The engine compares each sound's position
+  with the previous frame's, smooths the result over about a tenth of a second (so
+  uneven frame times don't wobble the pitch), and hands the velocities to miniaudio.
+- **The listener moves too.** Fly towards the humming crate quickly (hold **Shift**) and
+  its hum rises slightly; fly away and it drops. That's the same effect, from the
+  listener's motion.
+- **Teleports are ignored.** A jump faster than sound (respawning, a cut to a new camera)
+  isn't treated as a real speed, so it doesn't produce a squeal.
+- **Realistic Doppler is subtle.** At 18 units per second (65 km/h, if units are metres) the
+  real shift is about 5%. The drone doubles it with `doppler = 2.0f`; most games
+  exaggerate it like this. Very high speeds are capped so the pitch can't run away.
+- **Choose your speed of sound to match your units.** If your world uses centimetres,
+  set `speedOfSound = 34300`; with metres the default is right.
+- **Known velocities.** If you already know an object's velocity (from physics, say),
+  `app.audio().setVelocity(handle, v)` uses it instead of the estimate.
+  `setListenerVelocity` does the same for the listener.
+- **Music and plain (non-spatial) sounds are never shifted**, and neither is anything
+  played with `{.doppler = 0.0f}`: good for a 3D sound that shouldn't wobble, such as a
+  radio held by the player.
+
+**Run it:** stand still near the start and listen as the drone comes round. Its buzz rises
+as it approaches, drops as it passes, and stays low as it flies away. In the debug
+UI's **Sound** section, the "Drone pitch" readout follows it. Raise the drone speed or the
+Doppler factor to exaggerate the effect, or set the factor to 0 to hear the difference.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.

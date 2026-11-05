@@ -101,6 +101,7 @@ src/
     Camera2D.h/.cpp           orthographic camera (screen space for the HUD)
     SpriteBatch.h/.cpp        batched textured quads, drawText
     Font.h/.cpp               TrueType font baked into an atlas (stb_truetype)
+    Animation.h/.cpp          SpriteSheet (grid or Aseprite JSON), clips, Animator
   render3d/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
@@ -272,6 +273,21 @@ write depth, so a HUD drawn after the meshes always appears on top. The demo use
 with `SpriteBatch::drawText(font, utf8, position, TextStyle)`; `TextStyle` sets size,
 colour, alignment (`Left`/`Center`/`Right`), line spacing and pixel snapping.
 
+**`render2d::SpriteSheet` / `Animator`** (`render2d/Animation.h`): sprite-sheet
+animation. A `SpriteSheet` owns a texture, its frames (UV rectangle, pixel size, default
+duration) and named `AnimationClip`s (frame indices, per-frame durations, `Loop` / `Once` /
+`PingPong`, and named events on frames). Sheets come from a grid (`loadGrid`, clips added
+in code) or from **Aseprite's JSON export** (`loadAseprite`: tags become clips with their
+frame durations and directions; parsed with nlohmann/json, keeping file order for "Hash"
+exports). They load with nearest filtering and no mipmaps, so neighbouring frames never
+blend. An `Animator` plays one clip for one object: `play` (a no-op if that clip is
+already playing, so the game can state the wanted clip every step), `update(dt)` (handles
+several frames per step, fires the events of every frame entered, and has a tiny tolerance
+so 60 Hz steps change frames exactly on time), `uv(flipX)`, `finished()`,
+`eventFired(name)`, and a `speed` multiplier. It points at its sheet, which must stay alive
+and in place.
+In Game3D it can animate HUD icons or 2D overlays; see the Game2D tutorial, step 12.
+
 ### 3.5 audio
 
 **`audio::AudioEngine`** plays sound effects, music and 3D positional sound with
@@ -303,10 +319,20 @@ flowchart LR
   ignored, so a game can keep handles without tracking when sounds end.
 - **`PlayParams`**: `volume`, `pitch`, `pan`, `loop`, for 3D sounds `spatial`,
   `position`, `minDistance`, `maxDistance`, `rolloff` (inverse-distance attenuation), and
-  the sound's own effects: `lowPassHz` and `reverbSend`.
+  the sound's own effects: `lowPassHz` and `reverbSend`, and its `doppler` amount.
 - **3D sound** is relative to a single listener set with `setListener(position, forward,
   up)`, in the same right-handed, +Y-up axes as `Camera3D`. Use mono files for spatial
   sounds.
+- **Doppler.** Spatial sounds rise in pitch as they approach the listener and fall as
+  they move away (miniaudio's spatializer, using the OpenAL formula). In `update(dt)`,
+  each spatial sound's and the listener's velocity is estimated from how far it moved
+  since the last frame (smoothed over ~0.1 s; a jump faster than sound counts as a
+  teleport, not motion), unless the game sets it with `setVelocity` /
+  `setListenerVelocity`. Velocities are capped at 0.3 × speed of sound ÷ factor, because
+  the formula divides by (speed of sound − factor × speed). Settings: `speedOfSound` (in
+  world units/s; 343 = metres) and `dopplerFactor` globally, `PlayParams::doppler` per
+  sound. `dopplerPitch(handle)` reports the current shift. Non-spatial sounds and music
+  never shift. 2D games get Doppler by playing sounds as spatial in the X/Y plane.
 - **Music** is one streamed track at a time (`playMusic`, `stopMusic`, `pauseMusic`,
   `resumeMusic`). Starting a new track fades the old one out over
   `MusicParams::fadeOutPreviousSeconds`. Music is never spatialised.
@@ -325,8 +351,9 @@ flowchart LR
   its "off" value is skipped entirely, and the reverb does no work while its level is 0.
   The bus and reverb nodes keep processing after their inputs stop, so echo and reverb
   tails finish naturally.
-- **`update()`** is called by `Application` once per frame, after `onUpdate`. It releases
-  voices that have finished playing; nothing else in the game loop depends on audio.
+- **`update(dt)`** is called by `Application` once per frame, after `onUpdate`, with the
+  frame time. It releases voices that have finished playing and updates the Doppler
+  velocities; nothing else in the game loop depends on audio.
 - **No device, no problem.** If no output device can be opened (or `GAME_AUDIO=0` is
   set, or `AudioDesc::enabled` is false), a warning is logged and every call becomes a
   no-op. `AudioDesc::noDevice` runs the mixer without a device so tests can pull samples
@@ -454,7 +481,7 @@ sequenceDiagram
             App->>G: onFixedUpdate(fixedStep)
         end
         App->>G: onUpdate(dt)
-        App->>App: audio.update() (release finished sounds)
+        App->>App: audio.update(dt) (release finished sounds, Doppler velocities)
         opt debug UI visible
             App->>G: onDebugUI() (between ImGui NewFrame and Render)
         end
@@ -710,6 +737,7 @@ maps, roughness, masks) must use `TextureDesc::srgb = false`.
 | stb | pinned commit | image loading (stb_image), font rasterisation (stb_truetype) | header (impl in `Implementations.cpp`) |
 | miniaudio | 0.11.23 | audio output, mixing, decoding (WAV/FLAC/MP3, OGG via its bundled stb_vorbis), 3D sound | header (impl in `audio/MiniaudioImpl.cpp`) |
 | Dear ImGui | 1.92.9 | debug UI, with its SDL3 and Vulkan backends | static library `imgui` |
+| nlohmann/json | 3.12.0 | JSON: Aseprite sprite sheets (and later settings and saves) | header only |
 
 Global definitions: `VK_NO_PROTOTYPES`, `GLM_FORCE_DEPTH_ZERO_TO_ONE`,
 `GLM_FORCE_RADIANS`. On Linux, `third_party` also links `pthread`, `dl` and `m` for
@@ -804,7 +832,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - No skybox (the fog-coloured clear colour stands in for the sky).
 - The debug UI uses one window (no ImGui docking or multi-viewport) and doesn't save its
   layout.
-- Audio: no Doppler, one listener; music is one track at a time. One shared reverb (no
+- Audio: one listener (no split-screen); music is one track at a time. One shared reverb (no
   per-zone reverbs mixed together). Occlusion is the game's decision: muffle a sound with
   `setLowPass(handle, hz)` when something blocks it.
 - No deferred resource destruction; destroy GPU objects only when idle (see §4).
