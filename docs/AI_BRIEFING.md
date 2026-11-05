@@ -34,7 +34,7 @@ fits together.
 ```
 src/
   main.cpp              AppConfig + run the game (swap DemoGame for your game here)
-  core/                 Application (loop, hooks), Window, Input, Paths, Log
+  core/                 Application (loop, hooks), Window, Input, Actions, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
   render3d/             MeshRenderer (Material, SceneLighting), Mesh (+ primitives), Camera3D
@@ -213,14 +213,16 @@ and runs the loop. A game is a subclass of `core::Game`; every hook is optional:
 | `onResize(app, w, h)` | swapchain size changed (pixels) | resize render targets |
 | `onShutdown(app)` | after `vkDeviceWaitIdle` | destroy GPU objects (reset `unique_ptr`s) |
 
-Frame order: events → `onFixedUpdate` × n → `onUpdate` → audio update → `onDebugUI` →
+Frame order: events → actions update → `onFixedUpdate` × n → `onUpdate` → audio update → `onDebugUI` →
 `onPreRender` → `onRender` → debug UI drawn on top → present.
 
 **Fixed timestep with interpolation.** Simulate in `onFixedUpdate` and keep the previous
 state. Render `glm::mix(prev, current, app.interpolationAlpha())` so motion is smooth at any
-refresh rate. Read input in `onUpdate` into a member and apply it in `onFixedUpdate`.
+refresh rate. Read held input (movement) in `onUpdate` into a member and apply it in
+`onFixedUpdate`; for one-off presses read in `onFixedUpdate` (a punch, a jump) use
+`app.actions().consume("punch")`, so a press is never lost between steps or used twice.
 
-**`core::Application`:** `window()`, `input()`, `gpu()` (`gfx::VulkanContext&`),
+**`core::Application`:** `window()`, `input()`, `actions()`, `gpu()` (`gfx::VulkanContext&`),
 `renderer()` (`gfx::Renderer&`), `audio()` (`audio::AudioEngine&`), `debugUI()`
 (`debugui::DebugUI*`, **null in Release builds**), `config()`, `time()` (seconds since
 start), `fps()`, `interpolationAlpha()`, `quit()`.
@@ -235,7 +237,52 @@ RGBA, `framesInFlight`), `audio` (see §9), `debugUI` (see §10), `fixedTimestep
 `gfx::FrameContext` (passed to the render hooks): `cmd`, `frameIndex` (index per-frame
 resources with it), `imageIndex`, `frameNumber`, `extent`.
 
-## 5. Input (`core::Input`, `app.input()`)
+## 5. Input
+
+### Input actions (`core::Actions`, `app.actions()`) — use these for gameplay controls
+
+The game names what the player does and asks about the name, never about a key, so every
+control is rebindable and on-screen prompts always match. Define in `onInit`:
+
+```cpp
+using core::Binding;
+core::Actions& actions = app.actions();
+actions.define("left", {Binding::key(SDL_SCANCODE_A), Binding::key(SDL_SCANCODE_LEFT),
+                        Binding::axis(SDL_GAMEPAD_AXIS_LEFTX, -1), Binding::button(SDL_GAMEPAD_BUTTON_DPAD_LEFT)});
+// ...right, up, down the same way...
+actions.define("punch", {Binding::key(SDL_SCANCODE_J), Binding::button(SDL_GAMEPAD_BUTTON_WEST)});
+```
+
+- `Binding::key(scancode)`, `Binding::mouse(SDL_BUTTON_LEFT)`, `Binding::button(SDL_GamepadButton)`,
+  `Binding::axis(SDL_GamepadAxis, ±1)` (one direction of a stick, or a trigger with +1).
+  `define` again replaces the defaults; names are case-sensitive strings.
+- Reading: `down(name)`, `pressed(name)` (this frame; taps shorter than a frame count),
+  `released(name)`, `value(name)` (0..1, analog for sticks/triggers),
+  `vector("left", "right", "up", "down")` (length ≤ 1, **+Y down**; negate Y for 3D forward),
+  `consume(name, bufferSeconds = 0.15f)` (buffered press for `onFixedUpdate`: true once if
+  pressed within the buffer and not used yet). Unknown names warn once and read as idle.
+- Updated once per frame after events and before `onFixedUpdate`, so `pressed` is true for
+  one *frame*: in `onFixedUpdate` (which may run 0 or 2+ times per frame) use `consume`.
+- Rebinding: `bindings(name)`, `defaultBindings(name)`, `setBindings`, `addBinding`,
+  `removeBinding`, `resetToDefaults(name)`, `resetAllToDefaults()`, `actionsUsing(binding)`
+  (clashes; sharing is allowed), `names()` (definition order). `capture()` returns the first
+  input pressed this frame (`std::optional<Binding>`) for "press a key" screens; while
+  waiting, the game should ignore its own controls, and Esc conventionally cancels.
+- Saving: `saveBindings()` → JSON text `{"left": ["key:A", "key:Left", "axis:leftx-", "pad:dpleft"], ...}`;
+  `loadBindings(text)` → false if unreadable; unknown actions/inputs are skipped.
+  `Binding::toString()/fromString()` for single bindings. (No settings file yet: store the text.)
+- Prompts: `lastDevice()` (`core::InputDevice::KeyboardMouse` or `Gamepad`, whichever was
+  touched last), `prompt(name)` → that device's first binding as text ("Space", "Left
+  Arrow", "A", "Cross", "Left Stick Up", "RB", "LT"), `displayName(binding)`. Pad names
+  follow the connected pad: Xbox and Steam Deck A/B/X/Y, PlayStation Cross/Circle/
+  Square/Triangle (L1, R2...), Nintendo labels. List the stick before the d-pad in
+  defaults if the stick should be the one shown. `pressThreshold` (0.5) = how far a stick
+  must move to count as down.
+- The Game2D demo (tutorial step 13) shows a complete rebinding window in the debug UI.
+
+### Raw input (`core::Input`, `app.input()`) — for things that aren't actions
+
+The mouse wheel and cursor, editor hot keys, and anything needing a specific device.
 
 - Keys by **scancode** (layout-independent): `keyDown`, `keyPressed`, `keyReleased`
   (`SDL_SCANCODE_W`, ...). Presses are latched, so short taps are never missed.
@@ -421,6 +468,9 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
 
 ## 11. Conventions and rules for writing code here
 
+- **Gameplay controls are named actions** (`app.actions()`), never hard-coded keys: they
+  must be rebindable, and help text uses `prompt()`. Raw `app.input()` is for the wheel,
+  cursor and debug/editor keys.
 - **Read input in `onUpdate`, simulate in `onFixedUpdate`, draw in `onRender`.**
   Interpolate rendered positions with `interpolationAlpha()`.
 - **GPU object lifetime:** create in `onInit`; destroy in `onShutdown` (the GPU is idle)
@@ -479,6 +529,9 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   from `MeshData` or the primitives.
 - One directional light, no shadows, not PBR, no anti-aliasing, no skybox (the fog-coloured
   clear colour stands in), no frustum culling or instancing (one draw call per object).
+- Input actions: one gamepad (no local multiplayer yet), no chords/combos ("Ctrl+S",
+  double-tap; a fighting-game move list would be game code on top of actions), the wheel
+  and cursor aren't bindable, and bindings aren't saved to disk by the framework yet.
 - One audio listener (no split-screen); one music track at a time; one shared reverb.
 - The debug UI draws inside the game window (no ImGui docking or separate OS windows) and
   doesn't save its layout.

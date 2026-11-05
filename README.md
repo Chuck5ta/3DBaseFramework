@@ -8,6 +8,7 @@ scene showing how they fit together.
 | Layer | What it does | Library |
 |---|---|---|
 | Platform | Window, keyboard/mouse, gamepads (incl. Steam Deck controls), hi-DPI | SDL3 |
+| Input actions | Named actions ("jump") with rebindable keys/buttons/sticks, button prompts for the device in use (Xbox, PlayStation, Nintendo labels), buffered presses, bindings as JSON | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
@@ -99,6 +100,7 @@ src/
     Application         owns everything, runs the main loop
     Window              SDL window, Vulkan surface, fullscreen
     Input               keyboard, mouse, gamepad (pressed / down / released)
+    Actions             named input actions: rebindable, with button prompts
     Paths               shaderPath(), assetPath()
     Log.h               LOG_INFO/WARN/ERROR, core::fatal()
   audio/                sound effects, music, 3D sound (shared with Game2D)
@@ -139,6 +141,7 @@ copied between them (or later moved into a shared library).
 ```
 Application::run()
  ├─ poll SDL events → Input, window resize → Renderer
+ ├─ Actions update             named actions from this frame's input
  ├─ Game::onFixedUpdate(dt)   0..n times at a fixed 60 Hz (gameplay/physics)
  ├─ Game::onUpdate(dt)        once per frame (input, camera)
  └─ Renderer
@@ -206,6 +209,11 @@ Tips
 - Doppler is automatic for 3D sounds: move a sound with `app.audio().setPosition(handle, p)`
   every frame and it rises in pitch as it approaches. Set `AppConfig::audio.speedOfSound` to
   match your units (343 = metres) and `dopplerFactor` to exaggerate it.
+- Input actions: define once in `onInit` with
+  `app.actions().define("jump", {core::Binding::key(SDL_SCANCODE_SPACE), core::Binding::button(SDL_GAMEPAD_BUTTON_SOUTH)})`,
+  then ask `actions.pressed("jump")`, `actions.vector("left", "right", "up", "down")`, or
+  `actions.consume("jump")` in `onFixedUpdate` (a buffered press). `actions.prompt("jump")`
+  gives "Space" or "A" for the help text; players can rebind with `capture()` + `addBinding()`.
 - Debug UI: press **`** (below Esc) in a Debug build. Add your own windows by overriding
   `onDebugUI(core::Application&)` and calling ImGui there, e.g.
   `ImGui::SliderFloat("Speed", &speed_, 0.0f, 500.0f);`.
