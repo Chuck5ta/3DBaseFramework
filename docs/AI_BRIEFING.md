@@ -7,7 +7,7 @@
 > (design and internals), `docs/TUTORIAL.md` (the demo built step by step) or
 > `docs/BUILDING.md` (Windows, Linux, Steam Deck builds).
 >
-> Framework state: **2026-11-05**. If the user's copy of the framework is older or newer,
+> Framework state: **2026-11-06**. If the user's copy of the framework is older or newer,
 > trust the source code over this file.
 
 ## 1. What it is
@@ -34,7 +34,7 @@ fits together.
 ```
 src/
   main.cpp              AppConfig + run the game (swap DemoGame for your game here)
-  core/                 Application (loop, hooks), Window, Input, Actions, Paths, Log
+  core/                 Application (loop, hooks), Window, Input, Actions, GameState, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
   render3d/             MeshRenderer (Material, SceneLighting), Mesh (+ primitives), Camera3D
@@ -212,8 +212,9 @@ and runs the loop. A game is a subclass of `core::Game`; every hook is optional:
 | `onRender(app, frame)` | inside the main pass (cleared, viewport set) | all drawing |
 | `onResize(app, w, h)` | swapchain size changed (pixels) | resize render targets |
 | `onShutdown(app)` | after `vkDeviceWaitIdle` | destroy GPU objects (reset `unique_ptr`s) |
+| `onPause(app)` / `onResume(app)` | a game state that pauses the game was pushed / is gone | snap interpolation (`prev = current`), pause loops |
 
-Frame order: events → actions update → `onFixedUpdate` × n → `onUpdate` → audio update → `onDebugUI` →
+Frame order: events → actions update → game-state changes → `onFixedUpdate` × n → `onUpdate` → audio update → `onDebugUI` →
 `onPreRender` → `onRender` → debug UI drawn on top → present.
 
 **Fixed timestep with interpolation.** Simulate in `onFixedUpdate` and keep the previous
@@ -222,10 +223,51 @@ refresh rate. Read held input (movement) in `onUpdate` into a member and apply i
 `onFixedUpdate`; for one-off presses read in `onFixedUpdate` (a punch, a jump) use
 `app.actions().consume("punch")`, so a press is never lost between steps or used twice.
 
-**`core::Application`:** `window()`, `input()`, `actions()`, `gpu()` (`gfx::VulkanContext&`),
+**`core::Application`:** `window()`, `input()`, `actions()`, `states()`, `gpu()` (`gfx::VulkanContext&`),
 `renderer()` (`gfx::Renderer&`), `audio()` (`audio::AudioEngine&`), `debugUI()`
 (`debugui::DebugUI*`, **null in Release builds**), `config()`, `time()` (seconds since
 start), `fps()`, `interpolationAlpha()`, `quit()`.
+
+**Game states** (`core/GameState.h`, `app.states()`): title screens, pause menus, game-over
+screens, as classes derived from `core::GameState`, on a stack **above** the `Game` (which
+is always the bottom layer). Use them instead of `if (paused)` checks in the game.
+
+```cpp
+class PauseState : public core::GameState {
+public:
+    explicit PauseState(MyGame& game) : game_(game) { name = "Pause"; } // pausesBelow = true by default
+    void onUpdate(core::Application& app, float) override {
+        if (app.actions().pressed("pause")) app.states().pop();
+    }
+    void onRender(core::Application& app, gfx::FrameContext& frame) override { /* dim + menu */ }
+private:
+    MyGame& game_; // states usually reach the game's resources through a reference
+};
+// in MyGame::onUpdate:  if (app.actions().pressed("pause")) app.states().push<PauseState>(*this);
+```
+
+- Hooks: the `Game`'s (`onFixedUpdate`, `onUpdate`, `onPreRender`, `onRender`, `onResize`,
+  `onDebugUI`) plus `onEnter`/`onExit` (added/removed; destroyed after `onExit`) and
+  `onPause`/`onResume`. Settings (public members, set in the constructor): `pausesBelow`
+  (default **true**: layers below get no `onFixedUpdate`/`onUpdate`), `hidesBelow` (default
+  false: layers below aren't drawn), `name` (shown in the Engine panel's "Game states").
+- Update and draw go bottom to top, from the lowest layer not paused/hidden by a state
+  above. `onDebugUI` reaches every state. `timeInState()` = seconds active (not paused).
+- `push(std::unique_ptr)` / `push<T>(args...)`, `pop()`, `replace<T>(args...)` (pop then
+  push, no resume in between), `clear()`: **queued, applied at the start of the next frame**,
+  so a state may pop itself from its own hooks. `onEnter`/`onExit` may queue more changes
+  (applied in the same frame). Reading: `empty()`, `size()`, `top()`, `at(i)` (0 = bottom),
+  `find<T>()`, `isActive(state)`, `gamePaused()`, `changesPending()`.
+- When the stack changes, `Actions::clearPresses()` runs: a press that closed a menu can't
+  also act below (incl. buffered `consume`).
+- Rendering still interpolates with `interpolationAlpha()` while paused, which keeps
+  changing: in `Game::onPause` (or a state's) set previous = current state, or the frozen
+  picture shimmers.
+- At shutdown (GPU idle): states `onExit` top first, then `Game::onShutdown`.
+- To push a state from `onInit` (start on a title screen) is fine: it applies before the
+  first update.
+- Game2D tutorial step 14 / `DemoGame`: `Menu` (keys, pad, mouse), `MenuState` base, title,
+  pause (muffles audio with a master-bus low-pass in `onEnter`/`onExit`) and result screens.
 
 **`core::AppConfig`** (set in `main.cpp`): `window` (`title`, `width`, `height`,
 `resizable`, `fullscreen`), `renderer` (`vsync`, `depthBuffer`, `clearColor` as **linear**
@@ -468,6 +510,8 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
 
 ## 11. Conventions and rules for writing code here
 
+- **Menus and pausing are game states** (`app.states()`), not flags checked all over the
+  game.
 - **Gameplay controls are named actions** (`app.actions()`), never hard-coded keys: they
   must be rebindable, and help text uses `prompt()`. Raw `app.input()` is for the wheel,
   cursor and debug/editor keys.
@@ -523,12 +567,14 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   feature is added, update `README.md`, `docs/ARCHITECTURE.md`, `docs/BUILDING.md` if
   relevant, the tutorial, **and this briefing**.
 
-## 13. Known limitations (as of 2026-11-05)
+## 13. Known limitations (as of 2026-11-06)
 
 - No model loading yet (glTF via cgltf/fastgltf is the natural next step); meshes come
   from `MeshData` or the primitives.
 - One directional light, no shadows, not PBR, no anti-aliasing, no skybox (the fog-coloured
   clear colour stands in), no frustum culling or instancing (one draw call per object).
+- Game states: no built-in transitions (fades) or menu widgets (copy the Game2D demo's
+  `Menu`); states are made in code.
 - Input actions: one gamepad (no local multiplayer yet), no chords/combos ("Ctrl+S",
   double-tap; a fighting-game move list would be game code on top of actions), the wheel
   and cursor aren't bindable, and bindings aren't saved to disk by the framework yet.

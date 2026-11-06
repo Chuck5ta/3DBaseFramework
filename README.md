@@ -9,6 +9,7 @@ scene showing how they fit together.
 |---|---|---|
 | Platform | Window, keyboard/mouse, gamepads (incl. Steam Deck controls), hi-DPI | SDL3 |
 | Input actions | Named actions ("jump") with rebindable keys/buttons/sticks, button prompts for the device in use (Xbox, PlayStation, Nintendo labels), buffered presses, bindings as JSON | nlohmann/json |
+| Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
@@ -101,6 +102,7 @@ src/
     Window              SDL window, Vulkan surface, fullscreen
     Input               keyboard, mouse, gamepad (pressed / down / released)
     Actions             named input actions: rebindable, with button prompts
+    GameState           title / pause / game-over screens on a stack (app.states())
     Paths               shaderPath(), assetPath()
     Log.h               LOG_INFO/WARN/ERROR, core::fatal()
   audio/                sound effects, music, 3D sound (shared with Game2D)
@@ -142,6 +144,8 @@ copied between them (or later moved into a shared library).
 Application::run()
  ├─ poll SDL events → Input, window resize → Renderer
  ├─ Actions update             named actions from this frame's input
+ ├─ States: apply push/pop    queued last frame (onEnter/onExit, onPause/onResume)
+ │    (below, "Game::" = the Game, then each state, skipping paused or hidden ones)
  ├─ Game::onFixedUpdate(dt)   0..n times at a fixed 60 Hz (gameplay/physics)
  ├─ Game::onUpdate(dt)        once per frame (input, camera)
  └─ Renderer
@@ -209,6 +213,10 @@ Tips
 - Doppler is automatic for 3D sounds: move a sound with `app.audio().setPosition(handle, p)`
   every frame and it rises in pitch as it approaches. Set `AppConfig::audio.speedOfSound` to
   match your units (343 = metres) and `dopplerFactor` to exaggerate it.
+- Game states: derive from `core::GameState`, then `app.states().push<PauseState>(...)`.
+  By default a state pauses the game below it (its `onUpdate`/`onFixedUpdate` stop) and
+  lets it show through; `pop()` resumes. Changes apply at the start of the next frame, so
+  a state can pop itself. (The Game2D tutorial, step 14, builds a title, pause and game-over screen.)
 - Input actions: define once in `onInit` with
   `app.actions().define("jump", {core::Binding::key(SDL_SCANCODE_SPACE), core::Binding::button(SDL_GAMEPAD_BUTTON_SOUTH)})`,
   then ask `actions.pressed("jump")`, `actions.vector("left", "right", "up", "down")`, or
