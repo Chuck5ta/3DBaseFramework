@@ -10,6 +10,9 @@ int main(int, char**)
 {
     core::AppConfig config;
     config.window.title = "Game3D";
+    // Settings and saves go in a folder named after these (see core/Paths.h).
+    config.organization = "MyStudio"; // your studio's name, or your own
+    config.application = "Game3D";
     config.window.width = 1280;
     config.window.height = 720;
     config.renderer.vsync = true;

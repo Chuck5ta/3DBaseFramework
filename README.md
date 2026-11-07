@@ -10,6 +10,7 @@ scene showing how they fit together.
 | Platform | Window, keyboard/mouse, gamepads (incl. Steam Deck controls), hi-DPI | SDL3 |
 | Input actions | Named actions ("jump") with rebindable keys/buttons/sticks, button prompts for the device in use (Xbox, PlayStation, Nintendo labels), buffered presses, bindings as JSON | nlohmann/json |
 | Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
+| Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
@@ -103,7 +104,8 @@ src/
     Input               keyboard, mouse, gamepad (pressed / down / released)
     Actions             named input actions: rebindable, with button prompts
     GameState           title / pause / game-over screens on a stack (app.states())
-    Paths               shaderPath(), assetPath()
+    Paths               shaderPath(), assetPath(), saveFolder() (the player's folder)
+    SaveData            save files: get/set values, crash-safe save, backup; app.settings()
     Log.h               LOG_INFO/WARN/ERROR, core::fatal()
   audio/                sound effects, music, 3D sound (shared with Game2D)
     AudioEngine         miniaudio: cached effects, streamed music, listener, mixer
@@ -213,6 +215,15 @@ Tips
 - Doppler is automatic for 3D sounds: move a sound with `app.audio().setPosition(handle, p)`
   every frame and it rises in pitch as it approaches. Set `AppConfig::audio.speedOfSound` to
   match your units (343 = metres) and `dopplerFactor` to exaggerate it.
+- Settings and saves: the framework remembers fullscreen, vsync, volumes, mute and
+  rebound controls in `settings.json` by itself. Add your own with
+  `app.settings().set("game.difficulty", 2)`. For progress, use a `core::SaveData`:
+  `save.load()`, `save.getInt("bestScore")`, `save.set(...)`, `save.save()`.
+  Files go in the player's save folder: `%APPDATA%\MyStudio\Game3D\` on Windows,
+  `~/.local/share/MyStudio/Game3D/` on Linux and Steam Deck. Set `config.organization`
+  and `config.application` in `main.cpp` before you release (and don't change them
+  afterwards, or players lose their saves). While developing: debug UI → Engine →
+  **Settings & saves** to open the folder or reset settings.
 - Game states: derive from `core::GameState`, then `app.states().push<PauseState>(...)`.
   By default a state pauses the game below it (its `onUpdate`/`onFixedUpdate` stop) and
   lets it show through; `pop()` resumes. Changes apply at the start of the next frame, so
@@ -271,6 +282,10 @@ Also handy: the **Steam Deck devkit client** (Steamworks docs → *Steam Deck �
 for Steam Deck*) deploys and runs builds from your PC over the network.
 
 The Windows build also runs on the Deck through Proton, but shipping the native Linux build is better.
+
+Saves and settings live in `~/.local/share/<organization>/<application>/` on the Deck. Steam
+Cloud can sync them with Auto-Cloud (no code): root `WinAppDataRoaming` plus your
+`<organization>/<application>` subfolder, with a Linux root override to `LinuxXdgDataHome`.
 
 Things worth testing on the Deck: 800p resolution, GPU time at 40/60 Hz frame
 limits (Steam's performance overlay helps), suspend/resume (swapchain recreation), on-screen keyboard if you need text input.
