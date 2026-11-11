@@ -86,11 +86,21 @@ Mesh::Mesh(gfx::VulkanContext& ctx, const MeshData& data, const char* debugName)
 
 void Mesh::draw(VkCommandBuffer cmd) const
 {
+    bind(cmd);
+    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+}
+
+void Mesh::bind(VkCommandBuffer cmd) const
+{
     const VkBuffer vb = vertices_.handle();
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
     vkCmdBindIndexBuffer(cmd, indices_.handle(), 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+}
+
+void Mesh::drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset) const
+{
+    vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, vertexOffset, 0);
 }
 
 } // namespace render3d

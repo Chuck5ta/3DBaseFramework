@@ -108,6 +108,14 @@ void DemoGame::onInit(core::Application& app)
     drone.doppler = 2.0f;
     droneSound_ = app.audio().play(core::assetPath("sounds/drone_loop.wav"), drone);
 
+    // The drone's model: a glTF file, the format Blender exports. Its parts are nodes;
+    // look up the rotors by name once, so they can be spun every frame.
+    droneModel_ = render3d::Model::load(app.gpu(), core::assetPath("models/drone.glb"));
+    dronePose_ = droneModel_.defaultPose();
+    const char* rotorNames[4] = {"RotorFL", "RotorFR", "RotorBL", "RotorBR"};
+    for (int i = 0; i < 4; ++i)
+        rotors_[i] = droneModel_.findNode(rotorNames[i]);
+
     camera_.position = {0.0f, 3.0f, 10.0f};
     camera_.lookAt({0.0f, 1.0f, 0.0f});
 }
@@ -184,6 +192,10 @@ void DemoGame::onUpdate(core::Application& app, float dt)
     // velocity from these positions, and from that the Doppler pitch.
     const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, app.interpolationAlpha());
     app.audio().setPosition(droneSound_, droneAt(droneAngle));
+
+    // Spin the rotors: purely visual, so once per frame is enough. They turn faster
+    // when the drone flies faster.
+    rotorAngle_ = std::fmod(rotorAngle_ + (30.0f + droneSpeed_) * dt, glm::two_pi<float>());
 
     // Slowly move the sun around the scene (unless switched off in the debug UI).
     if (animateSun_) {
@@ -365,19 +377,17 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
         meshRenderer_->draw(sphere_, s, {nullptr, palette[i]});
     }
 
-    // The drone: a dark body facing along its path, four rotor discs and a red light.
+    // The drone: its glTF model, facing along its path and banking into the turn.
     const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, alpha);
     glm::mat4 d = glm::translate(glm::mat4(1.0f), droneAt(droneAngle));
-    d = glm::rotate(d, -droneAngle, glm::vec3(0, 1, 0));
-    const glm::vec4 dark(0.18f, 0.2f, 0.24f, 1.0f);
-    meshRenderer_->draw(cube_, glm::scale(d, glm::vec3(0.7f, 0.18f, 0.45f)), {nullptr, dark});
+    d = glm::rotate(d, -droneAngle, glm::vec3(0, 1, 0));            // the model's front (+Z) along the path
+    d = glm::rotate(d, droneSpeed_ * 0.012f, glm::vec3(0, 0, 1));  // lean into the turn
     for (int i = 0; i < 4; ++i) {
-        const glm::vec3 corner((i & 1) ? 0.55f : -0.55f, 0.12f, (i & 2) ? 0.4f : -0.4f);
-        meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, corner), glm::vec3(0.6f, 0.05f, 0.6f)),
-                            {nullptr, {0.35f, 0.38f, 0.42f, 1.0f}});
+        // Diagonal pairs spin the same way, so the drone doesn't twist round.
+        const float direction = (i == 0 || i == 3) ? 1.0f : -1.0f;
+        dronePose_[rotors_[i]].rotation = glm::angleAxis(rotorAngle_ * direction, glm::vec3(0, 1, 0));
     }
-    meshRenderer_->draw(sphere_, glm::scale(glm::translate(d, {0.0f, 0.12f, 0.0f}), glm::vec3(0.18f)),
-                        {nullptr, {1.0f, 0.15f, 0.1f, 1.0f}});
+    meshRenderer_->draw(droneModel_, d, &dronePose_);
 
     meshRenderer_->end();
 

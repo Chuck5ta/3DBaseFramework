@@ -61,6 +61,10 @@ public:
     PipelineBuilder& topology(VkPrimitiveTopology topology);
     PipelineBuilder& polygonMode(VkPolygonMode mode);
     PipelineBuilder& cullMode(VkCullModeFlags mode, VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    // Cull mode and front face become dynamic state (Vulkan 1.3 core): set them with
+    // vkCmdSetCullMode / vkCmdSetFrontFace before drawing (double-sided materials,
+    // mirrored objects) instead of building more pipelines.
+    PipelineBuilder& dynamicCulling(bool enabled = true);
     PipelineBuilder& blend(BlendMode mode);
     PipelineBuilder& depthTest(bool test, bool write, VkCompareOp op = VK_COMPARE_OP_LESS_OR_EQUAL);
     PipelineBuilder& colorFormat(VkFormat format);
@@ -78,6 +82,7 @@ private:
     VkPipelineRasterizationStateCreateInfo rasterizer_{};
     VkPipelineColorBlendAttachmentState blendAttachment_{};
     VkPipelineDepthStencilStateCreateInfo depthStencil_{};
+    bool dynamicCulling_ = false;
     VkFormat colorFormat_ = VK_FORMAT_UNDEFINED;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
     std::vector<VkDescriptorSetLayout> setLayouts_;

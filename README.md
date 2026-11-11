@@ -2,7 +2,8 @@
 
 A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**.
 You own all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a
-depth buffer, a lit, textured mesh renderer with a fly camera and 3D audio, plus a demo
+depth buffer, a lit, textured mesh renderer that also draws glTF models from Blender, a
+fly camera and 3D audio, plus a demo
 scene showing how they fit together.
 
 | Layer | What it does | Library |
@@ -13,6 +14,7 @@ scene showing how they fit together.
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
+| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
@@ -124,14 +126,16 @@ src/
     Font                .ttf/.otf baked into a texture atlas
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
-    MeshRenderer        lit textured meshes (frame UBO, per-object push constants)
+    Model               glTF 2.0 models: parts, materials, textures, poses
+    MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants)
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
   game/
     DemoGame            the example — replace with your game
 shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatically
                         (*.glsl files are shared includes, e.g. common.glsl)
 assets/                 copied next to the exe (fonts/: Roboto Medium, Apache 2.0;
-                        sounds/: demo sounds, CC0)
+                        sounds/: demo sounds, CC0; models/: the demo's drone, CC0)
+tools/                  make_drone.py: writes the demo's drone.glb (plain Python)
 cmake/                  dependency + shader build logic
 ```
 
@@ -195,9 +199,13 @@ void MyGame::onRender(core::Application&, gfx::FrameContext& frame) {
 ```
 
 Tips
+- Models from Blender: export **glTF Binary (.glb)** into `assets/models/`, then
+  `model_ = render3d::Model::load(app.gpu(), core::assetPath("models/ship.glb"))` and
+  `meshes_->draw(model_, transform)`. Spin or aim named parts with a `render3d::ModelPose`
+  (`pose[model_.findNode("Turret")].rotation = ...`, then `draw(model_, transform, &pose)`).
+  Front is +Z (Blender's -Y). Tutorial step 12 walks through it.
 - Your own geometry: fill a `render3d::MeshData` (positions, normals, UVs, indices —
-  counter-clockwise triangles) and construct a `Mesh`. A glTF loader (cgltf or
-  fastgltf) is the natural next step.
+  counter-clockwise triangles) and construct a `Mesh`.
 - New shaders: drop `foo.vert`/`foo.frag` in `shaders/`, load
   `core::shaderPath("foo.vert.spv")`, build a pipeline with `gfx::PipelineBuilder`
   (copy the one in `MeshRenderer` and use `renderer.depthFormat()`).

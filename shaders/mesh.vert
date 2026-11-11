@@ -6,18 +6,22 @@
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
+layout(location = 3) in vec4 inColor;
 
 layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
+layout(location = 3) out vec4 outColor;
 
 void main()
 {
     vec4 world = object.model * vec4(inPosition, 1.0);
-    mat3 normalMatrix = mat3(object.normalMatrix[0].xyz, object.normalMatrix[1].xyz, object.normalMatrix[2].xyz);
+    // Inverse-transpose keeps normals correct under non-uniform scaling.
+    mat3 normalMatrix = transpose(inverse(mat3(object.model)));
 
     outWorldPos = world.xyz;
     outNormal = normalMatrix * inNormal;
     outUV = inUV;
+    outColor = inColor;
     gl_Position = frame.viewProjection * world;
 }

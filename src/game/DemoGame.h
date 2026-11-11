@@ -10,6 +10,7 @@
 #include "render3d/Camera3D.h"
 #include "render3d/Mesh.h"
 #include "render3d/MeshRenderer.h"
+#include "render3d/Model.h"
 
 #include <memory>
 #include <string>
@@ -67,4 +68,10 @@ private:
     float droneAngle_ = 0.0f;     // position on its circle (radians), advanced in onFixedUpdate
     float prevDroneAngle_ = 0.0f;
     float droneSpeed_ = 18.0f;    // units per second
+
+    // The drone's 3D model (a glTF file), and its rotors' pose.
+    render3d::Model droneModel_;
+    render3d::ModelPose dronePose_; // this drone's own node transforms
+    int rotors_[4] = {-1, -1, -1, -1}; // node indices: front left, front right, back left, back right
+    float rotorAngle_ = 0.0f;
 };

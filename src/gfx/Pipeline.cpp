@@ -128,6 +128,12 @@ PipelineBuilder& PipelineBuilder::cullMode(VkCullModeFlags mode, VkFrontFace fro
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::dynamicCulling(bool enabled)
+{
+    dynamicCulling_ = enabled;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::blend(BlendMode mode)
 {
     VkPipelineColorBlendAttachmentState& b = blendAttachment_;
@@ -248,9 +254,10 @@ Pipeline PipelineBuilder::build(VulkanContext& ctx) const
     blendState.attachmentCount = 1;
     blendState.pAttachments = &blendAttachment_;
 
-    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                            VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
+    dynamic.dynamicStateCount = dynamicCulling_ ? 4u : 2u;
     dynamic.pDynamicStates = dynamicStates;
 
     // Dynamic rendering: attachment formats instead of a VkRenderPass.

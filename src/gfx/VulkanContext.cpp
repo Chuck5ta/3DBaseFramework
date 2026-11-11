@@ -240,8 +240,8 @@ void VulkanContext::pickPhysicalDevice()
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(gpu, &f2);
-        if (!f13.dynamicRendering || !f13.synchronization2) {
-            reject("dynamicRendering/synchronization2 missing");
+        if (!f13.dynamicRendering || !f13.synchronization2 || !f13.shaderDemoteToHelperInvocation) {
+            reject("dynamicRendering/synchronization2/shaderDemoteToHelperInvocation missing");
             continue;
         }
 
@@ -301,6 +301,7 @@ void VulkanContext::createDevice()
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE; // no VkRenderPass / VkFramebuffer objects
     f13.synchronization2 = VK_TRUE; // simpler, less error-prone barriers
+    f13.shaderDemoteToHelperInvocation = VK_TRUE; // `discard` in SPIR-V 1.6 shaders (alpha cut-outs)
 
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;

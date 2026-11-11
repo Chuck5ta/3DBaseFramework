@@ -7,17 +7,17 @@
 > (design and internals), `docs/TUTORIAL.md` (the demo built step by step) or
 > `docs/BUILDING.md` (Windows, Linux, Steam Deck builds).
 >
-> Framework state: **2026-11-07**. If the user's copy of the framework is older or newer,
+> Framework state: **2026-11-11**. If the user's copy of the framework is older or newer,
 > trust the source code over this file.
 
 ## 1. What it is
 
 An engine-free C++20 starter for **3D games** on Windows, Linux and Steam Deck. The game
 owns all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer,
-a lit and textured forward mesh renderer with a fly camera, a 2D overlay for HUD text,
-3D audio with effects and Doppler, and a debug UI. A demo scene (`DemoGame`: crates,
-spheres, a moving sun, a humming crate, chiming spheres and a flying drone) shows how it
-fits together.
+a lit and textured forward renderer for meshes and **glTF models** (from Blender), a fly
+camera, a 2D overlay for HUD text, 3D audio with effects and Doppler, and a debug UI. A
+demo scene (`DemoGame`: crates, spheres, a moving sun, a humming crate, chiming spheres and
+a drone model circling with spinning rotors) shows how it fits together.
 
 - **Language and build:** C++20, CMake ≥ 3.22 with presets (`debug`, `relwithdebinfo`,
   `release`, `vs2022`, `vs2026`). Every dependency is downloaded by CMake at a pinned
@@ -25,7 +25,8 @@ fits together.
 - **Platforms:** Windows (Visual Studio 2022/2026), Linux, Steam Deck (SteamOS, Mesa RADV).
 - **Libraries:** SDL3 3.4.16 (window, input, gamepads), Vulkan 1.3 through volk, VMA 3.3.0
   (GPU memory), GLM 1.0.1 (maths), stb_image and stb_truetype (images, fonts), miniaudio
-  0.11.23 (audio), Dear ImGui 1.92.9 (debug UI), nlohmann/json 3.12.0 (JSON).
+  0.11.23 (audio), Dear ImGui 1.92.9 (debug UI), nlohmann/json 3.12.0 (JSON), cgltf 1.15
+  (glTF models; used by Game3D, fetched by both so `Dependencies.cmake` stays identical).
 - **Shared code:** `core/`, `gfx/`, `audio/`, `debugui/` and `render2d/` are identical in
   Game2D and Game3D (this is Game3D; its sibling is Game2D). Game3D adds `render3d` and uses `render2d` for its HUD.
 
@@ -37,14 +38,15 @@ src/
   core/                 Application (loop, hooks), Window, Input, Actions, GameState, SaveData, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
-  render3d/             MeshRenderer (Material, SceneLighting), Mesh (+ primitives), Camera3D
+  render3d/             MeshRenderer (Material, SceneLighting), Model (glTF), Mesh (+ primitives), Camera3D
   render2d/             SpriteBatch, Camera2D, Font, Animation (used for the HUD)
   audio/                AudioEngine (miniaudio): sounds, music, 3D, effects, Doppler
   debugui/              DebugUI (Dear ImGui)
   game/                 DemoGame (the example); your game goes here
 shaders/                mesh.vert/.frag, common.glsl, sprite.vert/.frag, imgui.frag
-assets/                 fonts/ (Roboto), sounds/, textures/ (copied next to the exe)
+assets/                 fonts/ (Roboto), models/ (drone.glb), sounds/, textures/ (copied next to the exe)
 cmake/                  Dependencies.cmake, Shaders.cmake
+tools/                  make_drone.py (writes the demo's drone.glb; plain Python)
 docs/                   ARCHITECTURE, BUILDING, TUTORIAL, AI_BRIEFING (this file)
 ```
 
@@ -378,7 +380,8 @@ The mouse wheel and cursor, editor hot keys, and anything needing a specific dev
   `solid(gpu, r, g, b, a)`. Move-only; `width()`, `height()`, `size()`, `valid()`.
 - `gfx::TextureDesc`: `srgb` (true for colour images; false for data such as normal maps),
   `mipmaps`, `filter` (`VK_FILTER_NEAREST` for pixel art), `wrap`
-  (`VK_SAMPLER_ADDRESS_MODE_REPEAT` / `CLAMP_TO_EDGE`), `debugName`.
+  (`VK_SAMPLER_ADDRESS_MODE_REPEAT` / `CLAMP_TO_EDGE`; both directions), `wrapV` (a
+  different vertical wrap; default = same as `wrap`), `debugName`.
 - Paths: `core::assetPath("sounds/x.wav")` → `<exe>/assets/sounds/x.wav`,
   `core::shaderPath("x.frag.spv")`, `core::basePath()`. Never rely on the working directory.
 - Logging (`core/Log.h`): `LOG_INFO/LOG_WARN/LOG_ERROR/LOG_DEBUG(printf-style)`;
@@ -396,16 +399,49 @@ to about ±1.55), `fovY`, `nearPlane`, `farPlane`. `setAspect(w / h)` every fram
 Y flipped), `viewProjection()`.
 
 **`render3d::Mesh`:** `Mesh(app.gpu(), MeshData, "name")`; `MeshData` = `vertices` (`position`,
-`normal`, `uv`) + `indices` (uint32). Primitives: `primitives::cube(size)`,
+`normal`, `uv`, `color` = linear vertex colour, white by default) + `indices` (uint32). Primitives: `primitives::cube(size)`,
 `plane(size, uvRepeat)` (XZ plane facing +Y), `sphere(radius, segments, rings)`.
 
 **`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer())`, needs
 `config.renderer.depthBuffer = true`):
-`begin(frame, camera, lighting)` → `draw(mesh, modelMatrix, Material)` × n → `end()`.
-`Material{texture pointer or nullptr, sRGB color tint}`. `setWireframe(bool)`,
+`begin(frame, camera, lighting)` → `draw(mesh, modelMatrix, Material)` and/or
+`draw(model, transform, &pose)` × n → `end()` (see-through model parts are drawn in `end()`,
+farthest first). It stops with a message if the renderer has no depth buffer.
+`Material{texture, color (sRGB tint), emissive (sRGB glow), emissiveStrength,
+emissiveTexture, roughness = 0.5, metallic = 0, doubleSided}`. `setWireframe(bool)`,
 `wireframe()`, `wireframeSupported()`, `drawCalls()`. Per-object data travels as push
-constants (one draw call per object). Build model matrices with
+constants (one draw call per object or model part). Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
+
+**`render3d::Model`** (`render3d/Model.h`): glTF 2.0, `.glb` (one file, preferred) or
+`.gltf` (+ `.bin` + images beside it), e.g. Blender's *File > Export > glTF 2.0*.
+
+```cpp
+// onInit
+drone_ = render3d::Model::load(app.gpu(), core::assetPath("models/drone.glb")); // fatal with a reason if unusable
+pose_ = drone_.defaultPose();                 // one ModelPose per copy on screen
+rotor_ = drone_.findNode("RotorFL");          // a node = an object in Blender's Outliner; -1 + warning if missing
+// onRender, between begin() and end()
+pose_[rotor_].rotation = glm::angleAxis(angle, glm::vec3(0, 1, 0)); // relative to its parent; pose[-1] is ignored
+meshes.draw(drone_, transform, &pose_);       // pose optional (nullptr = as exported)
+```
+
+- Front is **+Z**, up +Y, metres (Blender's −Y front, converted by the exporter). A node
+  turns about its own origin (in Blender: *Set Origin > Origin to Geometry* for rotors).
+- `NodeTransform{translation, rotation (glm::quat), scale}`; `node(i)` gives `name`,
+  `parent`, `mesh` and the default transform; `nodeCount()`.
+- Bounds of the default pose: `boundsMin()`, `boundsMax()`, `size()`, `center()`.
+- Materials used: base colour (factor × texture × vertex colour), emissive (×
+  `KHR_materials_emissive_strength`, × texture), metallic and roughness factors, alpha
+  modes (opaque, mask + cutoff, blend), double-sided, `KHR_materials_unlit`; per-texture
+  filter and per-axis wrap. Ignored with a logged warning: metallic-roughness, normal and
+  occlusion textures, animations, skins, morph targets, cameras, lights.
+- `render3d::loadModelData(path, data, &error)` loads into `ModelData` on the CPU only
+  (tools and tests), returning false with a reason instead of stopping.
+- One `Model` in memory can be drawn many times with different transforms and poses.
+- `Game3D/assets/models/drone.glb` (CC0, ~1.3 m, nodes `Body`, `Frame`, `Lights`, `Eye`,
+  `RotorFL/FR/BL/BR`) is the demo's; tutorial step 12 shows it. Its generator is
+  `tools/make_drone.py`.
 
 **`render3d::SceneLighting`** (all colours sRGB): `sunDirection` (the direction light
 travels), `sunColor`, `sunIntensity`, `skyColor` and `groundColor` (hemisphere ambient),
@@ -456,6 +492,12 @@ ASCII + Latin-1; UTF-8 strings; characters not baked show as `?`). `measure(text
   reads Aseprite's *Export Sprite Sheet* JSON (Array or Hash; image next to it; export
   **untrimmed**): each tag becomes a clip with its frames' durations; *Ping-pong* tags
   ping-pong, *Reverse* play backwards, *Repeat 1* plays once; no tags = one "default" clip.
+  **Sprites from 3D models:** *SpriteCreator*, in the separate Game Developer Tools project
+  (`blender/SpriteCreator/`; drag a `.blend` onto `SpriteCreator.bat`), renders a Blender
+  animation into this format:
+  timeline markers name the clips (`hover`, `explode:once`, `bob:pingpong`), an automatic
+  orthographic camera fits every frame (`--view front|top|iso|dimetric|scene`), `--size N`,
+  `--pixel-art`, `--still` for icons. Output `sprites/<name>.png/.json` beside the .blend.
   `SpriteSheet::loadGrid(gpu, path, {w, h}, count = 0)` splits an image into equal frames
   (left to right, top to bottom); add clips with `addClip(name, first, count, fps, loop)` or
   `addClip(AnimationClip)`. Default `TextureDesc` is `SpriteSheet::pixelArt()` (nearest, no
@@ -602,11 +644,13 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   feature is added, update `README.md`, `docs/ARCHITECTURE.md`, `docs/BUILDING.md` if
   relevant, the tutorial, **and this briefing**.
 
-## 13. Known limitations (as of 2026-11-07)
+## 13. Known limitations (as of 2026-11-11)
 
-- No model loading yet (glTF via cgltf/fastgltf is the natural next step); meshes come
-  from `MeshData` or the primitives.
-- One directional light, no shadows, not PBR, no anti-aliasing, no skybox (the fog-coloured
+- Models: no skeletal/node animation, morph targets, normal/occlusion/metallic-roughness
+  textures, KTX2/WebP images or Draco/meshopt compression (refused with a message); moving
+  parts are posed in code with `ModelPose`.
+- One directional light, no shadows, not PBR (roughness/metallic shape a Blinn-Phong
+  highlight), no anti-aliasing, no skybox (the fog-coloured
   clear colour stands in), no frustum culling or instancing (one draw call per object).
 - Saves: no encryption/compression/cloud API (Steam Auto-Cloud works without code), no
   automatic `version` migration; window size/position aren't remembered.
@@ -614,7 +658,7 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   `Menu`); states are made in code.
 - Input actions: one gamepad (no local multiplayer yet), no chords/combos ("Ctrl+S",
   double-tap; a fighting-game move list would be game code on top of actions), the wheel
-  and cursor aren't bindable, and bindings aren't saved to disk by the framework yet.
+  and cursor aren't bindable (rebound controls are saved in settings.json).
 - One audio listener (no split-screen); one music track at a time; one shared reverb.
 - The debug UI draws inside the game window (no ImGui docking or separate OS windows) and
   doesn't save its layout.

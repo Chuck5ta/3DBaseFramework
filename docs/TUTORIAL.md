@@ -7,7 +7,7 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-3D sound with Doppler, audio effects and a debug UI.
+3D sound with Doppler, audio effects, a debug UI, and 3D models from Blender (glTF).
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -25,6 +25,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [9](#step-9--a-debug-ui) | A Dear ImGui window with `onDebugUI` | Live camera, lighting and fog controls |
 | [10](#step-10--reverb-and-muffled-sounds) | Audio effects: reverb presets, a per-sound low-pass | **R** changes the room; chimes behind the crate are muffled |
 | [11](#step-11--a-passing-drone-doppler) | A moving sound and the Doppler effect | A buzzing drone that rises in pitch as it approaches and drops as it passes |
+| [12](#step-12--a-drone-model-gltf) | A glTF model with moving parts | The drone becomes a proper model, rotors spinning, leaning into its turn |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -1299,6 +1300,116 @@ as it approaches, drops as it passes, and stays low as it flies away. In the deb
 UI's **Sound** section, the "Drone pitch" readout follows it. Raise the drone speed or the
 Doppler factor to exaggerate the effect, or set the factor to 0 to hear the difference.
 
+---
+
+## Step 12 — A drone model (glTF)
+
+The drone is still a box and some squashed spheres. Real games draw **models**: shapes
+made in a modelling program such as Blender, with their own materials and textures. The
+framework loads **glTF 2.0**, the open standard for this ("the JPEG of 3D"): Blender
+exports it (**File > Export > glTF 2.0**), and most free and paid asset packs include it.
+
+A glTF file comes in two forms, and both load the same way:
+
+| Form | Files | Best for |
+|---|---|---|
+| `.glb` | One file with everything inside | Games: one file to ship, nothing to lose |
+| `.gltf` | A text file plus a `.bin` (the geometry) and the images | Reading and debugging; keep them all together |
+
+In Blender, choose **glTF Binary (.glb)** as the format. The project ships a drone made
+for this step, `assets/models/drone.glb` (CC0, like the sounds): about 1.3 m across, 430
+triangles and one small texture. Its parts are separate objects, which glTF calls
+**nodes**: `Body`, `Frame`, `Lights`, `Eye` and four rotors named `RotorFL`, `RotorFR`,
+`RotorBL` and `RotorBR` (front/back, left/right).
+
+In **`MyGame.h`**, include the model header after `MeshRenderer.h`:
+
+```cpp
+#include "render3d/Model.h"
+```
+
+and add at the end of the members:
+
+```cpp
+    // The drone's 3D model (a glTF file), and its rotors' pose.
+    render3d::Model droneModel_;
+    render3d::ModelPose dronePose_; // this drone's own node transforms
+    int rotors_[4] = {-1, -1, -1, -1}; // node indices: front left, front right, back left, back right
+    float rotorAngle_ = 0.0f;
+```
+
+In **`MyGame.cpp`**, load it in `onInit`, after the drone's sound starts:
+
+```cpp
+    // The drone's model: a glTF file, the format Blender exports. Its parts are nodes;
+    // look up the rotors by name once, so they can be spun every frame.
+    droneModel_ = render3d::Model::load(app.gpu(), core::assetPath("models/drone.glb"));
+    dronePose_ = droneModel_.defaultPose();
+    const char* rotorNames[4] = {"RotorFL", "RotorFR", "RotorBL", "RotorBR"};
+    for (int i = 0; i < 4; ++i)
+        rotors_[i] = droneModel_.findNode(rotorNames[i]);
+```
+
+Spin the rotors in `onUpdate`, after the drone's sound is moved:
+
+```cpp
+    // Spin the rotors: purely visual, so once per frame is enough. They turn faster
+    // when the drone flies faster.
+    rotorAngle_ = std::fmod(rotorAngle_ + (30.0f + droneSpeed_) * dt, glm::two_pi<float>());
+```
+
+And in `onRender`, **replace** the step 11 drone (from `// The drone: a dark body...` to
+the red light) with:
+
+```cpp
+    // The drone: its glTF model, facing along its path and banking into the turn.
+    const float droneAngle = glm::mix(prevDroneAngle_, droneAngle_, alpha);
+    glm::mat4 d = glm::translate(glm::mat4(1.0f), droneAt(droneAngle));
+    d = glm::rotate(d, -droneAngle, glm::vec3(0, 1, 0));            // the model's front (+Z) along the path
+    d = glm::rotate(d, droneSpeed_ * 0.012f, glm::vec3(0, 0, 1));  // lean into the turn
+    for (int i = 0; i < 4; ++i) {
+        // Diagonal pairs spin the same way, so the drone doesn't twist round.
+        const float direction = (i == 0 || i == 3) ? 1.0f : -1.0f;
+        dronePose_[rotors_[i]].rotation = glm::angleAxis(rotorAngle_ * direction, glm::vec3(0, 1, 0));
+    }
+    meshRenderer_->draw(droneModel_, d, &dronePose_);
+```
+
+Things to notice:
+
+- **One `draw` call per model, as for a mesh.** `MeshRenderer` draws each part with its
+  own material: the textured hull, the dark metal frame, the rotors. The draw calls in
+  the HUD go up by one per part.
+- **Glowing parts.** The eye and the navigation lights (red on the left, green on the
+  right, as on aircraft) are **emissive**: they glow the same whether or not the sun
+  reaches them (fog still fades them with distance, like everything else). In Blender,
+  that's the Principled BSDF's *Emission* colour and strength.
+- **Nodes and poses.** A model's nodes are the objects in Blender's Outliner, each placed
+  relative to its parent. `findNode` looks one up by name (once: it's a search). A
+  `ModelPose` holds the position, rotation and scale of every node for *one copy* of the
+  model, so ten drones on screen can each have their own pose from one loaded `Model`.
+  Changing `dronePose_[node].rotation` turns that part about its own **origin**, so in
+  Blender, set each rotor's origin to its centre (*Object > Set Origin > Origin to
+  Geometry*).
+- **A misspelt name doesn't crash.** `findNode` returns -1 and logs a warning once, and
+  `pose[-1]` is quietly ignored, so a renamed part just stops moving.
+- **Transforms stack.** `d` is translated, then turned to face along the path, then
+  rolled about its own front axis; the model's matrix is multiplied with each node's.
+  Try `glm::scale(d, glm::vec3(2.0f))` for a drone twice the size.
+- **Which way is front?** Models face **+Z** in the framework, which is Blender's **-Y**
+  after export (the glTF exporter turns Blender's Z-up into Y-up). If a model faces the
+  wrong way, rotate it in code or in Blender (and apply the rotation: *Ctrl+A*).
+- **Exporting from Blender.** Apply scale and rotation (*Ctrl+A > All Transforms*), use
+  metres, keep materials simple (Principled BSDF with a Base Color image, roughness,
+  metallic, emission). Untick *Compression* in the export dialog: Draco-compressed files
+  aren't supported and are refused with a message saying so.
+- **Sizes for gameplay.** `droneModel_.size()` and `boundsMin()/boundsMax()` give the
+  model's extent in metres: handy for standing a model on the ground or for collision.
+
+**Run it:** the drone now has a hull, glowing eye and lights, and four spinning rotors
+(fly up close and press **F1** for wireframe to see how few triangles it takes). Raise
+the drone speed in the debug UI: it leans further into the turn and its rotors spin faster.
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -1312,8 +1423,8 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
    counter-clockwise triangles) and construct a `Mesh` — try a pyramid or a cylinder.
 2. **A third-person character.** Replace the fly camera: move a "player" cube in
    `onFixedUpdate` and place the camera behind it, smoothing with `1 - exp(-k·dt)`.
-3. **Model loading.** Load glTF 2.0 files (cgltf or fastgltf) into `MeshData` and
-   `Texture`s, so you can use models from Blender or asset stores.
+3. **A squadron.** Draw several drones from the one `droneModel_`, each with its own
+   `ModelPose`, flight path and rotor speed: one `Model` in memory, many on screen.
 4. **A skybox.** A cube drawn around the camera with a sky texture, rendered first with
    depth writes off.
 5. **Shadows.** Render the scene's depth from the sun in `onPreRender`, then sample that
@@ -1321,10 +1432,7 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
    buffer; essential for forests, crowds and particles.
 7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
-8. **Saving settings.** Write `lighting_` to a small text file from a "Save" button in
+8. **Saving tuned values.** Store `lighting_` with `core::SaveData` from a "Save" button in
    the debug UI and load it in `onInit`, so tuned values survive a restart.
-9. **Moving sound sources.** Give a moving object a looping spatial sound and call
-   `app.audio().setPosition(handle, position)` each frame, such as an engine on a
-   circling drone.
-10. **World-space labels.** Project a 3D position to the screen with
+9. **World-space labels.** Project a 3D position to the screen with
    `camera.viewProjection()` and draw a name tag there with the HUD batch.

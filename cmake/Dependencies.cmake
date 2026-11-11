@@ -75,9 +75,17 @@ FetchContent_Declare(json
     GIT_SHALLOW    TRUE
     SOURCE_SUBDIR  _download_only)
 
-FetchContent_MakeAvailable(SDL3 vulkan_headers volk vma glm stb miniaudio imgui json)
+# cgltf: reading glTF 2.0 models (.gltf/.glb), used by Game3D's render3d::Model.
+# One header; the implementation is compiled in render3d/Model.cpp.
+FetchContent_Declare(cgltf
+    GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+    GIT_TAG        v1.15
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _download_only)
 
-# --- One target that carries Vulkan headers, volk, VMA, GLM, stb, miniaudio, json ---
+FetchContent_MakeAvailable(SDL3 vulkan_headers volk vma glm stb miniaudio imgui json cgltf)
+
+# --- One target that carries Vulkan headers, volk, VMA, GLM, stb, miniaudio, json, cgltf ---
 add_library(third_party STATIC ${volk_SOURCE_DIR}/volk.c)
 target_include_directories(third_party SYSTEM PUBLIC
     ${vulkan_headers_SOURCE_DIR}/include
@@ -86,7 +94,8 @@ target_include_directories(third_party SYSTEM PUBLIC
     ${glm_SOURCE_DIR}
     ${stb_SOURCE_DIR}
     ${miniaudio_SOURCE_DIR}
-    ${json_SOURCE_DIR}/single_include)
+    ${json_SOURCE_DIR}/single_include
+    ${cgltf_SOURCE_DIR})
 target_compile_definitions(third_party PUBLIC
     VK_NO_PROTOTYPES                 # all Vulkan calls go through volk
     GLM_FORCE_DEPTH_ZERO_TO_ONE      # Vulkan clip space depth is [0, 1]

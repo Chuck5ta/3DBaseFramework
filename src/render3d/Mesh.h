@@ -4,6 +4,7 @@
 
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -14,6 +15,7 @@ struct Vertex {
     glm::vec3 position;
     glm::vec3 normal;
     glm::vec2 uv;
+    glm::vec4 color{1.0f}; // linear RGBA, multiplied with the material (glTF COLOR_0)
 };
 
 // CPU-side geometry. Triangles are counter-clockwise when seen from the front.
@@ -37,6 +39,9 @@ public:
 
     // Binds the buffers and issues one indexed draw.
     void draw(VkCommandBuffer cmd) const;
+    // For drawing parts of the buffers (a Model's pieces): bind once, then draw ranges.
+    void bind(VkCommandBuffer cmd) const;
+    void drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset) const;
 
     uint32_t indexCount() const { return indexCount_; }
     bool valid() const { return vertices_.valid(); }

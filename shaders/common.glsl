@@ -15,6 +15,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
-    vec4 normalMatrix[3];
-    vec4 color;         // linear
+    vec4 color;         // linear base colour and alpha
+    vec4 emissive;      // rgb = linear glow added on top; a = alpha cutoff (0 = none)
+    vec4 material;      // x = roughness (0 glossy .. 1 matte), y = metallic, z = 1 if unlit
 } object;

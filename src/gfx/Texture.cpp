@@ -105,7 +105,7 @@ Texture Texture::fromPixels(VulkanContext& ctx, uint32_t width, uint32_t height,
     samplerInfo.mipmapMode = desc.filter == VK_FILTER_NEAREST ? VK_SAMPLER_MIPMAP_MODE_NEAREST
                                                               : VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.addressModeU = desc.wrap;
-    samplerInfo.addressModeV = desc.wrap;
+    samplerInfo.addressModeV = desc.wrapV == VK_SAMPLER_ADDRESS_MODE_MAX_ENUM ? desc.wrap : desc.wrapV;
     samplerInfo.addressModeW = desc.wrap;
     samplerInfo.maxLod = float(mipLevels);
     if (ctx.samplerAnisotropySupported() && desc.filter == VK_FILTER_LINEAR && mipLevels > 1) {

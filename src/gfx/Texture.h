@@ -14,7 +14,8 @@ struct TextureDesc {
     bool srgb = true;      // true for colour images; false for data (normal maps etc.)
     bool mipmaps = true;   // generate a full mip chain on upload
     VkFilter filter = VK_FILTER_LINEAR;                      // NEAREST for pixel art
-    VkSamplerAddressMode wrap = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkSamplerAddressMode wrap = VK_SAMPLER_ADDRESS_MODE_REPEAT;     // both directions...
+    VkSamplerAddressMode wrapV = VK_SAMPLER_ADDRESS_MODE_MAX_ENUM;  // ...unless vertical differs
     const char* debugName = nullptr;
 };
 

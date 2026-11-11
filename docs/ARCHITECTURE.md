@@ -33,13 +33,13 @@ The code is split into layers. Each layer only depends on the layers below it.
 ```mermaid
 flowchart TD
     game["game/  (DemoGame or your game)"]
-    r3d["render3d/  MeshRenderer · Mesh · Camera3D"]
+    r3d["render3d/  MeshRenderer · Model · Mesh · Camera3D"]
     r2d["render2d/  SpriteBatch · Camera2D · Font (HUD)"]
     core["core/  Application · Window · Input · Actions · GameState · SaveData · Paths · Log"]
     aud["audio/  AudioEngine (miniaudio)"]
     dbg["debugui/  DebugUI (Dear ImGui)"]
     gfx["gfx/  VulkanContext · Swapchain · Renderer · Buffer · Image · Texture · Pipeline · Descriptors"]
-    third["Third party: SDL3 · volk · Vulkan-Headers · VMA · GLM · stb · miniaudio · Dear ImGui"]
+    third["Third party: SDL3 · volk · Vulkan-Headers · VMA · GLM · stb · miniaudio · Dear ImGui · cgltf"]
 
     game --> r3d
     game --> r2d
@@ -108,7 +108,8 @@ src/
   render3d/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
-    MeshRenderer.h/.cpp       lit, textured forward renderer; Material, SceneLighting
+    Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose
+    MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models; Material, SceneLighting
   game/
     DemoGame.h/.cpp           example scene with a fly camera
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
@@ -271,7 +272,8 @@ on Linux and Steam Deck. `GAME_SAVE_DIR` overrides it. `savePath("x.json")` is a
 - Creates the instance (API 1.3), optionally with `VK_LAYER_KHRONOS_validation` and a
   `VK_EXT_debug_utils` messenger.
 - Picks a GPU: must support Vulkan 1.3, `VK_KHR_swapchain`, `dynamicRendering`,
-  `synchronization2`, and graphics + present queues. Scores discrete > integrated and
+  `synchronization2`, `shaderDemoteToHelperInvocation` (what `discard` compiles to under
+  SPIR-V 1.6), and graphics + present queues. Scores discrete > integrated and
   prefers a single queue family for both.
 - Creates the device (enables anisotropy and `fillModeNonSolid` when available) and the
   **VMA** allocator.
@@ -302,13 +304,16 @@ mapped buffers.
 descriptor set**, so a texture can be bound with a single call and needs no lookup tables.
 Created from pixels (`fromPixels`), from a file via stb_image (`fromFile`) or as a solid
 colour (`solid`). `TextureDesc` selects sRGB vs UNORM, mipmaps (generated on the GPU by
-blitting), filtering and wrap mode. Linear filtering with mipmaps also enables
+blitting), filtering and wrap mode (`wrap` for both directions, or `wrapV` for a different
+vertical one). Linear filtering with mipmaps also enables
 anisotropic filtering (up to 16×) when the GPU supports it, which keeps ground
 textures sharp at grazing angles.
 
 **`gfx::Pipeline` / `gfx::PipelineBuilder`**: fluent builder for graphics pipelines
 using dynamic rendering (`VkPipelineRenderingCreateInfo` with attachment formats).
-Viewport and scissor are always dynamic state. Blend modes: `Opaque`, `Alpha`,
+Viewport and scissor are always dynamic state; `dynamicCulling()` also makes cull mode and
+front face dynamic (`vkCmdSetCullMode`/`vkCmdSetFrontFace`), so one pipeline can draw
+single- and double-sided or mirrored geometry. Blend modes: `Opaque`, `Alpha`,
 `PremultipliedAlpha`, `Additive`.
 
 **`gfx::Descriptors`**: `DescriptorLayoutBuilder`, `DescriptorAllocator` (adds a new pool
@@ -328,20 +333,56 @@ whenever the current one is exhausted; optional per-set freeing) and `Descriptor
 
 **`render3d::Mesh` and `MeshData`**
 
-- `Vertex { vec3 position; vec3 normal; vec2 uv; }` (32 bytes).
+- `Vertex { vec3 position; vec3 normal; vec2 uv; vec4 color; }` (48 bytes; `color` is a
+  linear vertex colour, white by default, used by glTF models that have one).
 - `MeshData` = vertices + `uint32` indices, triangles **counter-clockwise** seen from the
   front.
 - `primitives::cube(size)` (24 vertices, per-face normals/UVs), `plane(size, uvRepeat)`
   (XZ plane facing +Y), `sphere(radius, segments, rings)`.
 - `Mesh` uploads `MeshData` into **device-local** vertex and index buffers once (via
   staging) and draws itself with `draw(cmd)`: bind buffers + one `vkCmdDrawIndexed`.
+  `bind(cmd)` + `drawRange(cmd, firstIndex, indexCount, vertexOffset)` draw part of it
+  (a model's parts share one `Mesh`).
 
-**`render3d::MeshRenderer`**: forward renderer for lit, textured meshes (details in §6).
-API: `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`, `end()`,
-`setWireframe(bool)`, `drawCalls()`.
+**`render3d::Model`, `ModelData`, `ModelPose`**: glTF 2.0 models (`.gltf` + `.bin` +
+images, or one `.glb`), parsed with cgltf.
 
-- `Material { const Texture* texture; vec4 color; }`: texture may be `nullptr`
-  (an internal 1×1 white texture is used); `color` is an sRGB tint.
+- `loadModelData(path, data, &error)` reads a file into `ModelData` on the CPU (no GPU:
+  usable in tools and tests); `Model::load(gpu, path)` loads and uploads, and stops with
+  a clear message if the file can't be used (like textures and sounds).
+- **Geometry:** every primitive's vertices and indices go into **one** `Mesh`; a
+  `ModelPrimitive` is a range in it (`firstIndex`, `indexCount`, `vertexOffset`) with a
+  material. Triangle strips and fans become lists; points and lines are skipped with a
+  warning. Missing normals give flat shading; missing UVs give (0, 0).
+- **Nodes** are stored parents-before-children, each with a translation, rotation
+  (quaternion) and scale relative to its parent (a node's matrix is decomposed). Only the
+  default scene is used. `findNode(name)` returns the index, or -1 with a warning once.
+- **`ModelPose`**: per-copy node transforms (`defaultPose()`, then
+  `pose[node].rotation = ...`), so many copies of one `Model` can each have their own
+  pose. Index -1 is accepted and ignored. `nodeMatrices(transform, pose, out)` gives every
+  node's world matrix.
+- **Materials** (`ModelMaterial`): base colour factor and texture, emissive factor (times
+  `KHR_materials_emissive_strength`) and texture, metallic and roughness factors, alpha
+  mode (opaque, mask with cutoff, blend), double-sided, `KHR_materials_unlit`. The
+  spec-gloss extension falls back to its diffuse colour and texture.
+- **Textures**: PNG and JPEG (stb_image) from a buffer view, a data URI or a file beside
+  the `.gltf`; per-texture filter and per-axis wrap (`TextureDesc::wrap`/`wrapV`), mipmaps,
+  sRGB.
+- **Not supported** (warned about, the rest still loads): metallic-roughness, normal and
+  occlusion textures, skins and animations, morph targets, cameras, lights, KTX2/WebP
+  images. Files that *require* Draco or meshopt compression are refused with a message
+  saying how to export without it.
+- Bounds (`boundsMin/Max`, `size`, `center`) are of the default pose, in model units.
+
+**`render3d::MeshRenderer`**: forward renderer for lit, textured meshes and models
+(details in §6). API: `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`,
+`draw(model, transform, pose = nullptr)`, `end()`, `setWireframe(bool)`, `drawCalls()`.
+It needs a depth buffer, and says so at start-up if there isn't one.
+
+- `Material { texture, color, emissive, emissiveStrength, emissiveTexture, roughness,
+  metallic, doubleSided }`: textures may be `nullptr` (an internal 1×1 white texture is
+  used); colours are sRGB. A model brings its own `ModelMaterial`s (linear colours, as in
+  glTF).
 - `SceneLighting`: sun direction/colour/intensity, sky and ground ambient colours with an
   ambient intensity, fog colour and density. All colours are sRGB.
 
@@ -669,10 +710,10 @@ flowchart LR
         ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog"]
     end
     subgraph perMaterial["Per texture change"]
-        tex["Set 1: texture's own set<br/>(combined image sampler)"]
+        tex["Set 1: base colour + emission<br/>(two combined image samplers)"]
     end
-    subgraph perObject["Per draw (push constants, 128 bytes)"]
-        pc["mat4 model<br/>mat3 normal matrix (3 × vec4)<br/>vec4 colour (linear)"]
+    subgraph perObject["Per draw (push constants, 112 bytes)"]
+        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit"]
     end
     ubo --> sh["mesh.vert / mesh.frag"]
     tex --> sh
@@ -682,18 +723,30 @@ flowchart LR
 | Binding | Contents | Update frequency |
 |---|---|---|
 | Set 0, binding 0 (UBO, vertex + fragment) | `FrameUniforms`: matrices, camera position, lights, fog (std140) | once per frame, written into that frame's own buffer |
-| Set 1, binding 0 (sampler, fragment) | material texture | when the texture changes between draws |
-| Push constants (vertex + fragment) | model matrix, normal matrix, colour | every draw |
+| Set 1, bindings 0 and 1 (samplers, fragment) | base colour and emission textures | when either texture changes between draws |
+| Push constants (vertex + fragment) | model matrix, colour, emissive + alpha cutoff, roughness/metallic/unlit | every draw |
+| Dynamic state | cull mode, front face | when a draw needs different culling (double-sided material, mirrored node) |
 
-- The push-constant block is **exactly 128 bytes**, the minimum every Vulkan GPU must
+- The push-constant block is **112 bytes**, within the 128 every Vulkan GPU must
   support, so it works everywhere without querying limits. A `static_assert` protects it.
-- The **normal matrix** (`transpose(inverse(mat3(model)))`) is computed on the CPU so
-  normals stay correct under non-uniform scaling; it is passed as three `vec4` columns to
-  match std430 padding.
+- The **normal matrix** (`transpose(inverse(mat3(model)))`) is computed in the vertex
+  shader, so normals stay correct under non-uniform scaling and the push constants have
+  room for material values.
+- **Set 1** holds a pair of textures (base colour, emission), so it can't be the texture's
+  own set: sets are allocated from a **per-frame pool** that is reset when that frame comes
+  round again, with a small cache so each texture pair gets one set per frame. No set
+  outlives its textures.
 - **Per-frame uniform buffers**: one host-visible UBO and descriptor set per frame in
   flight, so writing this frame's camera never races with the GPU reading last frame's.
-- Redundant texture binds are skipped (`boundTexture_`). Sorting draws by texture reduces
-  binds further.
+- Redundant texture binds are skipped (`boundTexture_`), as are geometry binds when
+  consecutive draws are parts of the same model. Sorting draws by texture reduces binds
+  further.
+- **Models:** `draw(model, transform, pose)` computes every node's world matrix and draws
+  each primitive of each node's mesh with its material. **Blend** primitives are put
+  aside and drawn in `end()`, sorted farthest first, with the blend pipeline (alpha
+  blending, depth test without depth writes). A node whose matrix has a negative
+  determinant (mirrored with a negative scale) is drawn with the front face set to
+  clockwise, so its triangles aren't culled inside out.
 
 ### 6.2 Draw flow
 
@@ -706,15 +759,17 @@ sequenceDiagram
     G->>MR: begin(frame, camera, lighting)
     MR->>MR: fill FrameUniforms (sRGB → linear), write UBO[frameIndex]
     MR->>Cmd: bind pipeline (solid or wireframe), bind set 0
-    loop each object
-        G->>MR: draw(mesh, model, material)
-        alt texture differs from last draw
-            MR->>Cmd: bind set 1 (texture)
+    loop each object (a mesh, or each part of a model)
+        G->>MR: draw(mesh, model, material) / draw(model, transform, pose)
+        alt textures differ from last draw
+            MR->>Cmd: bind set 1 (base colour + emission)
         end
-        MR->>Cmd: push constants (model, normal matrix, colour)
-        MR->>Cmd: bind vertex/index buffers, vkCmdDrawIndexed
+        MR->>Cmd: set cull mode / front face if they changed
+        MR->>Cmd: push constants (model, colour, emissive, material)
+        MR->>Cmd: bind vertex/index buffers (if changed), vkCmdDrawIndexed
     end
     G->>MR: end()
+    MR->>Cmd: blended parts, farthest first (blend pipeline)
 ```
 
 ### 6.3 Pipeline state
@@ -722,20 +777,28 @@ sequenceDiagram
 | State | Solid pipeline | Wireframe pipeline |
 |---|---|---|
 | Polygon mode | `FILL` | `LINE` (only created if `fillModeNonSolid` is supported) |
-| Culling | back faces, front = counter-clockwise | none |
+| Culling | dynamic: back faces (none for double-sided), front = counter-clockwise (clockwise for mirrored nodes) | none |
 | Depth | test + write, `LESS` | test + write, `LESS` |
-| Blending | opaque | opaque |
-| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`) | same |
+| Blending | opaque (a third pipeline, for Blend parts: alpha blending, no depth writes) | opaque |
+| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`) | same |
+
+Alpha-masked parts use `discard` in the fragment shader. Under SPIR-V 1.6 that compiles to
+"demote to helper invocation", so `VulkanContext` enables the Vulkan 1.3 feature
+`shaderDemoteToHelperInvocation` (required; every 1.3 driver has it).
 
 ### 6.4 Shading model (`mesh.frag`)
 
 ```
-albedo   = texture(uv) · material colour
-N        = normalize(normal)   (flipped for back faces, e.g. in wireframe)
+albedo   = texture(uv) · material colour · vertex colour      (discarded if alpha < cutoff)
+N        = normalize(normal)   (flipped for back faces, e.g. double-sided or wireframe)
 ambient  = mix(groundColour, skyColour, N.y · 0.5 + 0.5)      hemisphere light
 diffuse  = sunColour · max(N·L, 0)                              Lambert
-specular = sunColour · 0.25 · max(N·H, 0)^64                    Blinn-Phong
-colour   = albedo · (ambient + diffuse) + specular
+shininess = 2^(10·(1 − roughness) + 1)                          roughness 0.5 → 64
+strength  = 0.5 · (1 − roughness) · mix(1, 3, metallic)         roughness 0.5 → 0.25
+specular = sunColour · mix(white, albedo, metallic) · strength · max(N·H, 0)^shininess
+colour   = albedo · (1 − 0.7·metallic) · (ambient + diffuse) + specular
+           (unlit materials: colour = albedo)
+colour  += emissive · emissionTexture(uv)                       glow, ignores lighting
 fog      = 1 − exp(−(density · distance)²)                     exponential-squared
 output   = mix(colour, fogColour, fog)                          linear, sRGB-encoded by the swapchain
 ```
@@ -831,7 +894,8 @@ maps, roughness, masks) must use `TextureDesc::srgb = false`.
 | stb | pinned commit | image loading (stb_image), font rasterisation (stb_truetype) | header (impl in `Implementations.cpp`) |
 | miniaudio | 0.11.23 | audio output, mixing, decoding (WAV/FLAC/MP3, OGG via its bundled stb_vorbis), 3D sound | header (impl in `audio/MiniaudioImpl.cpp`) |
 | Dear ImGui | 1.92.9 | debug UI, with its SDL3 and Vulkan backends | static library `imgui` |
-| nlohmann/json | 3.12.0 | JSON: Aseprite sprite sheets (and later settings and saves) | header only |
+| nlohmann/json | 3.12.0 | JSON: Aseprite sprite sheets, settings and saves | header only |
+| cgltf | 1.15 | glTF 2.0 parsing (`.gltf`, `.glb`) for `render3d::Model` | header (impl in `render3d/Model.cpp`; fetched by both projects so `Dependencies.cmake` stays identical, used by Game3D only) |
 
 Global definitions: `VK_NO_PROTOTYPES`, `GLM_FORCE_DEPTH_ZERO_TO_ONE`,
 `GLM_FORCE_RADIANS`. On Linux, `third_party` also links `pthread`, `dl` and `m` for
@@ -905,10 +969,12 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | VMA for memory | Correct, efficient suballocation without writing an allocator | Third-party header |
 | One descriptor set per texture | Binding a texture is one call; no caches that can go stale | One set per texture (cheap); not bindless |
 | Forward rendering | Simplest path to correct lighting with one main light; works well on the Deck | Many dynamic lights need clustered/forward+ or deferred later |
-| Per-object data in push constants (128 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object; switch to instancing/SSBOs for thousands of objects |
-| Normal matrix computed on the CPU | Correct normals under non-uniform scale without per-vertex `inverse()` | A little CPU math per draw |
+| Per-object data in push constants (112 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; switch to instancing/SSBOs for thousands of objects |
+| Normal matrix computed in the vertex shader | Frees push-constant space for material values; correct under non-uniform scale | An `inverse()` per vertex (cheap for game-sized meshes) |
+| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No animations, skins or normal maps yet; whole model in memory |
+| Per-instance `ModelPose` instead of mutable nodes | One loaded model, many copies each in its own pose (rotors at different angles); the `Model` stays read-only | The game keeps a pose per copy |
 | Single shared depth buffer | Saves memory; correct thanks to the per-frame barrier | Frames' depth work is serialised (negligible) |
-| Blinn-Phong + hemisphere ambient + fog | Small, readable shader that looks good immediately | Not PBR; replace when materials need it |
+| Blinn-Phong + hemisphere ambient + fog, driven by roughness/metallic | Small, readable shader that looks good immediately and uses glTF's material values | Not PBR (no image-based lighting, no energy conservation); replace when materials need it |
 | Wait-idle on swapchain recreation | Simplest correct approach | Brief stall on resize only |
 | Settings remembered by the framework, from the live systems | A game gets saved volume, fullscreen, vsync and controls with no code; nothing can drift out of step, because the file is written from what the window, renderer and audio engine actually are | Settings are saved at exit (or on `saveSettings()`), so a crash loses changes made since; the layout of the `video`/`audio`/`controls` keys is the framework's |
 | JSON save files with atomic replace and a backup | Readable and hand-editable while developing; a crash or power cut mid-save can't destroy a save | Text is larger than binary and anyone can edit it (fine for single-player) |
@@ -922,9 +988,12 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 
 ## 13. Known limitations and roadmap
 
-- No model loading yet (next step: glTF 2.0 via cgltf or fastgltf).
+- Models: no skeletal or node animations, morph targets, normal/occlusion/metallic-roughness
+  textures, KTX2/WebP images or Draco/meshopt compression yet. Moving parts are posed in
+  code (`ModelPose`).
 - No shadows; one directional light only.
-- Not PBR (metallic/roughness, image-based lighting would be the upgrade).
+- Not PBR (roughness and metallic shape a Blinn-Phong highlight; image-based lighting and
+  a proper BRDF would be the upgrade).
 - No anti-aliasing (MSAA, FXAA or TAA).
 - No frustum culling or instancing; one draw call per object.
 - No skybox (the fog-coloured clear colour stands in for the sky).
@@ -937,8 +1006,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
   `Menu` (tutorial step 14) is a starting point. States are created in code, not loaded
   from data.
 - Input actions: one gamepad (no local multiplayer yet); no chords or combos ("Ctrl+S",
-  double-tap); the mouse wheel and cursor aren't bindable. Bindings aren't saved to disk
-  by the framework yet (`saveBindings()` gives the text; settings files are planned).
+  double-tap); the mouse wheel and cursor aren't bindable.
 - Saves: no encryption, compression or cloud API (Steam Auto-Cloud can sync the folder
   without code); no automatic migration between `version`s; windowed size and position
   aren't remembered.

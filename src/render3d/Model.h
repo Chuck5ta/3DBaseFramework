@@ -1,0 +1,179 @@
+#pragma once
+
+// 3D models from glTF 2.0 files: .gltf (with its .bin and images) or a single .glb.
+// Blender exports them (File > Export > glTF 2.0), as do most free asset packs.
+//
+//   // onInit:
+//   drone_ = render3d::Model::load(app.gpu(), core::assetPath("models/drone.glb"));
+//
+//   // onRender, between meshes.begin() and meshes.end():
+//   meshes.draw(drone_, transform);
+//
+// Moving parts. A model's nodes are the objects in Blender's Outliner, each with its own
+// position, rotation and scale relative to its parent. A ModelPose holds those for one
+// copy of the model, so every drone on screen can have its rotors at a different angle:
+//
+//   rotor_ = drone_.findNode("RotorFL");          // once
+//   pose_ = drone_.defaultPose();                 // one per drone
+//   pose_[rotor_].rotation = glm::angleAxis(spin, glm::vec3(0, 1, 0));
+//   meshes.draw(drone_, transform, &pose_);
+//
+// Units are metres and +Y is up. A model's front faces +Z (Blender's -Y after export).
+
+#include "gfx/Texture.h"
+#include "render3d/Mesh.h"
+
+#include <glm/gtc/quaternion.hpp>
+#include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
+
+#include <cstdint>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace gfx { class VulkanContext; }
+
+namespace render3d {
+
+enum class AlphaMode {
+    Opaque, // alpha ignored
+    Mask,   // pixels with alpha below alphaCutoff are cut out (leaves, fences, decals)
+    Blend,  // see-through (glass, smoke): drawn after everything else, back to front
+};
+
+struct ModelMaterial {
+    std::string name;
+    glm::vec4 baseColor{1.0f};   // linear RGBA, multiplied with the texture and vertex colours
+    int baseColorTexture = -1;   // index into ModelData::textures, -1 = none
+    glm::vec3 emissive{0.0f};    // linear glow colour, already times the emission strength
+    int emissiveTexture = -1;    // multiplied with `emissive` (glowing windows, screens, LEDs)
+    float metallic = 1.0f;       // glTF's defaults; Blender writes its own values
+    float roughness = 1.0f;
+    AlphaMode alphaMode = AlphaMode::Opaque;
+    float alphaCutoff = 0.5f;
+    bool doubleSided = false;    // drawn from both sides (thin planes, leaves)
+    bool unlit = false;          // KHR_materials_unlit: flat colour, no lighting
+};
+
+struct ModelImage {
+    std::string name;
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba; // width * height * 4
+};
+
+struct ModelTexture {
+    int image = -1;
+    VkFilter filter = VK_FILTER_LINEAR;
+    VkSamplerAddressMode wrapU = VK_SAMPLER_ADDRESS_MODE_REPEAT; // across (glTF's S)
+    VkSamplerAddressMode wrapV = VK_SAMPLER_ADDRESS_MODE_REPEAT; // down (glTF's T)
+};
+
+// A run of triangles with one material, inside the model's shared vertex/index arrays.
+struct ModelPrimitive {
+    uint32_t firstIndex = 0;
+    uint32_t indexCount = 0;
+    int32_t vertexOffset = 0;
+    int material = -1; // -1 = plain white
+    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f};
+};
+
+struct ModelMesh {
+    std::string name;
+    std::vector<ModelPrimitive> primitives;
+};
+
+// A node's transform relative to its parent.
+struct NodeTransform {
+    glm::vec3 translation{0.0f};
+    glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 scale{1.0f};
+    glm::mat4 matrix() const;
+};
+
+struct ModelNode {
+    std::string name;
+    int parent = -1; // always lower than this node's index
+    int mesh = -1;   // -1 = an empty (a pivot or group)
+    NodeTransform transform;
+};
+
+// Everything in a glTF file, on the CPU. Model::load uses it; it's also handy for tools
+// and tests (no GPU needed).
+struct ModelData {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<ModelMesh> meshes;
+    std::vector<ModelMaterial> materials;
+    std::vector<ModelImage> images;
+    std::vector<ModelTexture> textures;
+    std::vector<ModelNode> nodes;       // parents before children
+    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // of the whole model, in its default pose
+    std::vector<std::string> warnings;  // things that were skipped (also logged)
+};
+
+// Reads a .gltf or .glb. Returns false with `error` set if the file can't be used.
+bool loadModelData(const std::string& path, ModelData& out, std::string* error = nullptr);
+
+// Per-copy node transforms for drawing a model in a different pose.
+class ModelPose {
+public:
+    // pose[node].rotation = ...; node -1 (from a failed findNode) is accepted and ignored.
+    NodeTransform& operator[](int node);
+    const NodeTransform& operator[](int node) const;
+    size_t size() const { return nodes_.size(); }
+
+private:
+    friend class Model;
+    std::vector<NodeTransform> nodes_;
+    NodeTransform ignored_;
+};
+
+class Model {
+public:
+    Model() = default;
+
+    // Loads a .gltf/.glb and uploads it to the GPU. Aborts with a message if the file is
+    // missing or can't be read (like textures and sounds do).
+    static Model load(gfx::VulkanContext& gpu, const std::string& path);
+    static Model fromData(gfx::VulkanContext& gpu, const ModelData& data, const std::string& debugName = "model");
+
+    bool valid() const { return geometry_.valid(); }
+
+    // Nodes: the objects in Blender's Outliner. findNode returns -1 (and warns once)
+    // if there's no node with that name.
+    int nodeCount() const { return int(nodes_.size()); }
+    int findNode(std::string_view name) const;
+    const ModelNode& node(int index) const { return nodes_[size_t(index)]; }
+    ModelPose defaultPose() const;
+
+    const std::vector<ModelMaterial>& materials() const { return materials_; }
+    const std::vector<ModelMesh>& meshes() const { return meshes_; }
+
+    // The model's size in its default pose (metres): for placing it on the ground,
+    // scaling it to fit, or collision.
+    glm::vec3 boundsMin() const { return boundsMin_; }
+    glm::vec3 boundsMax() const { return boundsMax_; }
+    glm::vec3 size() const { return boundsMax_ - boundsMin_; }
+    glm::vec3 center() const { return (boundsMin_ + boundsMax_) * 0.5f; }
+
+    // --- For MeshRenderer ---------------------------------------------------------------
+    const Mesh& geometry() const { return geometry_; }
+    const gfx::Texture* texture(int index) const;
+    // World matrix of every node for a pose (nullptr = default pose).
+    void nodeMatrices(const glm::mat4& transform, const ModelPose* pose, std::vector<glm::mat4>& out) const;
+
+private:
+    Mesh geometry_;
+    std::vector<gfx::Texture> textures_;
+    std::vector<ModelMaterial> materials_;
+    std::vector<ModelMesh> meshes_;
+    std::vector<ModelNode> nodes_;
+    glm::vec3 boundsMin_{0.0f}, boundsMax_{0.0f};
+    std::string name_;
+    mutable std::set<std::string, std::less<>> warned_;
+};
+
+} // namespace render3d
