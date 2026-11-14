@@ -26,7 +26,7 @@ gfx::Texture makeCheckerTexture(gfx::VulkanContext& gpu)
             const bool odd = ((x / cell) + (y / cell)) & 1;
             const bool line = (x % cell) < 2 || (y % cell) < 2;
             const uint8_t v = line ? 120 : (odd ? 200 : 170);
-            uint8_t* p = &px[(y * N + x) * 4];
+            uint8_t* p = &px[size_t((y * N + x) * 4)];
             p[0] = p[1] = p[2] = v;
             p[3] = 255;
         }
@@ -57,6 +57,38 @@ glm::vec3 droneAt(float angle)
 {
     return {std::cos(angle) * kDroneRadius, 4.0f + std::sin(angle * 2.0f) * 0.8f, std::sin(angle) * kDroneRadius};
 }
+
+// Where things stand. Drawing, the player's collisions and the camera's collisions all
+// use these, so they always agree.
+constexpr int kRing = 12;   // crates in the ring
+constexpr int kSpheres = 6;
+
+glm::mat4 bigCrateMatrix(float spin)
+{
+    glm::mat4 m = glm::translate(glm::mat4(1.0f), {0.0f, 1.5f, 0.0f});
+    m = glm::rotate(m, spin, glm::normalize(glm::vec3(0.3f, 1.0f, 0.2f)));
+    return glm::scale(m, glm::vec3(2.0f));
+}
+
+glm::mat4 ringCrateMatrix(int i, float spin)
+{
+    const float a = float(i) / kRing * glm::two_pi<float>();
+    glm::mat4 c = glm::translate(glm::mat4(1.0f), {std::cos(a) * 7.0f, 0.5f, std::sin(a) * 7.0f});
+    return glm::rotate(c, -a + spin * 0.25f, glm::vec3(0, 1, 0));
+}
+
+glm::vec3 sphereCentre(int i, float t)
+{
+    const float a = float(i) / kSpheres * glm::two_pi<float>() + 0.26f;
+    return {std::cos(a) * 4.0f, 0.8f + std::sin(t * 2.0f + float(i)) * 0.3f, std::sin(a) * 4.0f};
+}
+constexpr float kSphereRadius = 0.6f; // the 0.5 sphere mesh, drawn 1.2x
+
+// The player's speeds (metres per second), and the speeds the Walk and Run animations
+// were made for: playing them at speed / that, the feet keep pace with the ground.
+constexpr float kWalkSpeed = 1.5f, kRunSpeed = 4.0f;
+constexpr float kWalkAnimSpeed = 1.35f, kRunAnimSpeed = 3.4f;
+constexpr float kPlayerRadius = 0.35f;
 
 } // namespace
 
@@ -129,8 +161,13 @@ void DemoGame::onInit(core::Application& app)
     app.audio().preload(shotSound_);
     app.audio().preload(clickSound_);
 
-    camera_.position = {0.0f, 3.0f, 10.0f};
-    camera_.lookAt({0.0f, 1.0f, 0.0f});
+    // The player: the same soldier model with his own animator (and so his own pose).
+    playerAnim_.play(gunner_, "Idle");
+
+    // Start behind him, looking where he looks (along -Z).
+    follow_.yaw = -glm::half_pi<float>();
+    follow_.snapTo(playerPos_);
+    follow_.apply(camera_);
 }
 
 void DemoGame::onShutdown(core::Application&)
@@ -157,13 +194,12 @@ void DemoGame::onFixedUpdate(core::Application& app, float dt)
         pingTimer_ += 2.0f;
         const float notes[6] = {1.0f, 1.125f, 1.25f, 1.5f, 1.6875f, 2.0f};
         const int i = nextPing_;
-        nextPing_ = (nextPing_ + 1) % 6;
-        const float a = float(i) / 6.0f * glm::two_pi<float>() + 0.26f; // same layout as onRender
+        nextPing_ = (nextPing_ + 1) % kSpheres;
         audio::PlayParams ping;
         ping.volume = 0.8f;
         ping.pitch = notes[i];
         ping.spatial = true;
-        ping.position = {std::cos(a) * 4.0f, 0.8f, std::sin(a) * 4.0f};
+        ping.position = sphereCentre(i, simTime_);
         // Behind the big crate (seen from the camera)? Then muffle it, as a real
         // obstacle would: walls let the low frequencies through best.
         lastChimeBlocked_ = lineHitsSphere(camera_.position, ping.position, {0.0f, 1.5f, 0.0f}, 1.3f);
@@ -198,7 +234,23 @@ void DemoGame::onUpdate(core::Application& app, float dt)
         app.audio().setReverb(audio::ReverbParams::preset(audio::ReverbPreset(reverbPreset_)));
     }
 
-    updateCamera(app, dt);
+    // C (or Start) switches between flying and following the player.
+    if (in.keyPressed(SDL_SCANCODE_C) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_START)) {
+        cameraMode_ = cameraMode_ == CameraMode::Fly ? CameraMode::ThirdPerson : CameraMode::Fly;
+        if (cameraMode_ == CameraMode::ThirdPerson)
+            follow_.snapTo(playerPos_); // straight back behind him, wherever we flew to
+    }
+
+    const float alpha = app.interpolationAlpha();
+    spinNow_ = glm::mix(prevSpin_, spin_, alpha);
+    simTimeNow_ = glm::mix(prevSimTime_, simTime_, alpha);
+
+    updateMouseCapture(app);
+    updatePlayer(app, dt);
+    if (cameraMode_ == CameraMode::Fly)
+        updateFlyCamera(app, dt);
+    else
+        updateFollowCamera(app, dt); // after the player moved, so it follows him this frame
     // The player hears the world from the camera.
     app.audio().setListener(camera_.position, camera_.forward(), camera_.up());
     // Move the drone's sound with the drone. The audio engine works out its
@@ -286,18 +338,140 @@ void DemoGame::updateGunner(core::Application& app, float dt)
     torso.rotation = glm::angleAxis(-pitch, glm::vec3(1, 0, 0)) * torso.rotation;
 }
 
-void DemoGame::updateCamera(core::Application& app, float dt)
+// Hold the right mouse button (or press Tab) to capture the mouse for looking around.
+void DemoGame::updateMouseCapture(core::Application& app)
 {
     core::Input& in = app.input();
-
-    // --- Look: hold the right mouse button (or press Tab) to capture the mouse ---
     if (in.keyPressed(SDL_SCANCODE_TAB))
         in.setRelativeMouseMode(app.window().handle(), !in.relativeMouseMode());
     if (in.mousePressed(SDL_BUTTON_RIGHT))
         in.setRelativeMouseMode(app.window().handle(), true);
     if (in.mouseReleased(SDL_BUTTON_RIGHT))
         in.setRelativeMouseMode(app.window().handle(), false);
+}
 
+// The player soldier, its feet at playerPos_, turned to face playerYaw_ (his model faces +Z).
+glm::mat4 DemoGame::playerTransform() const
+{
+    return glm::rotate(glm::translate(glm::mat4(1.0f), playerPos_), playerYaw_, glm::vec3(0, 1, 0));
+}
+
+void DemoGame::updatePlayer(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // Which way to go, relative to the camera: "forward" walks away from it. Only in
+    // third person; in fly mode the same keys move the camera and he stands still.
+    glm::vec2 input(0.0f); // x = right, y = forward
+    bool run = false;
+    if (cameraMode_ == CameraMode::ThirdPerson) {
+        if (in.keyDown(SDL_SCANCODE_W)) input.y += 1.0f;
+        if (in.keyDown(SDL_SCANCODE_S)) input.y -= 1.0f;
+        if (in.keyDown(SDL_SCANCODE_D)) input.x += 1.0f;
+        if (in.keyDown(SDL_SCANCODE_A)) input.x -= 1.0f;
+        input += glm::vec2(in.leftStick().x, -in.leftStick().y); // stick up is negative
+        if (glm::length(input) > 1.0f)
+            input = glm::normalize(input);
+        run = in.keyDown(SDL_SCANCODE_LSHIFT) || in.gamepadDown(SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    }
+    const float amount = glm::length(input); // 0..1: a stick pushed half way walks slowly
+    const glm::vec3 wanted = follow_.flatForward() * input.y + follow_.flatRight() * input.x;
+
+    // Turn smoothly towards that direction, the short way round.
+    if (amount > 0.05f) {
+        const float target = std::atan2(wanted.x, wanted.z);
+        const float turn = std::remainder(target - playerYaw_, glm::two_pi<float>());
+        playerYaw_ += turn * (1.0f - std::exp(-12.0f * dt));
+    }
+
+    // Speed up and slow down smoothly, and move the way he faces (so he walks in an arc
+    // while turning, rather than sliding sideways).
+    const float targetSpeed = amount * (run ? kRunSpeed : kWalkSpeed);
+    playerSpeed_ += (targetSpeed - playerSpeed_) * (1.0f - std::exp(-8.0f * dt));
+    playerPos_ += glm::vec3(std::sin(playerYaw_), 0.0f, std::cos(playerYaw_)) * playerSpeed_ * dt;
+
+    // Keep him out of the crates, the spheres and the gunner: push him back out of a
+    // circle around each (enough for a flat world; a physics engine does this in general).
+    auto pushOut = [this](glm::vec2 centre, float radius) {
+        const glm::vec2 p(playerPos_.x, playerPos_.z);
+        const glm::vec2 away = p - centre;
+        const float d = glm::length(away);
+        const float r = radius + kPlayerRadius;
+        if (d < r && d > 1e-4f) {
+            const glm::vec2 out = centre + away / d * r;
+            playerPos_.x = out.x;
+            playerPos_.z = out.y;
+        }
+    };
+    pushOut({0.0f, 0.0f}, 1.6f); // the big crate, at any angle
+    for (int i = 0; i < kRing; ++i) {
+        const glm::vec3 c(ringCrateMatrix(i, spinNow_)[3]);
+        pushOut({c.x, c.z}, 0.65f);
+    }
+    for (int i = 0; i < kSpheres; ++i) {
+        const glm::vec3 c = sphereCentre(i, simTimeNow_);
+        pushOut({c.x, c.z}, kSphereRadius);
+    }
+    pushOut({-2.5f, 5.5f}, 0.4f); // the gunner
+
+    // The animation follows the speed: Idle, Walk or Run, played faster or slower so
+    // his feet keep pace with the ground.
+    if (playerSpeed_ < 0.2f) {
+        playerAnim_.play(gunner_, "Idle");
+        playerAnim_.speed = 1.0f;
+    } else if (playerSpeed_ < (kWalkSpeed + kRunSpeed) * 0.5f) {
+        playerAnim_.play(gunner_, "Walk");
+        playerAnim_.speed = playerSpeed_ / kWalkAnimSpeed;
+    } else {
+        playerAnim_.play(gunner_, "Run");
+        playerAnim_.speed = playerSpeed_ / kRunAnimSpeed;
+    }
+    playerAnim_.update(dt);
+}
+
+// What the third-person camera can't see through: the ground, the crates, the spheres and
+// the gunner.
+// Returns the distance to the nearest one along the ray, if any.
+std::optional<float> DemoGame::raycastScene(const render3d::Ray& ray) const
+{
+    std::optional<float> nearest;
+    auto consider = [&nearest](std::optional<float> hit) {
+        if (hit && (!nearest || *hit < *nearest))
+            nearest = hit;
+    };
+    consider(raycastPlane(ray, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+    consider(raycastBox(ray, bigCrateMatrix(spinNow_))); // the same matrices they're drawn with
+    for (int i = 0; i < kRing; ++i)
+        consider(raycastBox(ray, ringCrateMatrix(i, spinNow_)));
+    for (int i = 0; i < kSpheres; ++i)
+        consider(raycastSphere(ray, sphereCentre(i, simTimeNow_), kSphereRadius));
+    // The gunner, as a box around him (simple shapes are usually enough for a camera).
+    consider(raycastBox(ray, glm::scale(glm::translate(gunnerTransform(), {0.0f, 0.9f, 0.0f}), {0.6f, 1.8f, 0.6f})));
+    return nearest;
+}
+
+void DemoGame::updateFollowCamera(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // Orbit with the captured mouse or the right stick; zoom with the wheel or the d-pad.
+    if (in.relativeMouseMode())
+        follow_.orbit(in.mouseDelta().x * 0.0025f, -in.mouseDelta().y * 0.0025f);
+    const glm::vec2 look = in.rightStick();
+    follow_.orbit(look.x * 2.5f * dt, -look.y * 2.0f * dt);
+    follow_.zoom(in.mouseWheel());
+    if (in.gamepadDown(SDL_GAMEPAD_BUTTON_DPAD_UP)) follow_.zoom(4.0f * dt);
+    if (in.gamepadDown(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) follow_.zoom(-4.0f * dt);
+
+    follow_.update(playerPos_, dt, [this](const render3d::Ray& ray) { return raycastScene(ray); });
+    follow_.apply(camera_);
+}
+
+void DemoGame::updateFlyCamera(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // --- Look: with the captured mouse (see updateMouseCapture) or the right stick ---
     if (in.relativeMouseMode()) {
         const float sensitivity = 0.0025f; // radians per pixel
         camera_.yaw += in.mouseDelta().x * sensitivity;
@@ -359,6 +533,26 @@ void DemoGame::onDebugUI(core::Application& app)
         meshRenderer_->setWireframe(wireframe);
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int mode = int(cameraMode_);
+        if (ImGui::Combo("Mode", &mode, "Fly\0Third person\0")) {
+            cameraMode_ = CameraMode(mode);
+            if (cameraMode_ == CameraMode::ThirdPerson)
+                follow_.snapTo(playerPos_);
+        }
+    }
+    if (cameraMode_ == CameraMode::ThirdPerson && ImGui::CollapsingHeader("Third person", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Distance", &follow_.distance, follow_.minDistance, follow_.maxDistance, "%.1f m");
+        ImGui::SliderFloat("Shoulder", &follow_.shoulder, -1.0f, 1.0f, "%.2f m");
+        ImGui::SliderFloat("Look-at height", &follow_.targetOffset.y, 0.0f, 2.5f, "%.2f m");
+        ImGui::SliderAngle("Pitch", &follow_.pitch, -72.0f, 34.0f);
+        ImGui::SliderFloat("Follow sharpness", &follow_.followSharpness, 0.0f, 30.0f, "%.0f");
+        ImGui::SliderFloat("Return sharpness", &follow_.returnSharpness, 0.5f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Collision radius", &follow_.collisionRadius, 0.0f, 0.6f, "%.2f m");
+        ImGui::SliderAngle("Field of view", &camera_.fovY, 20.0f, 120.0f);
+        ImGui::Text("Distance now: %.2f m%s", double(follow_.currentDistance()), follow_.blocked() ? " (blocked)" : "");
+        ImGui::Text("Player: %s at %.1f m/s", playerAnim_.animationName().c_str(), double(playerSpeed_));
+    }
+    if (cameraMode_ == CameraMode::Fly && ImGui::CollapsingHeader("Fly camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("Position", &camera_.position.x, 0.1f, -100.0f, 100.0f, "%.1f");
         ImGui::SliderAngle("Yaw", &camera_.yaw, -360.0f, 360.0f);
         ImGui::SliderAngle("Pitch", &camera_.pitch, -89.0f, 89.0f);
@@ -421,41 +615,29 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
 {
     camera_.setAspect(float(frame.extent.width) / float(frame.extent.height));
 
-    // Interpolate the fixed-step animation state for smooth motion.
+    // The fixed-step animation state, interpolated for smooth motion (in onUpdate).
     const float alpha = app.interpolationAlpha();
-    const float spin = glm::mix(prevSpin_, spin_, alpha);
-    const float t = glm::mix(prevSimTime_, simTime_, alpha);
+    const float spin = spinNow_;
+    const float t = simTimeNow_;
 
     meshRenderer_->begin(frame, camera_, lighting_);
 
     // Ground: checker texture with a green tint.
     meshRenderer_->draw(ground_, glm::mat4(1.0f), {&checkerTexture_, {0.55f, 0.62f, 0.5f, 1.0f}});
 
-    // Centrepiece: a big crate.
-    glm::mat4 m = glm::translate(glm::mat4(1.0f), {0.0f, 1.5f, 0.0f});
-    m = glm::rotate(m, spin, glm::normalize(glm::vec3(0.3f, 1.0f, 0.2f)));
-    m = glm::scale(m, glm::vec3(2.0f));
-    meshRenderer_->draw(cube_, m, {&crateTexture_});
-
-    // Ring of crates
-    constexpr int kRing = 12;
-    for (int i = 0; i < kRing; ++i) {
-        const float a = float(i) / kRing * glm::two_pi<float>();
-        glm::mat4 c = glm::translate(glm::mat4(1.0f), {std::cos(a) * 7.0f, 0.5f, std::sin(a) * 7.0f});
-        c = glm::rotate(c, -a + spin * 0.25f, glm::vec3(0, 1, 0));
-        meshRenderer_->draw(cube_, c, {&crateTexture_});
-    }
+    // Centrepiece: a big crate, and a ring of crates around it.
+    meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
+    for (int i = 0; i < kRing; ++i)
+        meshRenderer_->draw(cube_, ringCrateMatrix(i, spin), {&crateTexture_});
 
     // Bobbing coloured spheres
     const glm::vec4 palette[] = {
         {0.95f, 0.30f, 0.30f, 1.0f}, {0.30f, 0.80f, 0.40f, 1.0f}, {0.30f, 0.50f, 0.95f, 1.0f},
         {0.95f, 0.80f, 0.25f, 1.0f}, {0.80f, 0.40f, 0.90f, 1.0f}, {0.95f, 0.95f, 0.95f, 1.0f},
     };
-    for (int i = 0; i < 6; ++i) {
-        const float a = float(i) / 6.0f * glm::two_pi<float>() + 0.26f;
-        const glm::vec3 p(std::cos(a) * 4.0f, 0.8f + std::sin(t * 2.0f + float(i)) * 0.3f, std::sin(a) * 4.0f);
-        glm::mat4 s = glm::translate(glm::mat4(1.0f), p);
-        s = glm::scale(s, glm::vec3(1.2f));
+    for (int i = 0; i < kSpheres; ++i) {
+        glm::mat4 s = glm::translate(glm::mat4(1.0f), sphereCentre(i, t));
+        s = glm::scale(s, glm::vec3(kSphereRadius * 2.0f));
         meshRenderer_->draw(sphere_, s, {nullptr, palette[i]});
     }
 
@@ -485,6 +667,11 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
                             flash);
     }
 
+    // The player: the same two models again, in his own pose.
+    const glm::mat4 p = playerTransform();
+    meshRenderer_->draw(gunner_, p, &playerAnim_.pose());
+    meshRenderer_->draw(rifle_, gunner_.nodeMatrix(gunnerSocket_, p, &playerAnim_.pose()));
+
     meshRenderer_->end();
 
     // ===== HUD: 2D text and shapes on top, with a camera where 1 unit = 1 pixel =====
@@ -499,10 +686,12 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     text.snapToPixel = true;
 
     // Top left: performance and camera info, with a soft shadow for readability.
-    char info[224];
-    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
-                  double(app.fps()), meshRenderer_->drawCalls(), double(camera_.position.x),
-                  double(camera_.position.y), double(camera_.position.z), gunnerAnim_.animationName().c_str(), ammo_);
+    char info[256];
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %s   %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
+                  double(app.fps()), meshRenderer_->drawCalls(),
+                  cameraMode_ == CameraMode::Fly ? "fly" : (follow_.blocked() ? "third person (blocked)" : "third person"),
+                  double(camera_.position.x), double(camera_.position.y), double(camera_.position.z),
+                  gunnerAnim_.animationName().c_str(), ammo_);
     render2d::TextStyle shadow = text;
     shadow.color = {0.0f, 0.0f, 0.0f, 0.5f};
     hud_->drawText(font_, info, glm::vec2(17.0f, 13.0f) * ui, shadow);
@@ -522,10 +711,15 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
 
     // Bottom: a help panel, sized to fit its text.
     if (showHelp_) {
-        const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
-                           "Shift: fast      F1 / (Y): wireframe      M: mute      R: reverb      V: vsync\n"
-                           "F / (B): gunner fires      L / (X): gunner reloads\n"
-                           "H: hide help      ` (below Esc): debug UI";
+        const char* help = cameraMode_ == CameraMode::Fly
+            ? "FLY CAMERA      C / (Start): follow the soldier\n"
+              "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down      Shift: fast\n"
+              "F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI"
+            : "THIRD PERSON      C / (Start): fly camera\n"
+              "WASD / left stick: walk      Shift / (L3): run      Right mouse / Tab / right stick: look around\n"
+              "Mouse wheel / d-pad: zoom      F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;
         const glm::vec2 size = font_.measure(help, style.size);

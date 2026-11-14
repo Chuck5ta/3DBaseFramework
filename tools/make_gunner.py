@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes gunner.glb (a low-poly soldier with Idle, Fire and Load animations) and
+"""Writes gunner.glb (a low-poly soldier with Idle, Fire, Load, Walk and Run animations) and
 rifle.glb (the rifle he holds, attached in code at his Socket_Hand_R). CC0.
 
 Usage: python tools/make_gunner.py assets/models
@@ -198,6 +198,30 @@ def build_gunner(path):
         (head, 'rotation', tl, [QUAT_IDENTITY, quat_euler(16, 8), quat_euler(16, 8), QUAT_IDENTITY]),
         (torso, 'rotation', tl, [torso_rest, quat_x(TORSO_LEAN + 4), quat_x(TORSO_LEAN + 4), torso_rest]),
     ])
+
+    # Walk (1.0 s) and Run (0.6 s), both loops: the legs swing, the hips bob, the arms
+    # keep the rifle ready. Thigh angles are degrees about X (negative = forward), shins
+    # bend the knee (positive). Each leg's cycle: contact in front, passing under the
+    # body, pushing off behind, swinging forward with the knee bent; the right leg is
+    # half a cycle behind the left.
+    def gait(name, length, thigh_fwd, thigh_back, knee_lift, bob, lean):
+        times = [length * i / 4 for i in range(5)]
+        thigh = [-thigh_fwd, 0.0, thigh_back, -thigh_fwd * 0.4, -thigh_fwd]
+        shin = [5.0, 8.0, 15.0, knee_lift, 5.0]
+        half = lambda keys: keys[2:4] + keys[0:3]       # the same cycle, half a cycle later
+        (thigh_l, shin_l), (thigh_r, shin_r) = legs['L'], legs['R']
+        low, high = (0, HIPS_Y - bob, 0), (0, HIPS_Y, 0)
+        b.animation(name, [
+            (thigh_l, 'rotation', times, [quat_x(a) for a in thigh]),
+            (shin_l, 'rotation', times, [quat_x(a) for a in shin]),
+            (thigh_r, 'rotation', times, [quat_x(a) for a in half(thigh)]),
+            (shin_r, 'rotation', times, [quat_x(a) for a in half(shin)]),
+            (hips, 'translation', times, [low, high, low, high, low]),
+            (torso, 'rotation', [0.0, length], [quat_x(TORSO_LEAN + lean)] * 2),
+        ])
+
+    gait('Walk', 1.0, thigh_fwd=25.0, thigh_back=20.0, knee_lift=55.0, bob=0.03, lean=3.0)
+    gait('Run', 0.6, thigh_fwd=40.0, thigh_back=30.0, knee_lift=85.0, bob=0.05, lean=12.0)
     b.write(path)
 
 # ---------------------------------------------------------------- the rifle

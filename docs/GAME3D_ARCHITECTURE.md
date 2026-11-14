@@ -110,9 +110,11 @@ src/
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
     Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose, ModelAnimation
     ModelAnimator.h/.cpp      plays a model's animations into a ModelPose (blending, loops, moments)
+    Raycast.h/.cpp            Ray; distance to a plane, sphere or (transformed) box
+    ThirdPersonCamera.h/.cpp  follow/orbit camera with zoom, shoulder offset and collision
     MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models; Material, SceneLighting
   game/
-    DemoGame.h/.cpp           example scene with a fly camera
+    DemoGame.h/.cpp           example scene: fly and third-person cameras, a walking player
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
   mesh.vert, mesh.frag        the mesh shaders
@@ -420,6 +422,61 @@ sequenceDiagram
     G->>A: pose()[torso].rotation = aim * ... (optional)
     G->>M: nodeMatrix(socket, transform, &pose)
     G->>R: draw(model, transform, &pose), then draw(rifle, socket matrix)
+```
+
+**`render3d/Raycast.h`**: ray tests against simple shapes, for camera collision, shooting,
+line of sight and mouse picking.
+
+- `Ray { origin, direction }` (direction normalised, so results are world distances);
+  `at(d)` is the point at distance `d`.
+- `raycastPlane(ray, point, normal)` (either side), `raycastSphere(ray, centre, radius)`,
+  `raycastBox(ray, transform, halfExtents = 0.5)`: each returns `std::optional<float>`,
+  the distance to the first hit. `raycastBox` takes a model matrix (position, rotation,
+  scale) and moves the ray into the box's space (slab test); the default half-extents fit
+  `primitives::cube(1.0f)`, so the matrix a crate is drawn with also tests against it.
+- A ray that starts inside a sphere or box doesn't hit it, so a camera whose target stands
+  inside a shape (a trigger volume, say) isn't blocked by it.
+- No triangle-mesh tests yet: games describe their colliders with these shapes.
+
+**`render3d::ThirdPersonCamera`**: follows a target from behind and orbits around it.
+
+- Public settings: `yaw`/`pitch` (Camera3D's convention: the view direction), `distance`
+  (`minDistance`..`maxDistance`), `targetOffset` (feet to the look-at point, 1.55 m up),
+  `shoulder` (sideways shift, 0.45 m), `minPitch`/`maxPitch`, `followSharpness` (12),
+  `zoomSharpness` (10), `returnSharpness` (4), `collisionRadius` (0.25 m).
+- `orbit(dYaw, dPitch)` (pitch clamped, yaw kept in −π..π), `zoom(steps)` (15 % per step;
+  the mouse wheel), `update(target, dt, raycastFn)`, `snapTo(target)` (no easing; the
+  first `update` does it too), `apply(camera)` (position, yaw, pitch; fov and planes kept).
+- `flatForward()` / `flatRight()`: the view directions along the ground, for moving a
+  player relative to the camera. `position()`, `lookAtPoint()`, `currentDistance()`,
+  `blocked()`.
+- `update`: the pivot follows the target and the zoom follows `distance`, each by
+  `1 − exp(−sharpness·dt)` (frame-rate independent; sharpness 0 = rigid). The look-at
+  point is pulled in from the shoulder if a ray sideways hits something. Then five rays
+  are cast backwards (from the look-at point and from four points `collisionRadius` around
+  it, a cheap stand-in for a sphere cast); the room behind is the nearest hit minus
+  `collisionRadius`. Less room than the current distance: jump there now (the view is never
+  blocked). More: ease out with `returnSharpness` (no popping back and forth past posts).
+- The ray function is the game's (`std::function<std::optional<float>(const Ray&)>`),
+  typically the nearest of `raycast*` calls over the level's colliders; without one there
+  is no collision.
+
+```mermaid
+sequenceDiagram
+    participant G as Game (onUpdate)
+    participant T as ThirdPersonCamera
+    participant W as Game's ray function
+    participant C as Camera3D
+    G->>G: move the player (flatForward/flatRight from T)
+    G->>T: orbit(mouse/stick), zoom(wheel)
+    G->>T: update(playerPos, dt, rayFn)
+    Note over T: pivot and zoom ease towards target and distance
+    T->>W: ray sideways to the shoulder
+    T->>W: five rays backwards
+    W-->>T: nearest hit distances
+    Note over T: blocked: jump in. Clear: ease out
+    G->>T: apply(camera)
+    T->>C: position, yaw, pitch
 ```
 
 **`render3d::MeshRenderer`**: forward renderer for lit, textured meshes and models
@@ -1023,6 +1080,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Per-instance `ModelPose` instead of mutable nodes | One loaded model, many copies each in its own pose (rotors at different angles); the `Model` stays read-only | The game keeps a pose per copy |
 | Rigid-part animation (node TRS) before skinning | Covers mechanical models and characters built from parts (the owner's mix-and-match style), with no shader changes; armature bones still work as nodes | No bending meshes (elbows, faces) until GPU skinning is added |
 | Animator rebuilds the whole pose each update | Simple and correct (no drift, procedural tweaks don't accumulate, blends include untouched nodes) | Work per node per update, fine for game-sized hierarchies |
+| Third-person camera collision through a ray callback | The camera stays independent of how a game stores its level; the same `raycast*` shapes serve shooting and picking; no physics engine needed | The game lists its colliders; only simple shapes until triangle tests or a physics engine come in |
+| Camera jumps in when blocked, eases out when clear | The player is never hidden behind a wall, and the camera doesn't jitter in and out past posts | A sudden cut when something passes between player and camera |
 | Moments by time (`reached`) rather than named events | glTF has no animation events; times come straight from Blender's timeline | Times live in code; rename-safe events would need a side file |
 | Single shared depth buffer | Saves memory; correct thanks to the per-frame barrier | Frames' depth work is serialised (negligible) |
 | Blinn-Phong + hemisphere ambient + fog, driven by roughness/metallic | Small, readable shader that looks good immediately and uses glTF's material values | Not PBR (no image-based lighting, no energy conservation); replace when materials need it |
@@ -1043,6 +1102,10 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
   KTX2/WebP images or Draco/meshopt compression yet. Animations move nodes (rigid parts,
   or parts parented to bones); one animation plays at a time per animator (plus blends).
 - No shadows; one directional light only.
+- Third-person camera: collision with simple shapes only (planes, spheres, boxes); it
+  doesn't fade the player out when it moves in very close; no automatic swing behind a
+  running player. No character controller (the demo keeps its player out of circles
+  around obstacles on a flat ground).
 - Not PBR (roughness and metallic shape a Blinn-Phong highlight; image-based lighting and
   a proper BRDF would be the upgrade).
 - No anti-aliasing (MSAA, FXAA or TAA).

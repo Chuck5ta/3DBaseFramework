@@ -2,9 +2,8 @@
 
 A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**.
 You own all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a
-depth buffer, a lit, textured mesh renderer that also draws glTF models from Blender, a
-fly camera and 3D audio, plus a demo
-scene showing how they fit together.
+depth buffer, a lit, textured mesh renderer that also draws glTF models from Blender, fly
+and third-person cameras and 3D audio, plus a demo scene showing how they fit together.
 
 | Layer | What it does | Library |
 |---|---|---|
@@ -13,7 +12,7 @@ scene showing how they fit together.
 | Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
-| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
+| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, wireframe | your code |
 | Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
@@ -130,6 +129,8 @@ src/
     ModelAnimator       plays a model's animations (blending, looping, moments)
     MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants)
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
+    ThirdPersonCamera   follows a character: orbit, zoom, shoulder offset, collision
+    Raycast             ray tests against planes, spheres and boxes
   game/
     DemoGame            the example — replace with your game
 shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatically
@@ -211,6 +212,11 @@ Tips
   `render3d::ModelAnimator` (`play(model, "Fire", render3d::AnimationLoop::Once)`,
   `update(dt)`, `meshes_->draw(model, transform, &animator.pose())`). Attach weapons or
   hats at socket empties with `model.nodeMatrix(node, transform, &pose)`. Tutorial step 13.
+- A third-person game: move the player with `follow.flatForward()`/`flatRight()`, then
+  `follow.update(playerPos, dt, rayFn)` and `follow.apply(camera_)` with a
+  `render3d::ThirdPersonCamera follow`. `rayFn` returns the nearest hit of your level's
+  colliders (`render3d::raycastBox(ray, crateMatrix)` and friends) so the camera stays out
+  of walls. Tutorial step 14.
 - Your own geometry: fill a `render3d::MeshData` (positions, normals, UVs, indices —
   counter-clockwise triangles) and construct a `Mesh`.
 - New shaders: drop `foo.vert`/`foo.frag` in `shaders/`, load
@@ -255,12 +261,17 @@ Tips
   the console clean of validation errors.
 
 ### Demo controls
+The demo starts in third person, behind a soldier you can walk around.
+
 | Action | Keyboard / mouse | Gamepad / Steam Deck |
 |---|---|---|
-| Look | Hold right mouse button, or Tab to capture the mouse | Right stick |
-| Move | WASD | Left stick |
-| Up / down | Space or E / Ctrl or Q | Right / left trigger |
-| Move faster | Shift | Click left stick |
+| Switch camera: third person / fly | C | Start (Menu) |
+| Look / orbit around the soldier | Hold right mouse button, or Tab to capture the mouse | Right stick |
+| Walk (third person) / move (fly) | WASD | Left stick |
+| Run (third person) / move faster (fly) | Shift | Click left stick |
+| Zoom (third person) | Mouse wheel | D-pad up / down |
+| Up / down (fly) | Space or E / Ctrl or Q | Right / left trigger |
+| Gunner fires / reloads | F / L | B / X |
 | Wireframe | F1 | Y |
 | Mute sound | M | |
 | Reverb: off / room / hall / cave | R | |

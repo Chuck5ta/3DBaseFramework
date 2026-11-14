@@ -12,8 +12,11 @@
 #include "render3d/MeshRenderer.h"
 #include "render3d/Model.h"
 #include "render3d/ModelAnimator.h"
+#include "render3d/Raycast.h"
+#include "render3d/ThirdPersonCamera.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 class DemoGame : public core::Game {
@@ -26,7 +29,12 @@ public:
     void onDebugUI(core::Application& app) override;
 
 private:
-    void updateCamera(core::Application& app, float dt);
+    void updateMouseCapture(core::Application& app);
+    void updateFlyCamera(core::Application& app, float dt);
+    void updateFollowCamera(core::Application& app, float dt);
+    void updatePlayer(core::Application& app, float dt);
+    std::optional<float> raycastScene(const render3d::Ray& ray) const;
+    glm::mat4 playerTransform() const;
     void updateGunner(core::Application& app, float dt);
     glm::mat4 gunnerTransform() const;
 
@@ -39,7 +47,20 @@ private:
     gfx::Texture crateTexture_;
     gfx::Texture checkerTexture_;
 
-    float cameraSpeedBoost_ = 1.0f; // eases between normal and fast movement
+    float cameraSpeedBoost_ = 1.0f; // eases between normal and fast movement (fly camera)
+
+    // Two ways to view the scene, switched with C: flying freely, or following the
+    // player from behind (third person).
+    enum class CameraMode { Fly, ThirdPerson };
+    CameraMode cameraMode_ = CameraMode::ThirdPerson;
+    render3d::ThirdPersonCamera follow_;
+
+    // The player: a second soldier (the gunner's model, with his own animator) who walks
+    // and runs where you steer him in third person.
+    glm::vec3 playerPos_{2.0f, 0.0f, 10.0f}; // his feet
+    float playerYaw_ = glm::pi<float>();      // which way he faces (pi = along -Z)
+    float playerSpeed_ = 0.0f;                // metres per second, eased
+    render3d::ModelAnimator playerAnim_;
 
     // 2D overlay for the HUD, drawn on top of the 3D scene.
     std::unique_ptr<render2d::SpriteBatch> hud_;
@@ -49,8 +70,10 @@ private:
 
     // Animation state, advanced in onFixedUpdate; prev* for interpolation.
     float spin_ = 0.0f;
+    float spinNow_ = 0.0f;    // spin_ interpolated for this frame (the camera's collisions use it)
     float prevSpin_ = 0.0f;
     float simTime_ = 0.0f;
+    float simTimeNow_ = 0.0f; // simTime_ interpolated for this frame
     float prevSimTime_ = 0.0f;
 
     // 3D sound: a looping hum on the big crate, and chimes from the spheres.

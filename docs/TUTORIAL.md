@@ -7,7 +7,8 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-3D sound with Doppler, audio effects, a debug UI, and 3D models from Blender (glTF), animated.
+3D sound with Doppler, audio effects, a debug UI, 3D models from Blender (glTF), animated,
+and a third-person camera that follows a walking character and keeps out of walls.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
@@ -27,6 +28,7 @@ background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECT
 | [11](#step-11--a-passing-drone-doppler) | A moving sound and the Doppler effect | A buzzing drone that rises in pitch as it approaches and drops as it passes |
 | [12](#step-12--a-drone-model-gltf) | A glTF model with moving parts | The drone becomes a proper model, rotors spinning, leaning into its turn |
 | [13](#step-13--an-animated-gunner) | Animations from Blender, sockets | A soldier who follows the drone, fires (**F**) and reloads (**L**) |
+| [14](#step-14--a-third-person-camera) | `ThirdPersonCamera`, ray tests, a player character | Walk and run a second soldier; the camera follows him and won't go through crates; **C** switches cameras |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -264,7 +266,7 @@ gfx::Texture makeCheckerTexture(gfx::VulkanContext& gpu)
             const bool odd = ((x / cell) + (y / cell)) & 1;
             const bool line = (x % cell) < 2 || (y % cell) < 2;
             const uint8_t v = line ? 120 : (odd ? 200 : 170);
-            uint8_t* p = &px[(y * N + x) * 4];
+            uint8_t* p = &px[size_t((y * N + x) * 4)];
             p[0] = p[1] = p[2] = v;
             p[3] = 255;
         }
@@ -1424,8 +1426,9 @@ animation to play, call `update(dt)` every frame, and draw with the **pose** it 
 
 The project ships a soldier made for this step, `assets/models/gunner.glb`, built from
 separate rigid parts (head, torso, upper arms, forearms, hands, legs), each turning about
-its joint. It has three animations: **Idle** (4 s, loops: breathing and looking around),
-**Fire** (0.45 s: the recoil) and **Load** (1.5 s: the left hand swaps the magazine).
+its joint. This step uses three of its animations: **Idle** (4 s, loops: breathing and
+looking around), **Fire** (0.45 s: the recoil) and **Load** (1.5 s: the left hand swaps
+the magazine). Step 14 uses the other two, **Walk** and **Run**.
 His rifle is a separate model, `assets/models/rifle.glb`, attached in code to an empty
 in his right hand called `Socket_Hand_R`: a **socket**. Swap the rifle for any other
 model and it's carried the same way.
@@ -1607,24 +1610,477 @@ Origin > Origin to 3D Cursor*, with the cursor on the joint). Parent them (*Ctrl
 Object*), apply scale (*Ctrl+A*), and add an empty called `Socket_Hand_R` in the hand.
 Then either:
 
-- **animate the objects themselves:** each animation is an Action per object. To export
-  several animations, push each object's Action down to an NLA track with the
-  animation's name ("Fire"), and export with *Animation > Mode: NLA Tracks*. Tracks with
-  the same name on different objects become one animation; or
 - **use an armature** (recommended for characters): add bones at the joints and parent
   each part to its bone (*Ctrl+P > Bone*, not *With Automatic Weights*), then make one
-  Action per animation on the armature (Action Editor). Export with *Animation > Mode:
-  Actions*. The parts stay rigid, the bones become nodes, and the framework animates them
-  the same way.
+  Action per animation on the armature (Dope Sheet > Action Editor, *New*). The parts
+  stay rigid, the bones become nodes with the parts as their children, and the framework
+  animates them the same way. One object holds all the animation, so this is the easy
+  route; or
+- **animate the objects themselves:** one animation is **one Action shared by every part**
+  (Blender 4.4 and later give each object its own *slot* in it). Keying several objects
+  gives each one its own Action (`HipsAction`, `TorsoAction`, …), which would export as
+  separate animations that each move one part, so: key one part, rename its Action to the
+  animation's name ("Fire"), then pick that Action for each other part (Object
+  Properties > Animation, or the Action Editor) before keying it. Importing
+  `gunner.glb` into Blender shows this set-up.
 
-Tick *Animation* in the glTF export dialog, keep the frame rate you animated at, and
-use Linear keyframes for loops. Skinned meshes (vertices bent by several bones with
-*Automatic Weights*) aren't supported yet: they load in their rest pose with a warning.
+**Export** (*File > Export > glTF 2.0*, format *glTF Binary (.glb)*): tick *Animation*
+and leave *Animation > Mode* on **Actions** (the default) so each Action becomes one
+animation with its name. Don't use *NLA Tracks*: tested with Blender 5.2, it mixed the
+other tracks into each animation and moved the rest pose. Blender exports whole frames,
+so keys between frames are rounded (frame 1 is 1/24 s at 24 fps, unless you tick *Set
+All glTF Animation Starting at 0*). Use Linear keyframes for loops. Skinned meshes
+(vertices bent by several bones with *Automatic Weights*) aren't supported yet: they
+load in their rest pose with a warning.
 
 **Run it:** the gunner stands on the left, turning to follow the drone, breathing and
 glancing around. Press **F** to fire (watch the recoil and the muzzle flash), five
 times to empty the rifle and see him reload, or **L** to reload at any time. The HUD
 shows his animation and ammunition.
+
+---
+
+## Step 14 — A third-person camera
+
+The fly camera is good for looking around, but most action games follow a character: the
+camera floats behind and above the player, turns around him with the mouse or the right
+stick, and moves in when a wall gets in the way. `render3d::ThirdPersonCamera` does that.
+You give it the player's position every frame and it works out where the camera goes:
+
+- it **follows** with a little lag, which smooths out small jerks in the movement;
+- it **orbits** (`orbit`) and **zooms** (`zoom`) around a point at head height, shifted
+  sideways for an over-the-shoulder view (`shoulder`);
+- it **avoids obstacles**: you give it a function that casts a ray into your world, and
+  when something comes between the player and the camera, the camera jumps in front of it
+  at once, then eases back out when the way is clear.
+
+The rays are tested with `render3d/Raycast.h`: `raycastPlane`, `raycastSphere` and
+`raycastBox`, each returning the distance to the hit (or nothing). `raycastBox` takes the
+same model matrix you draw a crate with, so the collision shapes can't drift away from
+what's drawn. The same tests work for shooting, line of sight and picking things with
+the mouse.
+
+The player is a second soldier, using `gunner.glb` again: it has two more animations
+for this step, **Walk** (1 s) and **Run** (0.6 s), both loops. One loaded model, two
+animators, two soldiers doing different things. **C** switches between the two cameras.
+
+In **`MyGame.h`**, include the two new headers after `ModelAnimator.h`:
+
+```cpp
+#include "render3d/Raycast.h"
+#include "render3d/ThirdPersonCamera.h"
+```
+
+and `#include <optional>` after `#include <memory>`. Replace the `updateCamera`
+declaration with these:
+
+```cpp
+    void updateMouseCapture(core::Application& app);
+    void updateFlyCamera(core::Application& app, float dt);
+    void updateFollowCamera(core::Application& app, float dt);
+    void updatePlayer(core::Application& app, float dt);
+    std::optional<float> raycastScene(const render3d::Ray& ray) const;
+    glm::mat4 playerTransform() const;
+```
+
+Replace the `cameraSpeedBoost_` member with:
+
+```cpp
+    float cameraSpeedBoost_ = 1.0f; // eases between normal and fast movement (fly camera)
+
+    // Two ways to view the scene, switched with C: flying freely, or following the
+    // player from behind (third person).
+    enum class CameraMode { Fly, ThirdPerson };
+    CameraMode cameraMode_ = CameraMode::ThirdPerson;
+    render3d::ThirdPersonCamera follow_;
+
+    // The player: a second soldier (the gunner's model, with his own animator) who walks
+    // and runs where you steer him in third person.
+    glm::vec3 playerPos_{2.0f, 0.0f, 10.0f}; // his feet
+    float playerYaw_ = glm::pi<float>();      // which way he faces (pi = along -Z)
+    float playerSpeed_ = 0.0f;                // metres per second, eased
+    render3d::ModelAnimator playerAnim_;
+```
+
+and replace the animation-state members (`spin_` to `prevSimTime_`) with these, which add
+the values for this frame (the camera's collisions need to know where the crates are now):
+
+```cpp
+    float spin_ = 0.0f;
+    float spinNow_ = 0.0f;    // spin_ interpolated for this frame (the camera's collisions use it)
+    float prevSpin_ = 0.0f;
+    float simTime_ = 0.0f;
+    float simTimeNow_ = 0.0f; // simTime_ interpolated for this frame
+    float prevSimTime_ = 0.0f;
+```
+
+In **`MyGame.cpp`**, the crates, spheres and player now need their positions in three
+places: to draw them, to stop the player walking through them, and to stop the camera
+seeing through them. Add these helpers to the anonymous namespace, after `droneAt`:
+
+```cpp
+// Where things stand. Drawing, the player's collisions and the camera's collisions all
+// use these, so they always agree.
+constexpr int kRing = 12;   // crates in the ring
+constexpr int kSpheres = 6;
+
+glm::mat4 bigCrateMatrix(float spin)
+{
+    glm::mat4 m = glm::translate(glm::mat4(1.0f), {0.0f, 1.5f, 0.0f});
+    m = glm::rotate(m, spin, glm::normalize(glm::vec3(0.3f, 1.0f, 0.2f)));
+    return glm::scale(m, glm::vec3(2.0f));
+}
+
+glm::mat4 ringCrateMatrix(int i, float spin)
+{
+    const float a = float(i) / kRing * glm::two_pi<float>();
+    glm::mat4 c = glm::translate(glm::mat4(1.0f), {std::cos(a) * 7.0f, 0.5f, std::sin(a) * 7.0f});
+    return glm::rotate(c, -a + spin * 0.25f, glm::vec3(0, 1, 0));
+}
+
+glm::vec3 sphereCentre(int i, float t)
+{
+    const float a = float(i) / kSpheres * glm::two_pi<float>() + 0.26f;
+    return {std::cos(a) * 4.0f, 0.8f + std::sin(t * 2.0f + float(i)) * 0.3f, std::sin(a) * 4.0f};
+}
+constexpr float kSphereRadius = 0.6f; // the 0.5 sphere mesh, drawn 1.2x
+
+// The player's speeds (metres per second), and the speeds the Walk and Run animations
+// were made for: playing them at speed / that, the feet keep pace with the ground.
+constexpr float kWalkSpeed = 1.5f, kRunSpeed = 4.0f;
+constexpr float kWalkAnimSpeed = 1.35f, kRunAnimSpeed = 3.4f;
+constexpr float kPlayerRadius = 0.35f;
+```
+
+In `onInit`, replace the two lines that place the camera with:
+
+```cpp
+    // The player: the same soldier model with his own animator (and so his own pose).
+    playerAnim_.play(gunner_, "Idle");
+
+    // Start behind him, looking where he looks (along -Z).
+    follow_.yaw = -glm::half_pi<float>();
+    follow_.snapTo(playerPos_);
+    follow_.apply(camera_);
+```
+
+The chimes now come from where the spheres really are (they bob). In `onFixedUpdate`,
+replace the lines from `nextPing_ = ...` to `ping.position = ...` with:
+
+```cpp
+        nextPing_ = (nextPing_ + 1) % kSpheres;
+        audio::PlayParams ping;
+        ping.volume = 0.8f;
+        ping.pitch = notes[i];
+        ping.spatial = true;
+        ping.position = sphereCentre(i, simTime_);
+```
+
+In `onUpdate`, replace `updateCamera(app, dt);` with:
+
+```cpp
+    // C (or Start) switches between flying and following the player.
+    if (in.keyPressed(SDL_SCANCODE_C) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_START)) {
+        cameraMode_ = cameraMode_ == CameraMode::Fly ? CameraMode::ThirdPerson : CameraMode::Fly;
+        if (cameraMode_ == CameraMode::ThirdPerson)
+            follow_.snapTo(playerPos_); // straight back behind him, wherever we flew to
+    }
+
+    const float alpha = app.interpolationAlpha();
+    spinNow_ = glm::mix(prevSpin_, spin_, alpha);
+    simTimeNow_ = glm::mix(prevSimTime_, simTime_, alpha);
+
+    updateMouseCapture(app);
+    updatePlayer(app, dt);
+    if (cameraMode_ == CameraMode::Fly)
+        updateFlyCamera(app, dt);
+    else
+        updateFollowCamera(app, dt); // after the player moved, so it follows him this frame
+```
+
+Now split `updateCamera` up. Its first lines, which capture the mouse, become a function
+of their own that both cameras use; the rest becomes `updateFlyCamera`. Replace the start
+of `updateCamera`, up to and including `if (in.relativeMouseMode()) {`, with the
+following pieces. First the mouse capture:
+
+```cpp
+// Hold the right mouse button (or press Tab) to capture the mouse for looking around.
+void MyGame::updateMouseCapture(core::Application& app)
+{
+    core::Input& in = app.input();
+    if (in.keyPressed(SDL_SCANCODE_TAB))
+        in.setRelativeMouseMode(app.window().handle(), !in.relativeMouseMode());
+    if (in.mousePressed(SDL_BUTTON_RIGHT))
+        in.setRelativeMouseMode(app.window().handle(), true);
+    if (in.mouseReleased(SDL_BUTTON_RIGHT))
+        in.setRelativeMouseMode(app.window().handle(), false);
+}
+```
+
+The player: he moves relative to the camera (forward = away from it), turns smoothly
+towards where he's going, and plays Idle, Walk or Run to match his speed:
+
+```cpp
+// The player soldier, its feet at playerPos_, turned to face playerYaw_ (his model faces +Z).
+glm::mat4 MyGame::playerTransform() const
+{
+    return glm::rotate(glm::translate(glm::mat4(1.0f), playerPos_), playerYaw_, glm::vec3(0, 1, 0));
+}
+
+void MyGame::updatePlayer(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // Which way to go, relative to the camera: "forward" walks away from it. Only in
+    // third person; in fly mode the same keys move the camera and he stands still.
+    glm::vec2 input(0.0f); // x = right, y = forward
+    bool run = false;
+    if (cameraMode_ == CameraMode::ThirdPerson) {
+        if (in.keyDown(SDL_SCANCODE_W)) input.y += 1.0f;
+        if (in.keyDown(SDL_SCANCODE_S)) input.y -= 1.0f;
+        if (in.keyDown(SDL_SCANCODE_D)) input.x += 1.0f;
+        if (in.keyDown(SDL_SCANCODE_A)) input.x -= 1.0f;
+        input += glm::vec2(in.leftStick().x, -in.leftStick().y); // stick up is negative
+        if (glm::length(input) > 1.0f)
+            input = glm::normalize(input);
+        run = in.keyDown(SDL_SCANCODE_LSHIFT) || in.gamepadDown(SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    }
+    const float amount = glm::length(input); // 0..1: a stick pushed half way walks slowly
+    const glm::vec3 wanted = follow_.flatForward() * input.y + follow_.flatRight() * input.x;
+
+    // Turn smoothly towards that direction, the short way round.
+    if (amount > 0.05f) {
+        const float target = std::atan2(wanted.x, wanted.z);
+        const float turn = std::remainder(target - playerYaw_, glm::two_pi<float>());
+        playerYaw_ += turn * (1.0f - std::exp(-12.0f * dt));
+    }
+
+    // Speed up and slow down smoothly, and move the way he faces (so he walks in an arc
+    // while turning, rather than sliding sideways).
+    const float targetSpeed = amount * (run ? kRunSpeed : kWalkSpeed);
+    playerSpeed_ += (targetSpeed - playerSpeed_) * (1.0f - std::exp(-8.0f * dt));
+    playerPos_ += glm::vec3(std::sin(playerYaw_), 0.0f, std::cos(playerYaw_)) * playerSpeed_ * dt;
+
+    // Keep him out of the crates, the spheres and the gunner: push him back out of a
+    // circle around each (enough for a flat world; a physics engine does this in general).
+    auto pushOut = [this](glm::vec2 centre, float radius) {
+        const glm::vec2 p(playerPos_.x, playerPos_.z);
+        const glm::vec2 away = p - centre;
+        const float d = glm::length(away);
+        const float r = radius + kPlayerRadius;
+        if (d < r && d > 1e-4f) {
+            const glm::vec2 out = centre + away / d * r;
+            playerPos_.x = out.x;
+            playerPos_.z = out.y;
+        }
+    };
+    pushOut({0.0f, 0.0f}, 1.6f); // the big crate, at any angle
+    for (int i = 0; i < kRing; ++i) {
+        const glm::vec3 c(ringCrateMatrix(i, spinNow_)[3]);
+        pushOut({c.x, c.z}, 0.65f);
+    }
+    for (int i = 0; i < kSpheres; ++i) {
+        const glm::vec3 c = sphereCentre(i, simTimeNow_);
+        pushOut({c.x, c.z}, kSphereRadius);
+    }
+    pushOut({-2.5f, 5.5f}, 0.4f); // the gunner
+
+    // The animation follows the speed: Idle, Walk or Run, played faster or slower so
+    // his feet keep pace with the ground.
+    if (playerSpeed_ < 0.2f) {
+        playerAnim_.play(gunner_, "Idle");
+        playerAnim_.speed = 1.0f;
+    } else if (playerSpeed_ < (kWalkSpeed + kRunSpeed) * 0.5f) {
+        playerAnim_.play(gunner_, "Walk");
+        playerAnim_.speed = playerSpeed_ / kWalkAnimSpeed;
+    } else {
+        playerAnim_.play(gunner_, "Run");
+        playerAnim_.speed = playerSpeed_ / kRunAnimSpeed;
+    }
+    playerAnim_.update(dt);
+}
+```
+
+What the camera can't see through, as a function that casts a ray into the scene:
+
+```cpp
+// What the third-person camera can't see through: the ground, the crates, the spheres and
+// the gunner.
+// Returns the distance to the nearest one along the ray, if any.
+std::optional<float> MyGame::raycastScene(const render3d::Ray& ray) const
+{
+    std::optional<float> nearest;
+    auto consider = [&nearest](std::optional<float> hit) {
+        if (hit && (!nearest || *hit < *nearest))
+            nearest = hit;
+    };
+    consider(raycastPlane(ray, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+    consider(raycastBox(ray, bigCrateMatrix(spinNow_))); // the same matrices they're drawn with
+    for (int i = 0; i < kRing; ++i)
+        consider(raycastBox(ray, ringCrateMatrix(i, spinNow_)));
+    for (int i = 0; i < kSpheres; ++i)
+        consider(raycastSphere(ray, sphereCentre(i, simTimeNow_), kSphereRadius));
+    // The gunner, as a box around him (simple shapes are usually enough for a camera).
+    consider(raycastBox(ray, glm::scale(glm::translate(gunnerTransform(), {0.0f, 0.9f, 0.0f}), {0.6f, 1.8f, 0.6f})));
+    return nearest;
+}
+```
+
+The camera: orbit, zoom, then `update` with the player's position and the ray function,
+and `apply` to copy the result into `camera_`. Then the start of the old function, renamed
+to `updateFlyCamera` (the rest of it stays as it was):
+
+```cpp
+void MyGame::updateFollowCamera(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // Orbit with the captured mouse or the right stick; zoom with the wheel or the d-pad.
+    if (in.relativeMouseMode())
+        follow_.orbit(in.mouseDelta().x * 0.0025f, -in.mouseDelta().y * 0.0025f);
+    const glm::vec2 look = in.rightStick();
+    follow_.orbit(look.x * 2.5f * dt, -look.y * 2.0f * dt);
+    follow_.zoom(in.mouseWheel());
+    if (in.gamepadDown(SDL_GAMEPAD_BUTTON_DPAD_UP)) follow_.zoom(4.0f * dt);
+    if (in.gamepadDown(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) follow_.zoom(-4.0f * dt);
+
+    follow_.update(playerPos_, dt, [this](const render3d::Ray& ray) { return raycastScene(ray); });
+    follow_.apply(camera_);
+}
+
+void MyGame::updateFlyCamera(core::Application& app, float dt)
+{
+    core::Input& in = app.input();
+
+    // --- Look: with the captured mouse (see updateMouseCapture) or the right stick ---
+    if (in.relativeMouseMode()) {
+```
+
+In `onRender`, the animation state for this frame is now worked out in `onUpdate`.
+Replace the three lines after `camera_.setAspect(...)` with:
+
+```cpp
+    // The fixed-step animation state, interpolated for smooth motion (in onUpdate).
+    const float alpha = app.interpolationAlpha();
+    const float spin = spinNow_;
+    const float t = simTimeNow_;
+```
+
+draw the crates with the helpers (replacing the big crate and the ring loop):
+
+```cpp
+    // Centrepiece: a big crate, and a ring of crates around it.
+    meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
+    for (int i = 0; i < kRing; ++i)
+        meshRenderer_->draw(cube_, ringCrateMatrix(i, spin), {&crateTexture_});
+```
+
+and the spheres (replacing their loop; the `palette` stays):
+
+```cpp
+    for (int i = 0; i < kSpheres; ++i) {
+        glm::mat4 s = glm::translate(glm::mat4(1.0f), sphereCentre(i, t));
+        s = glm::scale(s, glm::vec3(kSphereRadius * 2.0f));
+        meshRenderer_->draw(sphere_, s, {nullptr, palette[i]});
+    }
+```
+
+Draw the player after the gunner, before `meshRenderer_->end()`:
+
+```cpp
+    // The player: the same two models again, in his own pose.
+    const glm::mat4 p = playerTransform();
+    meshRenderer_->draw(gunner_, p, &playerAnim_.pose());
+    meshRenderer_->draw(rifle_, gunner_.nodeMatrix(gunnerSocket_, p, &playerAnim_.pose()));
+```
+
+The HUD shows the camera mode. Replace the `info` lines with:
+
+```cpp
+    char info[256];
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %s   %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
+                  double(app.fps()), meshRenderer_->drawCalls(),
+                  cameraMode_ == CameraMode::Fly ? "fly" : (follow_.blocked() ? "third person (blocked)" : "third person"),
+                  double(camera_.position.x), double(camera_.position.y), double(camera_.position.z),
+                  gunnerAnim_.animationName().c_str(), ammo_);
+```
+
+and the help text with one for each camera:
+
+```cpp
+        const char* help = cameraMode_ == CameraMode::Fly
+            ? "FLY CAMERA      C / (Start): follow the soldier\n"
+              "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down      Shift: fast\n"
+              "F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI"
+            : "THIRD PERSON      C / (Start): fly camera\n"
+              "WASD / left stick: walk      Shift / (L3): run      Right mouse / Tab / right stick: look around\n"
+              "Mouse wheel / d-pad: zoom      F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI";
+```
+
+Finally, the debug UI gets a mode switch and the third-person settings, so you can tune
+them while you play. In `onDebugUI`, replace the start of the Camera section, up to and
+including the `DragFloat3("Position", ...)` line, with:
+
+```cpp
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int mode = int(cameraMode_);
+        if (ImGui::Combo("Mode", &mode, "Fly\0Third person\0")) {
+            cameraMode_ = CameraMode(mode);
+            if (cameraMode_ == CameraMode::ThirdPerson)
+                follow_.snapTo(playerPos_);
+        }
+    }
+    if (cameraMode_ == CameraMode::ThirdPerson && ImGui::CollapsingHeader("Third person", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Distance", &follow_.distance, follow_.minDistance, follow_.maxDistance, "%.1f m");
+        ImGui::SliderFloat("Shoulder", &follow_.shoulder, -1.0f, 1.0f, "%.2f m");
+        ImGui::SliderFloat("Look-at height", &follow_.targetOffset.y, 0.0f, 2.5f, "%.2f m");
+        ImGui::SliderAngle("Pitch", &follow_.pitch, -72.0f, 34.0f);
+        ImGui::SliderFloat("Follow sharpness", &follow_.followSharpness, 0.0f, 30.0f, "%.0f");
+        ImGui::SliderFloat("Return sharpness", &follow_.returnSharpness, 0.5f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Collision radius", &follow_.collisionRadius, 0.0f, 0.6f, "%.2f m");
+        ImGui::SliderAngle("Field of view", &camera_.fovY, 20.0f, 120.0f);
+        ImGui::Text("Distance now: %.2f m%s", double(follow_.currentDistance()), follow_.blocked() ? " (blocked)" : "");
+        ImGui::Text("Player: %s at %.1f m/s", playerAnim_.animationName().c_str(), double(playerSpeed_));
+    }
+    if (cameraMode_ == CameraMode::Fly && ImGui::CollapsingHeader("Fly camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Position", &camera_.position.x, 0.1f, -100.0f, 100.0f, "%.1f");
+```
+
+The rest of the Camera section (yaw, pitch, field of view and the "Look at the crate"
+button) now belongs to "Fly camera".
+
+Things to notice:
+
+- **Moving relative to the camera.** `flatForward()` and `flatRight()` are the camera's
+  directions along the ground. Mixing them by the input makes W always walk away from the
+  camera and D always walk to its right, wherever it has been turned.
+- **Smoothing that doesn't depend on the frame rate.** The player's turning and speed, and
+  the camera's following, all move a fraction `1 - exp(-sharpness * dt)` of the way to
+  their target each frame. Unlike a fixed fraction per frame, that gives the same motion
+  at 30 and 300 fps.
+- **In fast, out slowly.** When the camera is blocked it moves in at once, so you never see
+  the inside of a crate; when the way is clear again it eases out (`returnSharpness`), so
+  it doesn't jump back and forth as you walk past things. It casts five rays, from the
+  look-at point and from points around it as wide as the camera (`collisionRadius`), so
+  it doesn't slip past edges that a single thin ray would miss.
+- **Animation speed matches the ground.** Walk was made for about 1.35 m/s, so playing it at
+  `playerSpeed_ / 1.35` keeps his feet from sliding when he walks slower or faster (a
+  half-pushed stick walks slowly). Above half way between walking and running speed, Run
+  takes over; the animator blends between them.
+- **Collisions without physics.** On a flat world, pushing the player out of a circle
+  around each obstacle is enough. A physics engine (Jolt, say) does this for any shape.
+- **The listener stays at the camera**, so sounds pan as you see them.
+
+**Try it:** in the debug UI's Third person section, set *Shoulder* to 0 for a centred view,
+or change *Follow sharpness* (higher is tighter, 0 is rigid) and *Return sharpness*.
+
+**Run it:** you start behind the second soldier. Walk with **WASD** (or the left stick)
+and run with **Shift** (or click the stick); hold the right mouse button, press **Tab**,
+or use the right stick to look around him; zoom with the mouse wheel or the d-pad. Walk
+behind the big crate and turn the camera so the crate is between you and it: the camera
+moves in front of it ("blocked" in the HUD). **C** switches to the fly camera and back.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
@@ -1637,8 +2093,10 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 
 1. **Your own meshes.** Fill a `render3d::MeshData` (positions, normals, UVs, and
    counter-clockwise triangles) and construct a `Mesh` — try a pyramid or a cylinder.
-2. **A third-person character.** Replace the fly camera: move a "player" cube in
-   `onFixedUpdate` and place the camera behind it, smoothing with `1 - exp(-k·dt)`.
+2. **Aiming over the shoulder.** While the right mouse button is held, zoom in (a smaller
+   `distance`, a bigger `shoulder`), turn the player to face where the camera looks, and
+   cast a ray from the camera through the middle of the screen with `raycastScene` to
+   find what he'd hit.
 3. **A squadron.** Draw several drones from the one `droneModel_`, each with its own
    `ModelPose`, flight path and rotor speed: one `Model` in memory, many on screen. Or a
    squad of gunners, each with its own `ModelAnimator`, firing in turn.

@@ -39,7 +39,8 @@ src/
   core/                 Application (loop, hooks), Window, Input, Actions, GameState, SaveData, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
-  render3d/             MeshRenderer (Material, SceneLighting), Model (glTF), ModelAnimator, Mesh (+ primitives), Camera3D
+  render3d/             MeshRenderer (Material, SceneLighting), Model (glTF), ModelAnimator, Mesh (+ primitives),
+                        Camera3D, ThirdPersonCamera, Raycast
   render2d/             SpriteBatch, Camera2D, Font, Animation (used for the HUD)
   audio/                AudioEngine (miniaudio): sounds, music, 3D, effects, Doppler
   debugui/              DebugUI (Dear ImGui)
@@ -483,15 +484,74 @@ meshes.draw(rifle_, gunner_.nodeMatrix(socket, transform, &anim_.pose()));
 - `Game3D/assets/models/gunner.glb` (CC0, 1.9 m soldier, 296 triangles): nodes `Gunner >
   Hips > Torso > Head > Helmet`, `UpperArm/Forearm/Hand_L/R`, `Thigh/Shin_L/R`,
   `Socket_Hand_R` (rifle goes here); animations `Idle` (4 s loop), `Fire` (0.45 s), `Load`
-  (1.5 s; magazine out at 0.3 s, in at 1.0 s). `rifle.glb` has a `Muzzle` node. Generated
+  (1.5 s; magazine out at 0.3 s, in at 1.0 s), `Walk` (1 s loop, made for ~1.35 m/s) and
+  `Run` (0.6 s loop, ~3.4 m/s; play at `speed = actualSpeed / that` so the feet don't
+  slide). The arms keep the rifle ready in every animation. `rifle.glb` has a `Muzzle` node. Generated
   by `tools/make_gunner.py` (arm poses solved with a small IK solver); sounds
   `rifle_shot.wav`, `mag_click.wav` by `tools/make_gunner_sounds.py`. Tutorial step 13.
-- Blender advice given to the owner (not yet tried by him): build characters from separate
-  objects with the same names and hierarchy, origins at the joints, parented (Ctrl+P >
-  Object) or bone-parented to an armature (Ctrl+P > Bone; then one Action per animation,
-  export *Mode: Actions*); without an armature, push each object's Action to NLA tracks
-  named after the animation and export *Mode: NLA Tracks*. Tick *Animation* and *Set all
-  glTF Animation starting at 0*. Sockets are empties (`Socket_Hand_R`).
+- **Blender workflow, tested by Claude through the Blender MCP connection (Blender 5.2.3,
+  2026-11-14):** build characters from separate objects (same names and hierarchy, origins
+  at the joints). Recommended: bone-parent them to an armature (Ctrl+P > Bone), one Action
+  per animation; the export has the bones as nodes with the parts as children, plus an
+  unused `skins` entry that the loader ignores (0 warnings), and played correctly in the
+  viewer. Without an armature, every part must share **one Action per animation** (Blender
+  4.4+ slots); keying parts separately gives one Action each, exported as separate
+  animations. Export *Mode: Actions* (default). **Not NLA Tracks:** re-exporting
+  the imported gunner that way put Fire 205 mm out and the rest pose 23 mm out (other
+  tracks mixed in), even with the active actions cleared; Actions mode matched (rest
+  exact, Idle within 2 mm). Keep *Always Sample Animations* on (off kept the key times
+  but moved a rest pose 24 mm). Blender rounds keys to whole frames (`make_gunner.py`'s
+  0.45 s Fire became 0.417 s), so sub-frame keys don't survive a round trip. Frame 1
+  exports as 1/24 s unless *Set All glTF Animation Starting at 0* is ticked. Importing
+  `gunner.glb` gives the 16 objects, the `Socket_Hand_R` empty and the actions Idle, Fire
+  and Load, each shared by the parts it moves. Sockets are empties (`Socket_Hand_R`).
+- **Testing through Blender:** the owner's Blender MCP add-on runs Python inside his
+  Blender 5.2.3 (`H:\Program Files\Blender Foundation\Blender 5.2`); Steam's Blender 5.3.0
+  is also installed. Work in a new scene (`bpy.data.scenes.new`) so his open file is left
+  alone, write test files to `tempfile.gettempdir()`, and save a test .blend with
+  `bpy.data.libraries.write` (doesn't rename his session). Binary results come back as
+  base64 in `result`; pad it past the size limit and the tool saves it to a file you can
+  decode. To check an export, load both files with `loadModelData` and compare every
+  node's world matrix at many times.
+
+**`render3d::ThirdPersonCamera`** (`render3d/ThirdPersonCamera.h`): follows a target from
+behind, orbits, zooms, keeps out of walls. Per frame, **after** moving the player:
+
+```cpp
+follow_.orbit(in.mouseDelta().x * 0.0025f, -in.mouseDelta().y * 0.0025f); // when the mouse is captured
+follow_.zoom(in.mouseWheel());                       // + = 15% closer per step
+follow_.update(playerPos_, dt, [this](const render3d::Ray& r) { return raycastScene(r); });
+follow_.apply(camera_);                              // position, yaw, pitch into the Camera3D
+// move the player relative to the view:
+glm::vec3 wanted = follow_.flatForward() * input.y + follow_.flatRight() * input.x;
+```
+
+- Settings (public): `yaw`/`pitch` (Camera3D convention: view direction; negative pitch
+  looks down), `distance` (1.5..12), `targetOffset` (feet → look-at, default 1.55 m up),
+  `shoulder` (0.45 m right; 0 = centred), `minPitch`/`maxPitch`, `followSharpness` (12; 0 =
+  rigid), `zoomSharpness`, `returnSharpness` (4), `collisionRadius` (0.25 m).
+- `snapTo(target)` places it with no easing (spawn, teleport, switching to this camera);
+  the first `update` does it too. `blocked()`, `currentDistance()`, `position()`,
+  `lookAtPoint()` for HUD/debug.
+- Collision: the optional ray function returns the nearest hit distance (or nothing); the
+  camera casts five rays backwards (a fake sphere cast) plus one sideways for the
+  shoulder. Blocked → jumps in at once; clear → eases out. No function = no collision.
+- Not built in: fading the player when the camera is very close, auto-swinging behind a
+  running player, a character controller (the demo pushes its player out of circles).
+
+**`render3d/Raycast.h`:** `Ray{origin, direction (normalised)}`, `ray.at(d)`;
+`raycastPlane(ray, point, normal)`, `raycastSphere(ray, centre, r)`,
+`raycastBox(ray, modelMatrix, halfExtents = 0.5)` → `std::optional<float>` distance. Pass a
+box the **same matrix it's drawn with** (the default half-extents fit `primitives::cube(1)`).
+Rays starting inside a sphere/box don't hit it. Typical ray function: the nearest of
+`raycast*` over the level's colliders (see `DemoGame::raycastScene`). Also for shooting,
+line of sight and mouse picking.
+
+**Demo (tutorial step 14):** starts in third person behind a second soldier (the gunner's
+model, own `ModelAnimator`); **C** / gamepad Start toggles the fly camera. WASD/left stick
+walk (camera-relative), Shift/L3 run, right mouse/Tab/right stick orbit, wheel/d-pad zoom.
+Shared layout helpers (`bigCrateMatrix`, `ringCrateMatrix`, `sphereCentre`) feed drawing,
+the player's push-out circles and the camera's `raycastScene`, so they can't disagree.
 
 **`render3d::SceneLighting`** (all colours sRGB): `sunDirection` (the direction light
 travels), `sunColor`, `sunIntensity`, `skyColor` and `groundColor` (hemisphere ambient),
@@ -696,8 +756,9 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
 
 ## 13. Known limitations (as of 2026-11-14)
 
-**Planned next (the owner's order, 2026-11-14):** a third-person camera, then shadows, then
-skinned characters if needed. The 3D "Drone Invaders" will have a soldier gunner on the
+**Planned next (the owner's order, 2026-11-14):** shadows, then skinned characters if
+needed (the third-person camera is done). Instancing was discussed and deferred: worth it
+for forests, crowds and particles, not for Drone Invaders' tens of objects. The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
 
@@ -706,6 +767,8 @@ can be mixed and matched from the same pieces.
   compression (refused with a message). Animation is node-based (rigid parts), one
   animation per animator at a time (plus cross-fades); no animation events beyond
   `reached(time)`.
+- Third-person camera: simple collider shapes only (no triangle-mesh ray tests), no
+  player fade when close, no auto-follow swing; no character controller.
 - One directional light, no shadows, not PBR (roughness/metallic shape a Blinn-Phong
   highlight), no anti-aliasing, no skybox (the fog-coloured
   clear colour stands in), no frustum culling or instancing (one draw call per object).

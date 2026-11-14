@@ -3,7 +3,7 @@
 | File | Description |
 |---|---|
 | `drone.glb` | Low-poly quadcopter, about 1.3 m across, 430 triangles, one 128×128 texture (the circling drone in the demo) |
-| `gunner.glb` | Low-poly soldier, 1.9 m, 296 triangles, built from rigid parts, with three animations: `Idle` (4 s, loops), `Fire` (0.45 s), `Load` (1.5 s) |
+| `gunner.glb` | Low-poly soldier, 1.9 m, 296 triangles, built from rigid parts, with five animations: `Idle` (4 s, loops), `Fire` (0.45 s), `Load` (1.5 s), `Walk` (1 s, loops; made for about 1.35 m/s) and `Run` (0.6 s, loops; about 3.4 m/s) |
 | `rifle.glb` | His rifle, 104 triangles; attached in code at the gunner's `Socket_Hand_R`. Its `Muzzle` node marks where the flash goes |
 
 `drone.glb` was generated for this project by `tools/make_drone.py`, and `gunner.glb` and
