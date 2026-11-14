@@ -18,6 +18,14 @@
 //   pose_[rotor_].rotation = glm::angleAxis(spin, glm::vec3(0, 1, 0));
 //   meshes.draw(drone_, transform, &pose_);
 //
+// Animations made in Blender (one per Action) are played by a ModelAnimator, which
+// fills a ModelPose for you (see ModelAnimator.h). Sockets: an empty in Blender, say
+// "Socket_Hand_R", marks where to attach another model, which then follows the animation:
+//
+//   const int hand = soldier_.findNode("Socket_Hand_R");              // once
+//   const glm::mat4 at = soldier_.nodeMatrix(hand, transform, &animator_.pose());
+//   meshes.draw(rifle_, at);
+//
 // Units are metres and +Y is up. A model's front faces +Z (Blender's -Y after export).
 
 #include "gfx/Texture.h"
@@ -28,6 +36,7 @@
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -100,6 +109,35 @@ struct ModelNode {
     NodeTransform transform;
 };
 
+class ModelPose;
+
+// --- Animations ------------------------------------------------------------------------------
+
+enum class AnimationPath { Translation, Rotation, Scale };
+enum class AnimationInterpolation { Linear, Step, CubicSpline };
+
+// The keyframes of one property (position, rotation or scale) of one node.
+struct AnimationChannel {
+    int node = -1;
+    AnimationPath path = AnimationPath::Translation;
+    AnimationInterpolation interpolation = AnimationInterpolation::Linear;
+    std::vector<float> times;      // seconds, increasing
+    // xyz for translation and scale; a quaternion as (x, y, z, w) for rotation.
+    // CubicSpline has three per key: in-tangent, value, out-tangent.
+    std::vector<glm::vec4> values;
+};
+
+// One animation: a Blender Action ("Idle", "Fire", "Load"), as glTF stores it.
+struct ModelAnimation {
+    std::string name;
+    float duration = 0.0f; // seconds (the last keyframe's time)
+    std::vector<AnimationChannel> channels;
+
+    // Sets the transforms of the nodes this animation moves to their values at `time`
+    // (seconds, clamped to 0..duration). Nodes it doesn't animate are left alone.
+    void apply(float time, ModelPose& pose) const;
+};
+
 // Everything in a glTF file, on the CPU. Model::load uses it; it's also handy for tools
 // and tests (no GPU needed).
 struct ModelData {
@@ -110,6 +148,7 @@ struct ModelData {
     std::vector<ModelImage> images;
     std::vector<ModelTexture> textures;
     std::vector<ModelNode> nodes;       // parents before children
+    std::vector<ModelAnimation> animations;
     glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // of the whole model, in its default pose
     std::vector<std::string> warnings;  // things that were skipped (also logged)
 };
@@ -127,6 +166,7 @@ public:
 
 private:
     friend class Model;
+    friend class ModelAnimator;
     std::vector<NodeTransform> nodes_;
     NodeTransform ignored_;
 };
@@ -149,6 +189,11 @@ public:
     const ModelNode& node(int index) const { return nodes_[size_t(index)]; }
     ModelPose defaultPose() const;
 
+    // Animations: one per Blender Action. findAnimation returns -1 (and warns once) if
+    // there's none with that name. ModelAnimator plays them by name.
+    const std::vector<ModelAnimation>& animations() const { return animations_; }
+    int findAnimation(std::string_view name) const;
+
     const std::vector<ModelMaterial>& materials() const { return materials_; }
     const std::vector<ModelMesh>& meshes() const { return meshes_; }
 
@@ -162,6 +207,10 @@ public:
     // --- For MeshRenderer ---------------------------------------------------------------
     const Mesh& geometry() const { return geometry_; }
     const gfx::Texture* texture(int index) const;
+    // World matrix of one node (a socket, a muzzle, a hand) for a pose (nullptr = default
+    // pose): draw an attached model with it, or take its position for effects and bullets.
+    // Node -1 gives `transform` itself.
+    glm::mat4 nodeMatrix(int node, const glm::mat4& transform, const ModelPose* pose = nullptr) const;
     // World matrix of every node for a pose (nullptr = default pose).
     void nodeMatrices(const glm::mat4& transform, const ModelPose* pose, std::vector<glm::mat4>& out) const;
 
@@ -171,9 +220,11 @@ private:
     std::vector<ModelMaterial> materials_;
     std::vector<ModelMesh> meshes_;
     std::vector<ModelNode> nodes_;
+    std::vector<ModelAnimation> animations_;
     glm::vec3 boundsMin_{0.0f}, boundsMax_{0.0f};
     std::string name_;
-    mutable std::set<std::string, std::less<>> warned_;
+    mutable std::set<std::string, std::less<>> warned_;           // missing node names reported
+    mutable std::set<std::string, std::less<>> warnedAnimations_; // missing animation names reported
 };
 
 } // namespace render3d

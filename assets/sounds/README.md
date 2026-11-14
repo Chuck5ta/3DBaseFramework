@@ -5,9 +5,11 @@
 | `hum_loop.wav` | Machine hum, 2 s, loops seamlessly (used as a 3D sound on the spinning crate) |
 | `ping.wav` | Small bell chime (played from the spheres, positioned in 3D) |
 | `drone_loop.wav` | Buzzing propeller motor, 1 s, loops seamlessly (the flying drone; you hear the Doppler effect as it passes) |
+| `rifle_shot.wav` | A rifle shot, 0.6 s (the gunner's Fire animation) |
+| `mag_click.wav` | A magazine clicking out or in, 0.12 s (his Load animation) |
 
 These sounds were synthesised for this project (sine tones, filtered noise and simple
-envelopes; mono, 48 kHz, 16-bit WAV). They are released into the public domain (CC0):
+envelopes; mono, 48 kHz, 16-bit WAV); `tools/make_gunner_sounds.py` makes the last two. They are released into the public domain (CC0):
 use, change and ship them freely.
 
 Play them with `app.audio().play(core::assetPath("sounds/<file>"))`. Supported formats are

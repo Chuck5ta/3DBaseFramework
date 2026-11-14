@@ -3,7 +3,7 @@
 > This guide covers setting up each platform, building, running, making a release build and
 > getting it onto a Steam Deck. Commands are run from the project folder (the one containing
 > `CMakeLists.txt`) unless stated otherwise.
-> For how the code is structured, see [ARCHITECTURE.md](ARCHITECTURE.md).
+> For how the code is structured, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
 
 ---
 
@@ -501,6 +501,7 @@ A short checklist (full details in the Steamworks documentation:
 | The debug UI doesn't appear | It exists in Debug builds only (`relwithdebinfo` and `release` don't create it). Press the key below Esc (**`**). To keep it in another build, set `config.debugUI.enabled = true` in `main.cpp`. |
 | The game starts muted, without vsync, in fullscreen, or with odd controls | Not a bug: the player's settings are remembered between runs in `settings.json`. In a Debug build, open the debug UI → Engine → **Settings & saves** → **Reset settings**, or close the game and delete the save folder: `%APPDATA%\MyStudio\Game3D` on Windows, `~/.local/share/MyStudio/Game3D` on Linux. |
 | *Failed to load model '…': …* | The message says why. Common ones: the file isn't next to the exe in `assets/models/` (rebuild to copy assets); a `.gltf`'s `.bin` or textures weren't copied with it (export as `.glb` instead); it was exported with Draco compression (untick *Compression* in Blender's glTF export). |
+| A model's animation doesn't play, or a part doesn't move | The log lists the animations the file has (*has no animation called 'Fire' (it has: …)*). In Blender's glTF export, tick *Animation*; with *Mode: Actions* each Action becomes one animation, and with *Mode: NLA Tracks* each track name does. A part that should move must be its own object (or parented to a bone), not joined into another mesh. A part that turns about the wrong point needs its origin on the joint. |
 | A model is invisible, inside out or faces the wrong way | Faces seen from behind are culled: in Blender, *Mesh > Normals > Recalculate Outside*, or tick *Backface Culling* off in the material's settings to export it double-sided. Apply rotation and scale before export (*Ctrl+A*). The framework's front is +Z, Blender's -Y. |
 | No sound | The log shows the device at startup (*Audio: … via WASAPI / PulseAudio / …*). *Audio: no output device* means none was found: the game keeps running silently. Check that `GAME_AUDIO` isn't set to `0`, the game isn't muted (**M** in the demo) and the sound files are in `assets/sounds/` next to the executable. |
 | Linux: *ALSA lib …* or *jack server is not running* lines in the console | Harmless. miniaudio is trying audio backends in turn; it uses the first one that works. |

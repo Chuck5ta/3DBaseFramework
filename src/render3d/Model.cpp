@@ -135,6 +135,7 @@ struct Loader {
     std::string folder;
     ModelData& out;
     std::set<std::string> warnedOnce;
+    std::map<const cgltf_node*, int> nodeIndex; // glTF node -> index in out.nodes
 
     void warn(const std::string& message)
     {
@@ -381,7 +382,8 @@ struct Loader {
         node.parent = parent;
         node.mesh = indexOf(n.mesh, gltf.meshes);
         if (n.skin)
-            warn("Node '" + node.name + "': skinned (armature) animation isn't supported yet; drawn in its rest pose");
+            warn("Node '" + node.name + "': skinned (armature) deformation isn't supported yet; drawn in its rest "
+                 "pose. For rigid parts, parent the objects to bones instead (Ctrl+P > Bone)");
         if (n.has_matrix) {
             glm::vec3 skew;
             glm::vec4 perspective;
@@ -396,6 +398,7 @@ struct Loader {
                 node.transform.scale = glm::make_vec3(n.scale);
         }
         const int index = int(out.nodes.size());
+        nodeIndex[&n] = index;
         out.nodes.push_back(std::move(node));
         for (cgltf_size i = 0; i < n.children_count; ++i)
             addNode(*n.children[i], index);
@@ -422,8 +425,67 @@ struct Loader {
                 out.nodes.push_back(node);
             }
         }
-        if (gltf.animations_count > 0)
-            warn("The file's animations aren't played yet (animate nodes with a ModelPose instead)");
+    }
+
+    void loadAnimations()
+    {
+        for (cgltf_size a = 0; a < gltf.animations_count; ++a) {
+            const cgltf_animation& anim = gltf.animations[a];
+            ModelAnimation ma;
+            ma.name = nameOr(anim.name, "animation", a);
+            for (cgltf_size c = 0; c < anim.channels_count; ++c) {
+                const cgltf_animation_channel& ch = anim.channels[c];
+                if (!ch.target_node || !ch.sampler || !ch.sampler->input || !ch.sampler->output)
+                    continue;
+                AnimationChannel mc;
+                switch (ch.target_path) {
+                case cgltf_animation_path_type_translation: mc.path = AnimationPath::Translation; break;
+                case cgltf_animation_path_type_rotation: mc.path = AnimationPath::Rotation; break;
+                case cgltf_animation_path_type_scale: mc.path = AnimationPath::Scale; break;
+                default:
+                    warn("Animation '" + ma.name + "': shape key (morph target) animation isn't supported; skipped");
+                    continue;
+                }
+                const auto found = nodeIndex.find(ch.target_node);
+                if (found == nodeIndex.end())
+                    continue; // a node outside the loaded scene
+                mc.node = found->second;
+                switch (ch.sampler->interpolation) {
+                case cgltf_interpolation_type_step: mc.interpolation = AnimationInterpolation::Step; break;
+                case cgltf_interpolation_type_cubic_spline: mc.interpolation = AnimationInterpolation::CubicSpline; break;
+                default: mc.interpolation = AnimationInterpolation::Linear; break;
+                }
+                const cgltf_accessor& in = *ch.sampler->input;
+                const cgltf_accessor& outAcc = *ch.sampler->output;
+                const cgltf_size perKey = mc.interpolation == AnimationInterpolation::CubicSpline ? 3 : 1;
+                if (in.count == 0 || outAcc.count != in.count * perKey) {
+                    warn("Animation '" + ma.name + "': a channel with mismatched keyframes was skipped");
+                    continue;
+                }
+                const cgltf_size components = mc.path == AnimationPath::Rotation ? 4 : 3;
+                mc.times.resize(in.count);
+                bool ok = true;
+                for (cgltf_size k = 0; k < in.count; ++k) {
+                    ok = ok && cgltf_accessor_read_float(&in, k, &mc.times[k], 1);
+                    if (k > 0 && mc.times[k] < mc.times[k - 1])
+                        ok = false;
+                }
+                mc.values.resize(outAcc.count, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                for (cgltf_size k = 0; k < outAcc.count; ++k) {
+                    float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    ok = ok && cgltf_accessor_read_float(&outAcc, k, v, components);
+                    mc.values[k] = glm::vec4(v[0], v[1], v[2], v[3]);
+                }
+                if (!ok) {
+                    warn("Animation '" + ma.name + "': a channel with unreadable keyframes was skipped");
+                    continue;
+                }
+                ma.duration = std::max(ma.duration, mc.times.back());
+                ma.channels.push_back(std::move(mc));
+            }
+            if (!ma.channels.empty())
+                out.animations.push_back(std::move(ma));
+        }
     }
 
     void computeBounds()
@@ -497,10 +559,74 @@ bool loadModelData(const std::string& path, ModelData& out, std::string* error)
     loader.loadMaterials();
     loader.loadMeshes();
     loader.loadNodes();
+    loader.loadAnimations();
     loader.computeBounds();
     if (out.indices.empty())
         return fail("it has no triangles to draw");
     return true;
+}
+
+// --- ModelAnimation ----------------------------------------------------------------------
+
+namespace {
+
+glm::quat toQuat(const glm::vec4& v) { return glm::quat(v.w, v.x, v.y, v.z); }
+
+// The value of a channel at `time`, as a vec4 (xyz, or a quaternion as x, y, z, w).
+glm::vec4 sample(const AnimationChannel& ch, float time)
+{
+    const std::vector<float>& t = ch.times;
+    const bool cubic = ch.interpolation == AnimationInterpolation::CubicSpline;
+    const auto value = [&](size_t key) { return ch.values[cubic ? key * 3 + 1 : key]; };
+    if (time <= t.front())
+        return value(0);
+    if (time >= t.back())
+        return value(t.size() - 1);
+    const size_t next = size_t(std::upper_bound(t.begin(), t.end(), time) - t.begin());
+    const size_t prev = next - 1;
+    const float span = t[next] - t[prev];
+    const float u = span > 0.0f ? (time - t[prev]) / span : 0.0f;
+    const bool rotation = ch.path == AnimationPath::Rotation;
+    switch (ch.interpolation) {
+    case AnimationInterpolation::Step:
+        return value(prev);
+    case AnimationInterpolation::CubicSpline: {
+        // Hermite spline between the two keys, with glTF's tangents (scaled by the span).
+        const glm::vec4 p0 = value(prev), p1 = value(next);
+        const glm::vec4 m0 = ch.values[prev * 3 + 2] * span, m1 = ch.values[next * 3] * span;
+        const float u2 = u * u, u3 = u2 * u;
+        glm::vec4 r = (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * m0 + (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * m1;
+        if (rotation) {
+            const glm::quat q = glm::normalize(toQuat(r));
+            r = glm::vec4(q.x, q.y, q.z, q.w);
+        }
+        return r;
+    }
+    case AnimationInterpolation::Linear:
+    default:
+        if (rotation) {
+            const glm::quat q = glm::slerp(toQuat(value(prev)), toQuat(value(next)), u); // the short way round
+            return glm::vec4(q.x, q.y, q.z, q.w);
+        }
+        return glm::mix(value(prev), value(next), u);
+    }
+}
+
+} // namespace
+
+void ModelAnimation::apply(float time, ModelPose& pose) const
+{
+    for (const AnimationChannel& ch : channels) {
+        if (ch.times.empty())
+            continue;
+        const glm::vec4 v = sample(ch, time);
+        NodeTransform& node = pose[ch.node];
+        switch (ch.path) {
+        case AnimationPath::Translation: node.translation = glm::vec3(v); break;
+        case AnimationPath::Rotation: node.rotation = glm::normalize(toQuat(v)); break;
+        case AnimationPath::Scale: node.scale = glm::vec3(v); break;
+        }
+    }
 }
 
 // --- ModelPose ---------------------------------------------------------------------------
@@ -559,6 +685,7 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
     m.materials_ = data.materials;
     m.meshes_ = data.meshes;
     m.nodes_ = data.nodes;
+    m.animations_ = data.animations;
     m.boundsMin_ = data.boundsMin;
     m.boundsMax_ = data.boundsMax;
     return m;
@@ -572,6 +699,30 @@ int Model::findNode(std::string_view name) const
     if (warned_.insert(std::string(name)).second)
         LOG_WARN("Model '%s' has no node called '%.*s'", name_.c_str(), int(name.size()), name.data());
     return -1;
+}
+
+int Model::findAnimation(std::string_view name) const
+{
+    for (size_t i = 0; i < animations_.size(); ++i)
+        if (animations_[i].name == name)
+            return int(i);
+    if (warnedAnimations_.insert(std::string(name)).second) {
+        std::string names;
+        for (const ModelAnimation& a : animations_)
+            names += (names.empty() ? "" : ", ") + a.name;
+        LOG_WARN("Model '%s' has no animation called '%.*s' (it has: %s)", name_.c_str(), int(name.size()), name.data(),
+                 names.empty() ? "none" : names.c_str());
+    }
+    return -1;
+}
+
+glm::mat4 Model::nodeMatrix(int node, const glm::mat4& transform, const ModelPose* pose) const
+{
+    const bool usePose = pose && pose->size() == nodes_.size();
+    glm::mat4 m(1.0f);
+    for (int i = node; i >= 0 && size_t(i) < nodes_.size(); i = nodes_[size_t(i)].parent)
+        m = (usePose ? (*pose)[i] : nodes_[size_t(i)].transform).matrix() * m;
+    return transform * m;
 }
 
 ModelPose Model::defaultPose() const

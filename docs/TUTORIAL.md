@@ -7,10 +7,10 @@ every step you can build and run the game and see the result.
 **What you'll learn:** the `Game` hooks, meshes and the `MeshRenderer`, materials and
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
-3D sound with Doppler, audio effects, a debug UI, and 3D models from Blender (glTF).
+3D sound with Doppler, audio effects, a debug UI, and 3D models from Blender (glTF), animated.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
-background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
+background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
 
 | Step | You add | You see |
 |---|---|---|
@@ -26,6 +26,7 @@ background on any class used here, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | [10](#step-10--reverb-and-muffled-sounds) | Audio effects: reverb presets, a per-sound low-pass | **R** changes the room; chimes behind the crate are muffled |
 | [11](#step-11--a-passing-drone-doppler) | A moving sound and the Doppler effect | A buzzing drone that rises in pitch as it approaches and drops as it passes |
 | [12](#step-12--a-drone-model-gltf) | A glTF model with moving parts | The drone becomes a proper model, rotors spinning, leaning into its turn |
+| [13](#step-13--an-animated-gunner) | Animations from Blender, sockets | A soldier who follows the drone, fires (**F**) and reloads (**L**) |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -1410,6 +1411,221 @@ Things to notice:
 (fly up close and press **F1** for wireframe to see how few triangles it takes). Raise
 the drone speed in the debug UI: it leans further into the turn and its rotors spin faster.
 
+---
+
+## Step 13 — An animated gunner
+
+The drone's rotors were moved by code. Most movement in games is **animation** made in
+a modelling program instead: a soldier firing, a door opening, a turret recoiling.
+Blender stores each animation as an **Action** ("Idle", "Fire", "Load"), and the glTF
+exporter writes them into the file. The framework plays them with a
+`render3d::ModelAnimator`, which works like the 2D `Animator`: you tell it which
+animation to play, call `update(dt)` every frame, and draw with the **pose** it works out.
+
+The project ships a soldier made for this step, `assets/models/gunner.glb`, built from
+separate rigid parts (head, torso, upper arms, forearms, hands, legs), each turning about
+its joint. It has three animations: **Idle** (4 s, loops: breathing and looking around),
+**Fire** (0.45 s: the recoil) and **Load** (1.5 s: the left hand swaps the magazine).
+His rifle is a separate model, `assets/models/rifle.glb`, attached in code to an empty
+in his right hand called `Socket_Hand_R`: a **socket**. Swap the rifle for any other
+model and it's carried the same way.
+
+In **`MyGame.h`**, include the animator after `Model.h`:
+
+```cpp
+#include "render3d/ModelAnimator.h"
+```
+
+declare two helpers after `updateCamera`:
+
+```cpp
+    void updateGunner(core::Application& app, float dt);
+    glm::mat4 gunnerTransform() const;
+```
+
+and add at the end of the members:
+
+```cpp
+    // A gunner: a soldier model with animations made in Blender (Idle, Fire, Load), and a
+    // rifle model attached to a socket in his right hand. He turns to follow the drone.
+    render3d::Model gunner_;
+    render3d::Model rifle_;
+    render3d::ModelAnimator gunnerAnim_;
+    int gunnerSocket_ = -1; // node in gunner_: where the rifle goes
+    int gunnerTorso_ = -1;  // node in gunner_: tilted to aim up at the drone
+    int rifleMuzzle_ = -1;  // node in rifle_: where the muzzle flash appears
+    int ammo_ = 5;          // rounds left in the magazine
+    float muzzleFlash_ = 0.0f; // seconds left to show the flash
+    glm::vec3 droneNow_{0.0f}; // the drone's position this frame (the gunner aims at it)
+    std::string shotSound_;
+    std::string clickSound_;
+```
+
+In **`MyGame.cpp`**, load the models and sounds in `onInit`, before the camera is placed:
+
+```cpp
+    // The gunner and his rifle: two models. The rifle is drawn at the gunner's
+    // "Socket_Hand_R" node, so it follows his animations.
+    gunner_ = render3d::Model::load(app.gpu(), core::assetPath("models/gunner.glb"));
+    rifle_ = render3d::Model::load(app.gpu(), core::assetPath("models/rifle.glb"));
+    gunnerSocket_ = gunner_.findNode("Socket_Hand_R");
+    gunnerTorso_ = gunner_.findNode("Torso");
+    rifleMuzzle_ = rifle_.findNode("Muzzle");
+    gunnerAnim_.play(gunner_, "Idle"); // loops until something else is played
+    shotSound_ = core::assetPath("sounds/rifle_shot.wav");
+    clickSound_ = core::assetPath("sounds/mag_click.wav");
+    app.audio().preload(shotSound_);
+    app.audio().preload(clickSound_);
+```
+
+Add the two helpers before `updateCamera`:
+
+```cpp
+// Where the gunner stands, turned to face the drone (his model faces +Z).
+glm::mat4 MyGame::gunnerTransform() const
+{
+    const glm::vec3 position(-2.5f, 0.0f, 5.5f);
+    const glm::vec3 to = droneNow_ - position;
+    const float yaw = std::atan2(to.x, to.z);
+    return glm::rotate(glm::translate(glm::mat4(1.0f), position), yaw, glm::vec3(0, 1, 0));
+}
+
+void MyGame::updateGunner(core::Application& app, float dt)
+{
+    constexpr int kMagazine = 5;
+    core::Input& in = app.input();
+    const bool loading = gunnerAnim_.isPlaying("Load") && !gunnerAnim_.finished();
+
+    // F (or the gamepad's B) fires; an empty rifle reloads instead. L (or X) reloads.
+    if (!loading && (in.keyPressed(SDL_SCANCODE_F) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_EAST))) {
+        if (ammo_ > 0) {
+            --ammo_;
+            gunnerAnim_.play(gunner_, "Fire", render3d::AnimationLoop::Once, true); // restart: rapid fire
+        } else {
+            gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+        }
+    }
+    if (!loading && ammo_ < kMagazine && (in.keyPressed(SDL_SCANCODE_L) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_WEST)))
+        gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+
+    gunnerAnim_.update(dt);
+    muzzleFlash_ = std::max(0.0f, muzzleFlash_ - dt); // before a new shot, so a flash shows for at least a frame
+
+    // Moments in the animations: the shot at the start of Fire, and the magazine coming
+    // out (0.3 s) and going in (1.0 s) during Load.
+    const glm::mat4 rifleAt = gunner_.nodeMatrix(gunnerSocket_, gunnerTransform(), &gunnerAnim_.pose());
+    const glm::vec3 riflePos(rifleAt[3]);
+    audio::PlayParams sound;
+    sound.spatial = true;
+    sound.position = riflePos;
+    sound.minDistance = 3.0f;
+    if (gunnerAnim_.isPlaying("Fire") && gunnerAnim_.reached(0.0f)) {
+        muzzleFlash_ = 0.06f;
+        app.audio().play(shotSound_, sound);
+    }
+    if (gunnerAnim_.isPlaying("Load") && (gunnerAnim_.reached(0.3f) || gunnerAnim_.reached(1.0f))) {
+        sound.volume = 0.6f;
+        app.audio().play(clickSound_, sound);
+    }
+
+    // When a Fire or Load finishes, go back to Idle (or reload an empty rifle).
+    if (gunnerAnim_.finished()) {
+        if (gunnerAnim_.isPlaying("Load"))
+            ammo_ = kMagazine;
+        if (gunnerAnim_.isPlaying("Fire") && ammo_ == 0)
+            gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+        else
+            gunnerAnim_.play(gunner_, "Idle");
+    }
+
+    // Aim up at the drone: tilt the torso back on top of whatever the animation does.
+    // (The pose is rebuilt by every update(), so this doesn't build up.)
+    const glm::vec3 chest = glm::vec3(gunnerTransform()[3]) + glm::vec3(0.0f, 1.4f, 0.0f);
+    const glm::vec3 to = droneNow_ - chest;
+    const float pitch = std::clamp(std::atan2(to.y, glm::length(glm::vec2(to.x, to.z))), 0.0f, glm::radians(35.0f));
+    render3d::NodeTransform& torso = gunnerAnim_.pose()[gunnerTorso_];
+    torso.rotation = glm::angleAxis(-pitch, glm::vec3(1, 0, 0)) * torso.rotation;
+}
+
+```
+
+Call it in `onUpdate`, after the rotors are spun:
+
+```cpp
+    droneNow_ = droneAt(droneAngle);
+    updateGunner(app, dt);
+```
+
+And in `onRender`, draw the gunner after the drone (before `meshRenderer_->end()`):
+
+```cpp
+    // The gunner, in the pose his animator worked out, and the rifle at his hand's socket.
+    const glm::mat4 g = gunnerTransform();
+    meshRenderer_->draw(gunner_, g, &gunnerAnim_.pose());
+    const glm::mat4 rifleAt = gunner_.nodeMatrix(gunnerSocket_, g, &gunnerAnim_.pose());
+    meshRenderer_->draw(rifle_, rifleAt);
+    if (muzzleFlash_ > 0.0f) { // a glowing blob at the rifle's "Muzzle" node
+        const glm::mat4 muzzle = rifle_.nodeMatrix(rifleMuzzle_, rifleAt);
+        render3d::Material flash{nullptr, {1.0f, 0.75f, 0.3f, 1.0f}};
+        flash.emissive = {1.0f, 0.7f, 0.25f};
+        flash.emissiveStrength = 3.0f;
+        meshRenderer_->draw(sphere_, glm::scale(glm::translate(muzzle, {0.0f, 0.0f, 0.06f}), glm::vec3(0.12f, 0.12f, 0.22f)),
+                            flash);
+    }
+```
+
+Things to notice:
+
+- **`play` is safe to call every frame.** Asking for the animation that's already
+  playing does nothing, unless you pass `restart = true` (rapid fire restarts **Fire**
+  on every shot). `AnimationLoop::Once` plays to the end and holds the last pose, and
+  `finished()` then tells you it's over: that's when the gunner goes back to **Idle**.
+- **Changing animation blends.** For `blendTime` (0.15 s by default) the animator mixes
+  the old pose into the new one, so going from **Fire** to **Idle** doesn't snap.
+- **Moments in an animation.** `reached(seconds)` is true on the update that passed that
+  time: the shot at 0 s into **Fire**, the magazine clicks at 0.3 s and 1.0 s into
+  **Load**. It's how you'd spawn a bullet or play a footstep exactly in time with the
+  animation. To find the times, take the frame number in Blender's timeline, subtract
+  the first frame and divide by the frame rate (frame 25 of an animation starting on
+  frame 1, at 24 fps, is 1 s), and tick *Set all glTF Animation starting at 0* in the
+  exporter's Animation settings so the file's times start at 0 too.
+- **Sockets.** `nodeMatrix(node, transform, &pose)` is the world matrix of one node in
+  this pose. Drawing another model with it attaches that model there; the rifle's own
+  `Muzzle` node then gives the place for the flash. Chains of attachments work the same way.
+- **Animation plus code.** `pose()` can be changed after `update()`: here the torso is
+  tilted back to aim up at the drone, on top of whatever animation is playing. The
+  pose is rebuilt on every update, so the tilt doesn't build up.
+- **Unknown names don't crash.** A misspelt animation logs a warning once, listing the
+  model's animations, and the current one carries on.
+- **One model, many soldiers.** Each `ModelAnimator` has its own time and pose, so a
+  squad can share one loaded `gunner_`, each with its own animator.
+
+**Making your own in Blender.** Build the character from separate objects with the same
+names and hierarchy as the gunner (or your own scheme, kept the same for every character),
+each with its **origin at its joint** (the shoulder for an upper arm: *Object > Set
+Origin > Origin to 3D Cursor*, with the cursor on the joint). Parent them (*Ctrl+P >
+Object*), apply scale (*Ctrl+A*), and add an empty called `Socket_Hand_R` in the hand.
+Then either:
+
+- **animate the objects themselves:** each animation is an Action per object. To export
+  several animations, push each object's Action down to an NLA track with the
+  animation's name ("Fire"), and export with *Animation > Mode: NLA Tracks*. Tracks with
+  the same name on different objects become one animation; or
+- **use an armature** (recommended for characters): add bones at the joints and parent
+  each part to its bone (*Ctrl+P > Bone*, not *With Automatic Weights*), then make one
+  Action per animation on the armature (Action Editor). Export with *Animation > Mode:
+  Actions*. The parts stay rigid, the bones become nodes, and the framework animates them
+  the same way.
+
+Tick *Animation* in the glTF export dialog, keep the frame rate you animated at, and
+use Linear keyframes for loops. Skinned meshes (vertices bent by several bones with
+*Automatic Weights*) aren't supported yet: they load in their rest pose with a warning.
+
+**Run it:** the gunner stands on the left, turning to follow the drone, breathing and
+glancing around. Press **F** to fire (watch the recoil and the muzzle flash), five
+times to empty the rifle and see him reload, or **L** to reload at any time. The HUD
+shows his animation and ammunition.
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -1424,7 +1640,8 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 2. **A third-person character.** Replace the fly camera: move a "player" cube in
    `onFixedUpdate` and place the camera behind it, smoothing with `1 - exp(-k·dt)`.
 3. **A squadron.** Draw several drones from the one `droneModel_`, each with its own
-   `ModelPose`, flight path and rotor speed: one `Model` in memory, many on screen.
+   `ModelPose`, flight path and rotor speed: one `Model` in memory, many on screen. Or a
+   squad of gunners, each with its own `ModelAnimator`, firing in turn.
 4. **A skybox.** A cube drawn around the camera with a sky texture, rendered first with
    depth writes off.
 5. **Shadows.** Render the scene's depth from the sun in `onPreRender`, then sample that

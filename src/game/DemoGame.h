@@ -11,6 +11,7 @@
 #include "render3d/Mesh.h"
 #include "render3d/MeshRenderer.h"
 #include "render3d/Model.h"
+#include "render3d/ModelAnimator.h"
 
 #include <memory>
 #include <string>
@@ -26,6 +27,8 @@ public:
 
 private:
     void updateCamera(core::Application& app, float dt);
+    void updateGunner(core::Application& app, float dt);
+    glm::mat4 gunnerTransform() const;
 
     std::unique_ptr<render3d::MeshRenderer> meshRenderer_;
     render3d::Camera3D camera_;
@@ -74,4 +77,18 @@ private:
     render3d::ModelPose dronePose_; // this drone's own node transforms
     int rotors_[4] = {-1, -1, -1, -1}; // node indices: front left, front right, back left, back right
     float rotorAngle_ = 0.0f;
+
+    // A gunner: a soldier model with animations made in Blender (Idle, Fire, Load), and a
+    // rifle model attached to a socket in his right hand. He turns to follow the drone.
+    render3d::Model gunner_;
+    render3d::Model rifle_;
+    render3d::ModelAnimator gunnerAnim_;
+    int gunnerSocket_ = -1; // node in gunner_: where the rifle goes
+    int gunnerTorso_ = -1;  // node in gunner_: tilted to aim up at the drone
+    int rifleMuzzle_ = -1;  // node in rifle_: where the muzzle flash appears
+    int ammo_ = 5;          // rounds left in the magazine
+    float muzzleFlash_ = 0.0f; // seconds left to show the flash
+    glm::vec3 droneNow_{0.0f}; // the drone's position this frame (the gunner aims at it)
+    std::string shotSound_;
+    std::string clickSound_;
 };

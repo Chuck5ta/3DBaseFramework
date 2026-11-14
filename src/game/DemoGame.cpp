@@ -116,6 +116,19 @@ void DemoGame::onInit(core::Application& app)
     for (int i = 0; i < 4; ++i)
         rotors_[i] = droneModel_.findNode(rotorNames[i]);
 
+    // The gunner and his rifle: two models. The rifle is drawn at the gunner's
+    // "Socket_Hand_R" node, so it follows his animations.
+    gunner_ = render3d::Model::load(app.gpu(), core::assetPath("models/gunner.glb"));
+    rifle_ = render3d::Model::load(app.gpu(), core::assetPath("models/rifle.glb"));
+    gunnerSocket_ = gunner_.findNode("Socket_Hand_R");
+    gunnerTorso_ = gunner_.findNode("Torso");
+    rifleMuzzle_ = rifle_.findNode("Muzzle");
+    gunnerAnim_.play(gunner_, "Idle"); // loops until something else is played
+    shotSound_ = core::assetPath("sounds/rifle_shot.wav");
+    clickSound_ = core::assetPath("sounds/mag_click.wav");
+    app.audio().preload(shotSound_);
+    app.audio().preload(clickSound_);
+
     camera_.position = {0.0f, 3.0f, 10.0f};
     camera_.lookAt({0.0f, 1.0f, 0.0f});
 }
@@ -197,11 +210,80 @@ void DemoGame::onUpdate(core::Application& app, float dt)
     // when the drone flies faster.
     rotorAngle_ = std::fmod(rotorAngle_ + (30.0f + droneSpeed_) * dt, glm::two_pi<float>());
 
+    droneNow_ = droneAt(droneAngle);
+    updateGunner(app, dt);
+
     // Slowly move the sun around the scene (unless switched off in the debug UI).
     if (animateSun_) {
         const float a = float(app.time()) * 0.1f;
         lighting_.sunDirection = glm::normalize(glm::vec3(std::cos(a), -0.8f, std::sin(a)));
     }
+}
+
+// Where the gunner stands, turned to face the drone (his model faces +Z).
+glm::mat4 DemoGame::gunnerTransform() const
+{
+    const glm::vec3 position(-2.5f, 0.0f, 5.5f);
+    const glm::vec3 to = droneNow_ - position;
+    const float yaw = std::atan2(to.x, to.z);
+    return glm::rotate(glm::translate(glm::mat4(1.0f), position), yaw, glm::vec3(0, 1, 0));
+}
+
+void DemoGame::updateGunner(core::Application& app, float dt)
+{
+    constexpr int kMagazine = 5;
+    core::Input& in = app.input();
+    const bool loading = gunnerAnim_.isPlaying("Load") && !gunnerAnim_.finished();
+
+    // F (or the gamepad's B) fires; an empty rifle reloads instead. L (or X) reloads.
+    if (!loading && (in.keyPressed(SDL_SCANCODE_F) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_EAST))) {
+        if (ammo_ > 0) {
+            --ammo_;
+            gunnerAnim_.play(gunner_, "Fire", render3d::AnimationLoop::Once, true); // restart: rapid fire
+        } else {
+            gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+        }
+    }
+    if (!loading && ammo_ < kMagazine && (in.keyPressed(SDL_SCANCODE_L) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_WEST)))
+        gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+
+    gunnerAnim_.update(dt);
+    muzzleFlash_ = std::max(0.0f, muzzleFlash_ - dt); // before a new shot, so a flash shows for at least a frame
+
+    // Moments in the animations: the shot at the start of Fire, and the magazine coming
+    // out (0.3 s) and going in (1.0 s) during Load.
+    const glm::mat4 rifleAt = gunner_.nodeMatrix(gunnerSocket_, gunnerTransform(), &gunnerAnim_.pose());
+    const glm::vec3 riflePos(rifleAt[3]);
+    audio::PlayParams sound;
+    sound.spatial = true;
+    sound.position = riflePos;
+    sound.minDistance = 3.0f;
+    if (gunnerAnim_.isPlaying("Fire") && gunnerAnim_.reached(0.0f)) {
+        muzzleFlash_ = 0.06f;
+        app.audio().play(shotSound_, sound);
+    }
+    if (gunnerAnim_.isPlaying("Load") && (gunnerAnim_.reached(0.3f) || gunnerAnim_.reached(1.0f))) {
+        sound.volume = 0.6f;
+        app.audio().play(clickSound_, sound);
+    }
+
+    // When a Fire or Load finishes, go back to Idle (or reload an empty rifle).
+    if (gunnerAnim_.finished()) {
+        if (gunnerAnim_.isPlaying("Load"))
+            ammo_ = kMagazine;
+        if (gunnerAnim_.isPlaying("Fire") && ammo_ == 0)
+            gunnerAnim_.play(gunner_, "Load", render3d::AnimationLoop::Once);
+        else
+            gunnerAnim_.play(gunner_, "Idle");
+    }
+
+    // Aim up at the drone: tilt the torso back on top of whatever the animation does.
+    // (The pose is rebuilt by every update(), so this doesn't build up.)
+    const glm::vec3 chest = glm::vec3(gunnerTransform()[3]) + glm::vec3(0.0f, 1.4f, 0.0f);
+    const glm::vec3 to = droneNow_ - chest;
+    const float pitch = std::clamp(std::atan2(to.y, glm::length(glm::vec2(to.x, to.z))), 0.0f, glm::radians(35.0f));
+    render3d::NodeTransform& torso = gunnerAnim_.pose()[gunnerTorso_];
+    torso.rotation = glm::angleAxis(-pitch, glm::vec3(1, 0, 0)) * torso.rotation;
 }
 
 void DemoGame::updateCamera(core::Application& app, float dt)
@@ -389,6 +471,20 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     }
     meshRenderer_->draw(droneModel_, d, &dronePose_);
 
+    // The gunner, in the pose his animator worked out, and the rifle at his hand's socket.
+    const glm::mat4 g = gunnerTransform();
+    meshRenderer_->draw(gunner_, g, &gunnerAnim_.pose());
+    const glm::mat4 rifleAt = gunner_.nodeMatrix(gunnerSocket_, g, &gunnerAnim_.pose());
+    meshRenderer_->draw(rifle_, rifleAt);
+    if (muzzleFlash_ > 0.0f) { // a glowing blob at the rifle's "Muzzle" node
+        const glm::mat4 muzzle = rifle_.nodeMatrix(rifleMuzzle_, rifleAt);
+        render3d::Material flash{nullptr, {1.0f, 0.75f, 0.3f, 1.0f}};
+        flash.emissive = {1.0f, 0.7f, 0.25f};
+        flash.emissiveStrength = 3.0f;
+        meshRenderer_->draw(sphere_, glm::scale(glm::translate(muzzle, {0.0f, 0.0f, 0.06f}), glm::vec3(0.12f, 0.12f, 0.22f)),
+                            flash);
+    }
+
     meshRenderer_->end();
 
     // ===== HUD: 2D text and shapes on top, with a camera where 1 unit = 1 pixel =====
@@ -403,10 +499,10 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     text.snapToPixel = true;
 
     // Top left: performance and camera info, with a soft shadow for readability.
-    char info[160];
-    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %.1f, %.1f, %.1f",
+    char info[224];
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
                   double(app.fps()), meshRenderer_->drawCalls(), double(camera_.position.x),
-                  double(camera_.position.y), double(camera_.position.z));
+                  double(camera_.position.y), double(camera_.position.z), gunnerAnim_.animationName().c_str(), ammo_);
     render2d::TextStyle shadow = text;
     shadow.color = {0.0f, 0.0f, 0.0f, 0.5f};
     hud_->drawText(font_, info, glm::vec2(17.0f, 13.0f) * ui, shadow);
@@ -428,6 +524,7 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     if (showHelp_) {
         const char* help = "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down\n"
                            "Shift: fast      F1 / (Y): wireframe      M: mute      R: reverb      V: vsync\n"
+                           "F / (B): gunner fires      L / (X): gunner reloads\n"
                            "H: hide help      ` (below Esc): debug UI";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;

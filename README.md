@@ -14,7 +14,7 @@ scene showing how they fit together.
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, sun + hemisphere ambient + fog lighting, wireframe | your code |
-| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; named parts posed in code (spinning rotors, turrets) | cgltf |
+| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
@@ -22,11 +22,11 @@ scene showing how they fit together.
 
 All dependencies are downloaded automatically by CMake at a pinned version.
 
-For a deeper look at how it all fits together, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For a deeper look at how it all fits together, see [docs/GAME3D_ARCHITECTURE.md](docs/GAME3D_ARCHITECTURE.md).
 Step-by-step build instructions for Windows, Linux and Steam Deck are in [docs/BUILDING.md](docs/BUILDING.md).
 To learn the framework by rebuilding the demo step by step, follow [docs/TUTORIAL.md](docs/TUTORIAL.md).
 Starting a chat with an AI assistant about a game built on this framework? Attach
-[docs/AI_BRIEFING.md](docs/AI_BRIEFING.md): a compact summary of the API, conventions and workflow.
+[docs/GAME3D_AI_BRIEFING.md](docs/GAME3D_AI_BRIEFING.md): a compact summary of the API, conventions and workflow.
 
 ---
 
@@ -126,7 +126,8 @@ src/
     Font                .ttf/.otf baked into a texture atlas
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
-    Model               glTF 2.0 models: parts, materials, textures, poses
+    Model               glTF 2.0 models: parts, materials, textures, poses, animations
+    ModelAnimator       plays a model's animations (blending, looping, moments)
     MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants)
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
   game/
@@ -135,7 +136,8 @@ shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatical
                         (*.glsl files are shared includes, e.g. common.glsl)
 assets/                 copied next to the exe (fonts/: Roboto Medium, Apache 2.0;
                         sounds/: demo sounds, CC0; models/: the demo's drone, CC0)
-tools/                  make_drone.py: writes the demo's drone.glb (plain Python)
+tools/                  make_drone.py, make_gunner.py, make_gunner_sounds.py: write the demo's
+                        models and gunner sounds (plain Python; gltf_builder.py is shared)
 cmake/                  dependency + shader build logic
 ```
 
@@ -204,6 +206,11 @@ Tips
   `meshes_->draw(model_, transform)`. Spin or aim named parts with a `render3d::ModelPose`
   (`pose[model_.findNode("Turret")].rotation = ...`, then `draw(model_, transform, &pose)`).
   Front is +Z (Blender's -Y). Tutorial step 12 walks through it.
+- Animated characters: build them in Blender from separate rigid parts (each with its
+  origin at its joint), one Action per animation, and play them with a
+  `render3d::ModelAnimator` (`play(model, "Fire", render3d::AnimationLoop::Once)`,
+  `update(dt)`, `meshes_->draw(model, transform, &animator.pose())`). Attach weapons or
+  hats at socket empties with `model.nodeMatrix(node, transform, &pose)`. Tutorial step 13.
 - Your own geometry: fill a `render3d::MeshData` (positions, normals, UVs, indices —
   counter-clockwise triangles) and construct a `Mesh`.
 - New shaders: drop `foo.vert`/`foo.frag` in `shaders/`, load
@@ -302,7 +309,7 @@ limits (Steam's performance overlay helps), suspend/resume (swapchain recreation
 
 ## 7. Where to go next
 
-- **Model loading:** glTF 2.0 via cgltf or fastgltf → `MeshData` + textures.
+- **Skinned characters:** meshes bent by armature bones (GPU skinning), for smoother elbows and faces.
 - **Shadows:** a depth-only pass for the sun in `onPreRender`, sampled in `mesh.frag`.
 - **PBR materials:** metallic/roughness + image-based lighting.
 - **MSAA or FXAA/TAA** for smoother edges.
