@@ -12,7 +12,7 @@
 1. [Overview](#1-overview)
 2. [Windows](#2-windows)
 3. [Linux](#3-linux)
-4. [Steam Deck](#4-steam-deck)
+4. [Steam Deck](#4-steam-deck) (start with the [first-run checklist](#first-run-checklist))
 5. [Shipping on Steam](#5-shipping-on-steam)
 6. [Troubleshooting](#6-troubleshooting)
 7. [Reference](#7-reference)
@@ -273,6 +273,54 @@ That produces a binary that runs on every Steam-supported Linux system, includin
 
 ## 4. Steam Deck
 
+### First-run checklist
+
+What to do, in order, when your Deck arrives. Each step points to the section with the
+details.
+
+**Before it arrives (on your PC)**
+
+1. **Make a Linux build.** Build it in the Steam Runtime SDK container and package it
+   (§4.3), so `dist/Game3D-steamrt` is ready to copy.
+2. **Keep the debug UI in your test builds.** Release builds leave it out. For builds you
+   test on the Deck, add `config.debugUI.enabled = true;` in `main.cpp` (and take it out
+   again before you ship). It works with the touchscreen.
+3. **Install the SteamOS Devkit Client** from your Steam library (§4.4).
+4. *(Optional)* Keep a Windows release folder (§2.6) to compare with Proton later (§4.6).
+
+**Day one on the Deck**
+
+5. **Update and connect.** Finish the Deck's setup, install any SteamOS updates, and join
+   the same network as your PC.
+6. **Pair it with your PC.** Turn on Developer Mode and pair the Deck with the Devkit
+   Client (§4.4).
+7. **Upload and launch.** In the Devkit Client, upload the build. It appears in the Deck's
+   library as *Devkit Game: Game3D*. (Or copy it over and add it as a Non-Steam Game:
+   §4.4 and §4.5.)
+8. **If it doesn't start,** look at its log (§4.5), then Troubleshooting (§6). A *GLIBC*
+   error means the build wasn't made in the container; *Permission denied* means the
+   executable bit was lost in copying.
+
+**First tests** (more in §4.7)
+
+9. **Controls.** Make sure the game's controller layout is a gamepad template (§4.5). In
+   the demo: the left stick walks (click it to run) and the right stick looks around; the
+   d-pad zooms; Menu switches cameras; B fires, X reloads and Y shows the wireframe; View
+   quits. **G** (shadows), **M**, **R**, **V**, **H** and **`** (debug UI) have no
+   buttons: put the ones you need on the back grips in the controller layout.
+10. **Looks.** Is the text readable on the 7" screen, and does nothing get cut off at
+    1280×800 (16:10 instead of the PC window's 16:9)?
+11. **Speed.** Turn on the performance overlay (*… button → Performance*) and note the
+    frame rate and GPU time with shadows on and off (**G**, or *Enabled* in the debug UI's
+    Shadows section). Try the 30, 40 and 60 Hz frame limits. If the shadows cost too much,
+    §4.7 says what to change.
+12. **Everyday Deck things.** Sleep and wake it with the power button while the game runs,
+    plug in headphones while it plays, and see how much battery 10 minutes takes.
+13. *(Optional)* Run the Windows build through Proton (§4.6) and compare.
+
+Write down what you find (frame rate, GPU time, anything odd): it's your baseline for
+judging what later features cost.
+
 ### 4.1 What you need to know
 
 - The Deck runs **SteamOS 3** (Arch Linux based) with an AMD GPU and Mesa's **RADV** Vulkan
@@ -511,6 +559,8 @@ A short checklist (full details in the Steamworks documentation:
 | Stripes or rings of shadow all over surfaces (*shadow acne*) | Raise *Normal bias* and *Depth bias* in the Shadows section (`lighting.shadows.normalBias` / `depthBias`, in shadow-map texels). If shadows instead come loose from what casts them, lower them. Bigger `shadows.distance` means bigger texels and coarser shadows, not more acne: the biases scale with it. |
 | Shadow edges shimmer, crawl or buzz | The sun is moving: the map's texel grid turns with `sunDirection`, so edges redraw differently every frame. Untick *Animate sun* in the debug UI (it is off by default). In your own game, keep `lighting.sunDirection` still, or change it very slowly. Moving the camera alone doesn't cause this. |
 | Shadows look blocky, or a thin object casts none | Each shadow-map texel covers roughly `distance × 2.4 / map size` of ground (about 3.5 cm by default; the debug UI shows it). Lower `shadows.distance`, raise *Softness*, or construct the `MeshRenderer` with a bigger map (`MeshRenderer(gpu, renderer, 4096)`: 64 MB). Objects thinner than a texel or two may cast broken or no shadows. |
+| A character from Blender doesn't bend (stays in its rest or T-pose), or bends wrongly | The log says why: *drawn unbent* means the skin couldn't be used. The mesh must be parented to the armature (Armature modifier) and the export must have *Data > Skinning* ticked. Keep *Include All Bone Influences* unticked (only 4 bones per vertex are used). Apply scale (*Ctrl+A*) to both mesh and armature before export. Spiky or stretched vertices: fix the weights in Weight Paint mode (every vertex needs weight on some bone; *Weights > Normalize All*). |
+| Instanced copies (`drawInstanced`) are missing, or the frame rate drops with many | *more than … instance matrices this frame* in the log: the frame's instance buffer is full (each copy counts twice with shadows); pass a bigger `maxInstances` to the `MeshRenderer` constructor, or draw fewer copies. The debug UI's *Instance matrices* line shows how full it is. Every copy is drawn even off screen: for tens of thousands, pass only the ones near or in front of the camera. |
 | A model is invisible, inside out or faces the wrong way | Faces seen from behind are culled: in Blender, *Mesh > Normals > Recalculate Outside*, or tick *Backface Culling* off in the material's settings to export it double-sided. Apply rotation and scale before export (*Ctrl+A*). The framework's front is +Z, Blender's -Y. |
 | No sound | The log shows the device at startup (*Audio: … via WASAPI / PulseAudio / …*). *Audio: no output device* means none was found: the game keeps running silently. Check that `GAME_AUDIO` isn't set to `0`, the game isn't muted (**M** in the demo) and the sound files are in `assets/sounds/` next to the executable. |
 | Linux: *ALSA lib …* or *jack server is not running* lines in the console | Harmless. miniaudio is trying audio backends in turn; it uses the first one that works. |

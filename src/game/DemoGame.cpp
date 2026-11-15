@@ -10,7 +10,9 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <span>
 
 using namespace render3d;
 
@@ -90,6 +92,26 @@ constexpr float kWalkSpeed = 1.5f, kRunSpeed = 4.0f;
 constexpr float kWalkAnimSpeed = 1.35f, kRunAnimSpeed = 3.4f;
 constexpr float kPlayerRadius = 0.35f;
 
+// The forest: trees scattered between these distances from the centre.
+constexpr int kTrees = 800;
+constexpr float kForestInner = 22.0f, kForestOuter = 90.0f;
+
+// A tiny random number generator (xorshift): the same forest every run, on every compiler
+// (std::uniform_real_distribution may give different numbers on MSVC and GCC).
+float random01(uint32_t& state)
+{
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return float(state >> 8) / float(1u << 24); // 0 .. 1
+}
+
+// Boxes around a tree's trunk and crown, for the camera's ray tests, before the tree's own
+// matrix places them (tree.glb: the trunk is 0.28 m wide and 1.4 m tall; the crown is
+// up to 2.7 m across, from 0.9 m up to 4.2 m: the box is narrower, around its thick part).
+const glm::mat4 kTrunkBox = glm::scale(glm::translate(glm::mat4(1.0f), {0.0f, 0.7f, 0.0f}), {0.28f, 1.4f, 0.28f});
+const glm::mat4 kCrownBox = glm::scale(glm::translate(glm::mat4(1.0f), {0.0f, 2.4f, 0.0f}), {1.6f, 3.0f, 1.6f});
+
 } // namespace
 
 void DemoGame::onInit(core::Application& app)
@@ -161,8 +183,29 @@ void DemoGame::onInit(core::Application& app)
     app.audio().preload(shotSound_);
     app.audio().preload(clickSound_);
 
-    // The player: the same soldier model with his own animator (and so his own pose).
-    playerAnim_.play(gunner_, "Idle");
+    // The player: the soldier again, skinned (soldier.glb: the same bones and animations,
+    // one mesh that bends), with his own animator (and so his own pose).
+    soldier_ = render3d::Model::load(app.gpu(), core::assetPath("models/soldier.glb"));
+    soldierSocket_ = soldier_.findNode("Socket_Hand_R");
+    playerAnim_.play(soldier_, "Idle");
+
+    // The forest: one model, and a matrix for each copy, each turned and sized a little
+    // differently so they don't look stamped out.
+    tree_ = render3d::Model::load(app.gpu(), core::assetPath("models/tree.glb"));
+    uint32_t seed = 12345;
+    for (int i = 0; i < kTrees; ++i) {
+        const float angle = random01(seed) * glm::two_pi<float>();
+        // Picking the squared distance spreads them evenly over the ring's area, rather than
+        // crowding them at its inner edge.
+        const float r = std::sqrt(glm::mix(kForestInner * kForestInner, kForestOuter * kForestOuter, random01(seed)));
+        const glm::vec3 position(std::cos(angle) * r, 0.0f, std::sin(angle) * r);
+        const float size = glm::mix(0.8f, 1.3f, random01(seed));
+        const float height = glm::mix(0.9f, 1.25f, random01(seed));
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), position);
+        m = glm::rotate(m, random01(seed) * glm::two_pi<float>(), glm::vec3(0, 1, 0));
+        trees_.push_back(glm::scale(m, glm::vec3(size, size * height, size)));
+    }
+    treesShown_ = kTrees;
 
     // Start behind him, looking where he looks (along -Z).
     follow_.yaw = -glm::half_pi<float>();
@@ -415,17 +458,21 @@ void DemoGame::updatePlayer(core::Application& app, float dt)
         pushOut({c.x, c.z}, kSphereRadius);
     }
     pushOut({-2.5f, 5.5f}, 0.4f); // the gunner
+    for (const glm::mat4& tree : trees_) { // the trunks (their x scale is the tree's size)
+        const glm::vec3 c(tree[3]);
+        pushOut({c.x, c.z}, 0.14f * glm::length(glm::vec3(tree[0])));
+    }
 
     // The animation follows the speed: Idle, Walk or Run, played faster or slower so
     // his feet keep pace with the ground.
     if (playerSpeed_ < 0.2f) {
-        playerAnim_.play(gunner_, "Idle");
+        playerAnim_.play(soldier_, "Idle");
         playerAnim_.speed = 1.0f;
     } else if (playerSpeed_ < (kWalkSpeed + kRunSpeed) * 0.5f) {
-        playerAnim_.play(gunner_, "Walk");
+        playerAnim_.play(soldier_, "Walk");
         playerAnim_.speed = playerSpeed_ / kWalkAnimSpeed;
     } else {
-        playerAnim_.play(gunner_, "Run");
+        playerAnim_.play(soldier_, "Run");
         playerAnim_.speed = playerSpeed_ / kRunAnimSpeed;
     }
     playerAnim_.update(dt);
@@ -449,6 +496,14 @@ std::optional<float> DemoGame::raycastScene(const render3d::Ray& ray) const
         consider(raycastSphere(ray, sphereCentre(i, simTimeNow_), kSphereRadius));
     // The gunner, as a box around him (simple shapes are usually enough for a camera).
     consider(raycastBox(ray, glm::scale(glm::translate(gunnerTransform(), {0.0f, 0.9f, 0.0f}), {0.6f, 1.8f, 0.6f})));
+    // Trees: a box for the trunk and one for the crown, but only for those near the ray's
+    // start (the camera never looks far past the player).
+    for (const glm::mat4& tree : trees_) {
+        if (glm::distance(glm::vec3(tree[3]), ray.origin) < 15.0f) {
+            consider(raycastBox(ray, tree * kTrunkBox));
+            consider(raycastBox(ray, tree * kCrownBox));
+        }
+    }
     return nearest;
 }
 
@@ -530,6 +585,8 @@ void DemoGame::onDebugUI(core::Application& app)
     }
 
     ImGui::Text("Draw calls: %u (+%u for shadows)", meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls());
+    ImGui::Text("Joint matrices: %u of %u", meshRenderer_->jointsUsed(), meshRenderer_->maxJoints());
+    ImGui::Text("Instance matrices: %u of %u", meshRenderer_->instancesUsed(), meshRenderer_->maxInstances());
     bool wireframe = meshRenderer_->wireframe();
     if (ImGui::Checkbox("Wireframe", &wireframe))
         meshRenderer_->setWireframe(wireframe);
@@ -561,6 +618,11 @@ void DemoGame::onDebugUI(core::Application& app)
         ImGui::SliderAngle("Field of view", &camera_.fovY, 20.0f, 120.0f);
         if (ImGui::Button("Look at the crate"))
             camera_.lookAt({0.0f, 1.5f, 0.0f});
+    }
+
+    if (ImGui::CollapsingHeader("Forest")) {
+        ImGui::SliderInt("Trees", &treesShown_, 0, int(trees_.size()));
+        ImGui::Checkbox("Instancing", &instanceTrees_); // off: watch the draw calls go up
     }
 
     if (ImGui::CollapsingHeader("Lighting")) {
@@ -639,10 +701,22 @@ void DemoGame::drawScene(float alpha)
     ground.castShadows = false;
     meshRenderer_->draw(ground_, glm::mat4(1.0f), ground);
 
-    // Centrepiece: a big crate, and a ring of crates around it.
+    // Centrepiece: a big crate, and a ring of crates around it, all twelve in one draw call
+    // (instancing: the same mesh and material, a matrix for each copy).
     meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
+    glm::mat4 ring[kRing];
     for (int i = 0; i < kRing; ++i)
-        meshRenderer_->draw(cube_, ringCrateMatrix(i, spin), {&crateTexture_});
+        ring[i] = ringCrateMatrix(i, spin);
+    meshRenderer_->drawInstanced(cube_, ring, {&crateTexture_});
+
+    // The forest: hundreds of trees, one draw call for the trunks and one for the crowns.
+    const std::span<const glm::mat4> trees(trees_.data(), size_t(treesShown_));
+    if (instanceTrees_) {
+        meshRenderer_->drawInstanced(tree_, trees);
+    } else {
+        for (const glm::mat4& tree : trees)
+            meshRenderer_->draw(tree_, tree);
+    }
 
     // Bobbing coloured spheres
     const glm::vec4 palette[] = {
@@ -682,10 +756,10 @@ void DemoGame::drawScene(float alpha)
                             flash);
     }
 
-    // The player: the same two models again, in his own pose.
+    // The player: the skinned soldier and the rifle, in his own pose.
     const glm::mat4 p = playerTransform();
-    meshRenderer_->draw(gunner_, p, &playerAnim_.pose());
-    meshRenderer_->draw(rifle_, gunner_.nodeMatrix(gunnerSocket_, p, &playerAnim_.pose()));
+    meshRenderer_->draw(soldier_, p, &playerAnim_.pose());
+    meshRenderer_->draw(rifle_, soldier_.nodeMatrix(soldierSocket_, p, &playerAnim_.pose()));
 }
 
 // Before the main pass: the shadow pass. The same scene, drawn from the sun.

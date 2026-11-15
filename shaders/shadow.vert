@@ -4,6 +4,7 @@
 // The shadow pass: draws the scene's depth as the sun sees it, into the shadow map.
 
 #include "common.glsl"
+#include "instance.glsl"
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 2) in vec2 inUV;
@@ -16,5 +17,5 @@ void main()
 {
     outUV = inUV;
     outAlpha = inColor.a;
-    gl_Position = frame.shadowMatrix * object.model * vec4(inPosition, 1.0);
+    gl_Position = frame.shadowMatrix * instanceMatrix() * vec4(inPosition, 1.0);
 }

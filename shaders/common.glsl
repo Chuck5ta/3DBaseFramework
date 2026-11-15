@@ -1,5 +1,7 @@
-// Shared declarations for mesh.vert / mesh.frag and shadow.vert / shadow.frag. Included
-// with #extension GL_GOOGLE_include_directive.
+// Shared declarations for mesh.vert / mesh.frag and shadow.vert / shadow.frag (and their
+// skinned versions). Included with #extension GL_GOOGLE_include_directive. The vertex
+// shaders also include instance.glsl (copies of a mesh in one draw) and, when skinned,
+// skin.glsl.
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view;
@@ -17,8 +19,10 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
 } frame;
 
 layout(push_constant) uniform PushConstants {
-    mat4 model;
+    mat4 model;         // the model matrix (one copy), or the part's matrix within the
+                        // model (instanced: see instance.glsl)
     vec4 color;         // linear base colour and alpha
     vec4 emissive;      // rgb = linear glow added on top; a = alpha cutoff (0 = none)
-    vec4 material;      // x = roughness (0 glossy .. 1 matte), y = metallic, z = 1 if unlit
+    vec4 material;      // x = roughness (0 glossy .. 1 matte), y = metallic, z = 1 if unlit,
+                        // w = first joint matrix (skinned meshes, see skin.glsl)
 } object;

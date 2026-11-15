@@ -84,10 +84,10 @@ Mesh::Mesh(gfx::VulkanContext& ctx, const MeshData& data, const char* debugName)
                                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, debugName);
 }
 
-void Mesh::draw(VkCommandBuffer cmd) const
+void Mesh::draw(VkCommandBuffer cmd, uint32_t instanceCount, uint32_t firstInstance) const
 {
     bind(cmd);
-    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+    vkCmdDrawIndexed(cmd, indexCount_, instanceCount, 0, 0, firstInstance);
 }
 
 void Mesh::bind(VkCommandBuffer cmd) const
@@ -98,9 +98,10 @@ void Mesh::bind(VkCommandBuffer cmd) const
     vkCmdBindIndexBuffer(cmd, indices_.handle(), 0, VK_INDEX_TYPE_UINT32);
 }
 
-void Mesh::drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset) const
+void Mesh::drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset,
+                     uint32_t instanceCount, uint32_t firstInstance) const
 {
-    vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, vertexOffset, 0);
+    vkCmdDrawIndexed(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 } // namespace render3d

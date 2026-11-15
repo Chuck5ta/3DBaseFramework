@@ -108,23 +108,29 @@ src/
   render3d/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
-    Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose, ModelAnimation
+    Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose, ModelAnimation, skins
     ModelAnimator.h/.cpp      plays a model's animations into a ModelPose (blending, loops, moments)
     Raycast.h/.cpp            Ray; distance to a plane, sphere or (transformed) box
     ThirdPersonCamera.h/.cpp  follow/orbit camera with zoom, shoulder offset and collision
-    MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models, with sun shadows;
-                              Material, SceneLighting, ShadowSettings
+    MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models, with sun shadows,
+                              GPU skinning and instancing; Material, SceneLighting, ShadowSettings
   game/
     DemoGame.h/.cpp           example scene: fly and third-person cameras, a walking player
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
+  instance.glsl               instancing: the instance matrix buffer (include, every vertex shader)
   mesh.vert, mesh.frag        the mesh shaders (mesh.frag also reads the shadow map)
   shadow.vert, shadow.frag    the shadow pass: depth from the sun (alpha-masked parts cut out)
+  skin.glsl                   skinning: joints, weights and the joint matrix buffer (include)
+  mesh_skinned.vert           mesh.vert for skinned meshes (bent by their joints first)
+  shadow_skinned.vert         shadow.vert for skinned meshes
   sprite.vert, sprite.frag    the 2D overlay shaders (shared with Game2D)
   imgui.frag                  Dear ImGui's fragment shader, sRGB-correct (debug UI)
 assets/                       runtime data (copied next to the executable)
   fonts/                      Roboto Medium + its licence
   sounds/                     demo sounds (CC0) + README
+  models/                     drone, gunner (rigid parts), soldier (skinned), rifle, tree (CC0) + README
+tools/                        Python scripts that generate the demo's models and sounds
 cmake/                        Dependencies.cmake, Shaders.cmake
 ```
 
@@ -374,6 +380,18 @@ images, or one `.glb`), parsed with cgltf.
   duration is the last keyframe's time. `findAnimation(name)` returns -1 and warns once,
   listing the model's animations. Shape key (morph weight) channels are skipped with a
   warning.
+- **Skins** (`ModelSkin`: Blender's armature): a list of joint nodes and an inverse bind
+  matrix for each (identity if the file has none). A node with a mesh and a skin has
+  `skin >= 0`; its primitives carry `JOINTS_0` (any integer type) and `WEIGHTS_0` (float or
+  normalised), stored as one `SkinVertex { u16vec4 joints; vec4 weights; }` (24 bytes) per
+  vertex in `ModelData::skinVertices`, parallel to `vertices` (zeros for unskinned ones),
+  and uploaded as a second vertex buffer (`skinVertices()`). Weights are normalised to
+  add up to 1. A skin whose joints are outside the scene, or a mesh whose joint indices
+  don't fit its skin, is drawn unbent with a warning; a second set of influences
+  (`JOINTS_1`) is ignored with a warning (4 per vertex). As glTF specifies, the skinned
+  node's own transform is ignored. `jointMatrices(skin, nodeMatrices, out)` gives
+  `nodeMatrix[joint] · inverseBind[joint]` for each joint: the matrix that takes a
+  bind-pose vertex to where that joint has moved it.
 - **Materials** (`ModelMaterial`): base colour factor and texture, emissive factor (times
   `KHR_materials_emissive_strength`) and texture, metallic and roughness factors, alpha
   mode (opaque, mask with cutoff, blend), double-sided, `KHR_materials_unlit`. The
@@ -382,11 +400,12 @@ images, or one `.glb`), parsed with cgltf.
   the `.gltf`; per-texture filter and per-axis wrap (`TextureDesc::wrap`/`wrapV`), mipmaps,
   sRGB.
 - **Not supported** (warned about, the rest still loads): metallic-roughness, normal and
-  occlusion textures, skinned meshes (drawn in their rest pose; bones still animate as
-  nodes, so rigid parts parented to bones move), morph targets, cameras, lights, KTX2/WebP
-  images. Files that *require* Draco or meshopt compression are refused with a message
+  occlusion textures, morph targets, cameras, lights, KTX2/WebP images. Files that *require* Draco or meshopt compression are refused with a message
   saying how to export without it.
-- Bounds (`boundsMin/Max`, `size`, `center`) are of the default pose, in model units.
+- Bounds (`boundsMin/Max`, `size`, `center`) are of the default pose, in model units;
+  skinned meshes are bent into the default pose on the CPU (at load) to measure them.
+- Tested with the Khronos samples RiggedSimple, RiggedFigure, CesiumMan and Fox, and the
+  generated `soldier.glb`.
 
 **`render3d::ModelAnimator`**: plays one animation of a model at a time and keeps the pose
 to draw with; one per animated object, like the 2D `Animator`.
@@ -482,12 +501,18 @@ sequenceDiagram
 ```
 
 **`render3d::MeshRenderer`**: forward renderer for lit, textured meshes and models, with
-shadows from the sun (details in §6). API: `MeshRenderer(gpu, renderer, shadowMapSize = 2048)`,
+shadows from the sun, GPU skinning and instancing (details in §6). API:
+`MeshRenderer(gpu, renderer, shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384)`,
 `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`,
 `draw(model, transform, pose = nullptr)`, `end()`, `setWireframe(bool)`, `drawCalls()`;
 for shadows `beginShadows(frame, camera, lighting)` / `endShadows()` around the same
 `draw()` calls in `onPreRender`, `shadowDrawCalls()`, `shadowMapSize()`,
-`shadowTexelSize()`. It needs a depth buffer, and says so at start-up if there isn't one.
+`shadowTexelSize()`; for skinning `jointsUsed()` / `maxJoints()`. Skinned models need no
+different calls: `draw(model, ...)` bends them (§6.6). Many copies at once:
+`drawInstanced(mesh, models, material)` and `drawInstanced(model, transforms, pose)` take a
+`std::span<const glm::mat4>` (a vector or array) and draw every copy in one draw call per
+part (§6.7); `instancesUsed()` / `maxInstances()`. It needs a depth buffer, and says so at
+start-up if there isn't one.
 
 - `Material { texture, color, emissive, emissiveStrength, emissiveTexture, roughness,
   metallic, doubleSided, castShadows }`: textures may be `nullptr` (an internal 1×1 white
@@ -820,13 +845,13 @@ resources with it), `imageIndex`, `frameNumber` and `extent`.
 ```mermaid
 flowchart LR
     subgraph perFrame["Per frame (once in begin)"]
-        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map"]
+        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map;<br/>the joint and instance matrix buffers"]
     end
     subgraph perMaterial["Per texture change"]
         tex["Set 1: base colour + emission<br/>(two combined image samplers)"]
     end
     subgraph perObject["Per draw (push constants, 112 bytes)"]
-        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit"]
+        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit, first joint"]
     end
     ubo --> sh["mesh.vert / mesh.frag"]
     tex --> sh
@@ -837,8 +862,11 @@ flowchart LR
 |---|---|---|
 | Set 0, binding 0 (UBO, vertex + fragment) | `FrameUniforms`: matrices, camera position, lights, fog, shadow matrix and settings (std140) | once per frame, written into that frame's own buffer |
 | Set 0, binding 1 (comparison sampler, fragment) | the shadow map | never (one image, rewritten by each shadow pass) |
+| Set 0, binding 2 (storage buffer, vertex) | joint matrices of the skinned models drawn this frame (`maxJoints` × 64 bytes) | appended to by each skinned draw, in that frame's own buffer |
+| Set 0, binding 3 (storage buffer, vertex) | instance matrices (`maxInstances` × 64 bytes); entry 0 is the identity, for single draws | appended to by each `drawInstanced`, in that frame's own buffer |
 | Set 1, bindings 0 and 1 (samplers, fragment) | base colour and emission textures | when either texture changes between draws |
-| Push constants (vertex + fragment) | model matrix, colour, emissive + alpha cutoff, roughness/metallic/unlit | every draw |
+| Push constants (vertex + fragment) | model matrix (instanced: the part's matrix within the model), colour, emissive + alpha cutoff, roughness/metallic/unlit, first joint matrix (skinned) | every draw |
+| Vertex binding 1 (skinned only) | the model's `SkinVertex`es: joints and weights | when the skinned model drawn changes |
 | Dynamic state | cull mode, front face | when a draw needs different culling (double-sided material, mirrored node) |
 
 - The push-constant block is **112 bytes**, within the 128 every Vulkan GPU must
@@ -860,7 +888,11 @@ flowchart LR
   aside and drawn in `end()`, sorted farthest first, with the blend pipeline (alpha
   blending, depth test without depth writes). A node whose matrix has a negative
   determinant (mirrored with a negative scale) is drawn with the front face set to
-  clockwise, so its triangles aren't culled inside out.
+  clockwise, so its triangles aren't culled inside out. A skinned node is drawn with the
+  skinned pipelines and the model's `transform` as its model matrix (§6.6).
+- **Instances:** `drawInstanced` uploads one matrix per copy and draws each part once with
+  that many instances; the vertex shaders multiply each copy's matrix by the push-constant
+  matrix (§6.7).
 
 ### 6.2 Draw flow
 
@@ -879,8 +911,15 @@ sequenceDiagram
             MR->>Cmd: bind set 1 (base colour + emission)
         end
         MR->>Cmd: set cull mode / front face if they changed
-        MR->>Cmd: push constants (model, colour, emissive, material)
-        MR->>Cmd: bind vertex/index buffers (if changed), vkCmdDrawIndexed
+        opt a skinned node of a model
+            MR->>MR: append its joint matrices to the frame's joint buffer
+            MR->>Cmd: bind the skinned pipeline and the joint vertex buffer (if changed)
+        end
+        opt drawInstanced
+            MR->>MR: append the copies' matrices to the frame's instance buffer (once per call)
+        end
+        MR->>Cmd: push constants (model, colour, emissive, material, first joint)
+        MR->>Cmd: bind vertex/index buffers (if changed), vkCmdDrawIndexed<br/>(instances: 1 at entry 0, or the copies, mirrored ones as a second draw)
     end
     G->>MR: end()
     MR->>Cmd: blended parts, farthest first (blend pipeline)
@@ -898,8 +937,14 @@ sequenceDiagram
 | Blending | opaque (a fourth pipeline, for Blend parts: alpha blending, no depth writes) | opaque | — |
 | Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`) | same | position, uv, colour (no normal) |
 
-All four share one pipeline layout (set 0, set 1, the push constants), so the shadow pass
-binds the same sets and pushes the same constants as the main pass.
+Each has a **skinned twin** (solid, blend, wireframe and shadow: eight in all), built from
+the same `PipelineBuilder` with `mesh_skinned.vert` or `shadow_skinned.vert` and a second
+vertex binding: joints (`R16G16B16A16_UINT`, location 4) and weights
+(`R32G32B32A32_SFLOAT`, location 5). All eight share one pipeline layout (set 0, set 1,
+the push constants), so the shadow pass binds the same sets and pushes the same
+constants as the main pass, and switching between a rigid and a skinned pipeline keeps
+the sets bound and the dynamic culling state. Instancing needs no pipelines of its own:
+every vertex shader reads its copy's matrix from the instance buffer (§6.7).
 
 Alpha-masked parts use `discard` in the fragment shader. Under SPIR-V 1.6 that compiles to
 "demote to helper invocation", so `VulkanContext` enables the Vulkan 1.3 feature
@@ -982,9 +1027,93 @@ sequenceDiagram
   the barrier before each shadow pass waits for earlier fragment-shader reads, and the
   one after it makes the writes visible to this frame's main pass.
 - **Cost.** Every caster is drawn a second time (depth only, nine lookups per lit pixel
-  in the main pass). In the demo: 71 shadow draws beside 72 main draws.
+  in the main pass). In the demo: 48 shadow draws beside 49 main draws.
 
-### 6.6 Text
+### 6.6 Skinning
+
+A skinned mesh is bent on the GPU, the usual way (*linear blend skinning*):
+
+1. **On the CPU, per draw.** `draw(model, transform, pose)` computes every node's matrix
+   in model space for the pose (once per model draw), then for each skinned node
+   `jointMatrices()`: `nodeMatrix[joint] · inverseBind[joint]` per joint. They are copied
+   into this frame's **joint buffer** (a host-visible storage buffer per frame in flight,
+   like the uniforms) after the ones already there; the index of the first goes in the
+   push constants (`material.w`).
+2. **On the GPU, per vertex.** `skin.glsl` blends the four matrices the vertex names by
+   its weights; `mesh_skinned.vert` multiplies `object.model` (the model's `transform`) by
+   the result and carries on exactly like `mesh.vert`, normal matrix included.
+   `shadow_skinned.vert` does the same for the shadow pass, so shadows bend too.
+
+```mermaid
+flowchart LR
+    pose["ModelPose<br/>(ModelAnimator)"] --> nm["node matrices<br/>in model space"]
+    nm --> jm["joint matrices<br/>node · inverseBind"]
+    jm --> buf["frame's joint buffer<br/>(set 0, binding 2)"]
+    sv["SkinVertex buffer<br/>joints + weights"] --> vs["mesh_skinned.vert<br/>Σ weight · joint matrix"]
+    buf --> vs
+    vs --> fs["mesh.frag<br/>(unchanged)"]
+```
+
+- The joint buffer holds `maxJoints` matrices (8192 by default: 512 KB per frame in
+  flight); the shadow pass and the main pass both append, so a model drawn in both uses
+  its joints twice (the soldier: 14 × 2). `jointsUsed()` reports the frame's total. When
+  it's full, further skinned draws are skipped with one warning.
+- It's reset where the per-frame texture sets are: in `beginShadows`, or in `begin` if the
+  frame had no shadow pass.
+- Blend parts of skinned meshes keep their joint offset until `end()` draws them; their
+  distance for sorting uses their unbent bounds.
+- Cost: four matrix reads and a blend per vertex, plus an `inverse()` for the normal
+  matrix as in `mesh.vert`; on the CPU, one matrix per node and per joint per draw. The
+  demo's skinned soldier is 5 draw calls (one per material) instead of the rigid gunner's
+  19.
+
+### 6.7 Instancing
+
+Many copies of one mesh or model (a forest, a field of rocks, a ring of crates) in one draw
+call per part, instead of one per copy:
+
+1. **On the CPU, per call.** `drawInstanced(model, transforms, pose)` copies the matrices
+   into this frame's **instance buffer** (a host-visible storage buffer per frame in
+   flight, like the joint buffer), after the ones already there, mirrored copies (negative
+   determinant) last. It computes the model's node matrices in model space once, for the
+   shared pose.
+2. **Per part.** Each primitive is drawn with `vkCmdDrawIndexed(..., instanceCount,
+   firstInstance)`: the push constants hold the part's matrix within the model (identity
+   for a mesh or a skinned part), `firstInstance` the index of the first copy's matrix.
+   Mirrored copies are a second draw with the opposite front face.
+3. **On the GPU, per vertex.** `instance.glsl`'s `instanceMatrix()` returns
+   `instances[gl_InstanceIndex] · object.model` (in Vulkan, `gl_InstanceIndex` includes
+   `firstInstance`). All four vertex shaders use it, so instancing works in the main pass,
+   the shadow pass, wireframe and with skinning.
+
+```mermaid
+flowchart LR
+    list["the game's matrices<br/>(std::span&lt;const mat4&gt;)"] --> up["uploadInstances<br/>mirrored ones last"]
+    up --> buf["frame's instance buffer<br/>(set 0, binding 3)<br/>[0] = identity"]
+    draw["one vkCmdDrawIndexed per part<br/>firstInstance, instanceCount = copies"] --> vs
+    node["part's matrix in the model<br/>(push constants)"] --> vs
+    buf --> vs["vertex shader, every vertex of every copy<br/>instances[gl_InstanceIndex] · object.model"]
+    vs --> fs["mesh.frag / shadow.frag<br/>(unchanged)"]
+```
+
+- **Single draws use entry 0**, which holds the identity matrix and is never overwritten:
+  `draw()` passes `firstInstance = 0`, so the same shaders and pipelines draw both, and
+  `draw()` costs one extra matrix read per vertex.
+- The buffer holds `maxInstances` matrices (16384 by default: 1 MB per frame in flight);
+  both passes append, so the demo's 812 copies use 1624 (plus entry 0). It's reset with the
+  joint buffer. A call that doesn't fit is skipped with one warning.
+- **Shared per call:** the material (or the model's materials) and the pose; a skinned
+  model's joints are uploaded once for all its copies.
+- **Blend parts** are queued one copy at a time, each with its own matrix
+  (`instance · part`), and drawn in `end()` with the other see-through parts, farthest
+  first.
+- **No culling:** every copy is drawn in both passes. Cull before the call (bounding
+  spheres against the view) when counts reach tens of thousands.
+- Cost: the matrices are written once per pass (64 bytes per copy); on the GPU, a matrix
+  read and multiply per vertex. The demo's 800 trees are 2 draw calls per pass instead of
+  1600.
+
+### 6.8 Text
 
 ```mermaid
 flowchart LR
@@ -1125,8 +1254,10 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Write your game | New `core::Game` subclass in `src/game/`, construct it in `main.cpp` |
 | Add a shader | Drop `foo.vert` / `foo.frag` in `shaders/`, build a pipeline with `PipelineBuilder` using `core::shaderPath("foo.vert.spv")` |
 | Add your own geometry | Fill `render3d::MeshData` (CCW triangles, normals, UVs) and construct a `Mesh` |
-| Load models | Add a glTF loader (cgltf / fastgltf) that produces `MeshData` + `Texture`s |
-| Add a new renderer (skybox, particles, instancing) | New class in `render3d/` following `MeshRenderer`: own `Pipeline` with `renderer.depthFormat()`, per-frame buffers indexed by `frame.frameIndex` |
+| Load models | `render3d::Model::load(gpu, path)` (glTF 2.0), drawn with `MeshRenderer::draw(model, transform, pose)` |
+| Add a skinned character | Blender: mesh + Armature, *Ctrl+P > With Automatic Weights*, one Action per animation; export glTF with *Skinning* on and at most 4 influences per vertex. Load and draw it like any model; play its Actions with a `ModelAnimator` |
+| Draw many copies (trees, rocks, crowds) | `meshes.drawInstanced(model, matrices)` or `drawInstanced(mesh, matrices, material)`: one draw call per part for all of them (§6.7); a bigger `maxInstances` for more than ~8000 copies with shadows |
+| Add a new renderer (skybox, particles) | New class in `render3d/` following `MeshRenderer`: own `Pipeline` with `renderer.depthFormat()`, per-frame buffers indexed by `frame.frameIndex` |
 | Sharper or further shadows | Change `shadows.distance` and the constructor's `shadowMapSize`; for both at once, cascades: several maps for near-to-far slices of the view, fitted like `fitShadowMap` |
 | Shadows from other lights | Spot light: a perspective version of the sun's map; point light: a cube map. Same pattern: a depth-only pass in `onPreRender`, sampled in `mesh.frag` |
 | Render off-screen (post-processing, bloom, tone mapping) | Create an `Image` with `COLOR_ATTACHMENT \| SAMPLED` usage, render to it in `onPreRender`, sample it in the main pass |
@@ -1147,11 +1278,14 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | VMA for memory | Correct, efficient suballocation without writing an allocator | Third-party header |
 | One descriptor set per texture | Binding a texture is one call; no caches that can go stale | One set per texture (cheap); not bindless |
 | Forward rendering | Simplest path to correct lighting with one main light; works well on the Deck | Many dynamic lights need clustered/forward+ or deferred later |
-| Per-object data in push constants (112 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; switch to instancing/SSBOs for thousands of objects |
+| Per-object data in push constants (112 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; `drawInstanced` covers many copies of one thing |
+| Instancing through a per-frame matrix buffer and `gl_InstanceIndex`, entry 0 the identity | No extra pipelines or vertex formats: the same four vertex shaders serve single and instanced draws, skinned or not, in both passes; the game passes plain matrices | Copies share material and pose (no per-copy colour yet); every single draw pays one matrix read per vertex; matrices are re-uploaded each pass even when they never change |
 | Normal matrix computed in the vertex shader | Frees push-constant space for material values; correct under non-uniform scale | An `inverse()` per vertex (cheap for game-sized meshes) |
-| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No animations, skins or normal maps yet; whole model in memory |
+| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No normal maps or morph targets yet; whole model in memory |
 | Per-instance `ModelPose` instead of mutable nodes | One loaded model, many copies each in its own pose (rotors at different angles); the `Model` stays read-only | The game keeps a pose per copy |
-| Rigid-part animation (node TRS) before skinning | Covers mechanical models and characters built from parts (the owner's mix-and-match style), with no shader changes; armature bones still work as nodes | No bending meshes (elbows, faces) until GPU skinning is added |
+| Rigid-part animation (node TRS) first, skinning on top | Covers mechanical models and characters built from parts (the owner's mix-and-match style); bones are nodes too, so skinning reuses the same poses, animator and sockets | — |
+| Linear blend skinning on the GPU, joint matrices in a per-frame storage buffer | The standard method, what glTF and Blender expect; no per-draw descriptor updates (an offset in the push constants picks the joints); shadows bend for free with a skinned shadow shader | Joints twist and lose volume at extreme bends ("candy wrapper" wrists); dual-quaternion skinning would fix that. The matrices are recomputed for each pass |
+| Separate skinned pipelines rather than one shader with a branch | Rigid meshes keep their plain vertex format and shader; skinned data is a second vertex buffer only skinned models have | Eight pipelines instead of four; a rigid/skinned switch rebinds the pipeline |
 | Animator rebuilds the whole pose each update | Simple and correct (no drift, procedural tweaks don't accumulate, blends include untouched nodes) | Work per node per update, fine for game-sized hierarchies |
 | Third-person camera collision through a ray callback | The camera stays independent of how a game stores its level; the same `raycast*` shapes serve shooting and picking; no physics engine needed | The game lists its colliders; only simple shapes until triangle tests or a physics engine come in |
 | Camera jumps in when blocked, eases out when clear | The player is never hidden behind a wall, and the camera doesn't jitter in and out past posts | A sudden cut when something passes between player and camera |
@@ -1175,9 +1309,10 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 
 ## 13. Known limitations and roadmap
 
-- Models: no skinned meshes, morph targets, normal/occlusion/metallic-roughness textures,
-  KTX2/WebP images or Draco/meshopt compression yet. Animations move nodes (rigid parts,
-  or parts parented to bones); one animation plays at a time per animator (plus blends).
+- Models: no morph targets, normal/occlusion/metallic-roughness textures, KTX2/WebP
+  images or Draco/meshopt compression yet. Skinning is linear blend, 4 joints per vertex.
+  One animation plays at a time per animator (plus blends); layering (legs walking, arms
+  firing) is up to the game, by combining two poses.
 - One directional light only, so only the sun casts shadows. One shadow map (no
   cascades): shadows reach `distance` (30 m) and fade out there; Blend (see-through)
   parts cast none; constant softness. Every caster is drawn again for the shadow pass
@@ -1190,7 +1325,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - Not PBR (roughness and metallic shape a Blinn-Phong highlight; image-based lighting and
   a proper BRDF would be the upgrade).
 - No anti-aliasing (MSAA, FXAA or TAA).
-- No frustum culling or instancing; one draw call per object.
+- No frustum culling: every draw and every instance is drawn, in both passes. Instanced
+  copies share their material and pose (no per-copy colour or animation time).
 - No skybox (the fog-coloured clear colour stands in for the sky).
 - The debug UI uses one window (no ImGui docking or multi-viewport) and doesn't save its
   layout.

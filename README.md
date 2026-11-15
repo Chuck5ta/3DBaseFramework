@@ -1,10 +1,10 @@
 # Game3D — C++20 / Vulkan 1.3 starter for 3D games
 
-A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**.
-You own all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a
-depth buffer, a lit, textured mesh renderer with sun shadows that also draws glTF models
-from Blender, fly and third-person cameras and 3D audio, plus a demo scene showing how
-they fit together.
+A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**. You own all
+the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer, a
+lit, textured mesh renderer with sun shadows and instancing that also draws glTF models
+from Blender (animated, rigid or skinned), fly and third-person cameras and 3D audio, plus
+a demo scene showing how they fit together.
 
 | Layer | What it does | Library |
 |---|---|---|
@@ -13,8 +13,8 @@ they fit together.
 | Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
-| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, soft sun shadows (a stable shadow map around the camera), wireframe | your code |
-| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; named parts posed in code (spinning rotors, turrets) | cgltf |
+| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, soft sun shadows (a stable shadow map around the camera), instancing (hundreds of copies in one draw call), wireframe | your code |
+| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; skinned meshes bent on the GPU (4 bones per vertex); named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
@@ -126,10 +126,10 @@ src/
     Font                .ttf/.otf baked into a texture atlas
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
-    Model               glTF 2.0 models: parts, materials, textures, poses, animations
+    Model               glTF 2.0 models: parts, materials, textures, poses, animations, skins
     ModelAnimator       plays a model's animations (blending, looping, moments)
     MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants),
-                        sun shadows (a shadow pass in onPreRender)
+                        sun shadows (a shadow pass in onPreRender), GPU skinning
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
     ThirdPersonCamera   follows a character: orbit, zoom, shoulder offset, collision
     Raycast             ray tests against planes, spheres and boxes
@@ -138,7 +138,8 @@ src/
 shaders/                GLSL; every *.vert/*.frag/*.comp is compiled automatically
                         (*.glsl files are shared includes, e.g. common.glsl)
 assets/                 copied next to the exe (fonts/: Roboto Medium, Apache 2.0;
-                        sounds/: demo sounds, CC0; models/: the demo's drone, CC0)
+                        sounds/: demo sounds, CC0; models/: the demo's drone, soldiers
+                        and rifle, CC0)
 tools/                  make_drone.py, make_gunner.py, make_gunner_sounds.py: write the demo's
                         models and gunner sounds (plain Python; gltf_builder.py is shared)
 cmake/                  dependency + shader build logic
@@ -214,6 +215,13 @@ Tips
   `render3d::ModelAnimator` (`play(model, "Fire", render3d::AnimationLoop::Once)`,
   `update(dt)`, `meshes_->draw(model, transform, &animator.pose())`). Attach weapons or
   hats at socket empties with `model.nodeMatrix(node, transform, &pose)`. Tutorial step 13.
+- Skinned characters (one mesh bending at the joints): parent the mesh to an armature
+  *With Automatic Weights* in Blender and export glTF with *Skinning* on. Load, animate and
+  draw them exactly like rigid ones; the renderer bends them. Tutorial step 16.
+- Many copies of the same thing (trees, rocks, crates): put a matrix per copy in a
+  `std::vector<glm::mat4>` and call `meshes_->drawInstanced(model_, matrices)` (or
+  `drawInstanced(mesh, matrices, material)`): one draw call per part for all of them.
+  Tutorial step 17.
 - A third-person game: move the player with `follow.flatForward()`/`flatRight()`, then
   `follow.update(playerPos, dt, rayFn)` and `follow.apply(camera_)` with a
   `render3d::ThirdPersonCamera follow`. `rayFn` returns the nearest hit of your level's
@@ -268,7 +276,8 @@ Tips
   the console clean of validation errors.
 
 ### Demo controls
-The demo starts in third person, behind a soldier you can walk around.
+The demo starts in third person, behind a (skinned) soldier you can walk around, in a
+clearing ringed by an instanced forest of 800 trees.
 
 | Action | Keyboard / mouse | Gamepad / Steam Deck |
 |---|---|---|
@@ -328,11 +337,11 @@ limits (Steam's performance overlay helps), suspend/resume (swapchain recreation
 
 ## 7. Where to go next
 
-- **Skinned characters:** meshes bent by armature bones (GPU skinning), for smoother elbows and faces.
+- **Animation layers:** walk with the legs while the arms fire, by combining two animators' poses.
 - **Shadow cascades:** several shadow maps from near to far, for sharp shadows close up that also reach the horizon.
 - **PBR materials:** metallic/roughness + image-based lighting.
 - **MSAA or FXAA/TAA** for smoother edges.
 - **Tools in the debug UI:** grow `onDebugUI` into a level editor or a tuning panel that saves to a file.
 - **Physics:** Jolt Physics.
 - **Music:** add a track to `assets/music/` and call `app.audio().playMusic(...)`.
-- **Frustum culling and instancing** once scenes get large.
+- **Frustum culling** once scenes get large: skip the draws and the instances the camera can't see.

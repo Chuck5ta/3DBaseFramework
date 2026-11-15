@@ -10,6 +10,9 @@ in a node hierarchy, add keyframed animations, and write one .glb:
     b.animation('Spin', [(root, 'rotation', [0, 1], [quat_y(0), quat_y(180)])])
     b.write('crate.glb')
 
+Skinned meshes too: give a Mesh per-vertex joints and weights, add a skin (its joints
+and their bind pose) with Builder.skin, and put the mesh on a node with skin=.
+
 Units are metres, +Y is up and the front faces +Z (the framework's conventions).
 Rotations are quaternions as (x, y, z, w), as glTF stores them.
 """
@@ -59,10 +62,50 @@ def quat_norm(q):
     l = math.sqrt(sum(c * c for c in q)) or 1.0
     return tuple(c / l for c in q)
 
+# Rigid transforms (rotation, then translation) as (quaternion, translation) pairs.
+def xform_mul(a, b):
+    """a after b: what b's frame is, seen from a's parent frame."""
+    return quat_mul(a[0], b[0]), add(a[1], quat_rotate(a[0], b[1]))
+
+def xform_inverse(a):
+    q = quat_conj(a[0])
+    return q, scale(quat_rotate(q, a[1]), -1.0)
+
+def xform_point(a, p): return add(a[1], quat_rotate(a[0], p))
+
+def xform_matrix(a):
+    """The 4x4 matrix, column-major (16 floats), as glTF stores matrices."""
+    x, y, z, w = quat_norm(a[0])
+    t = a[1]
+    return [1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 0.0,
+            2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 0.0,
+            2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y), 0.0,
+            t[0], t[1], t[2], 1.0]
+
 # ---------------------------------------------------------------- flat-shaded geometry
 class Mesh:
     def __init__(self):
         self.pos, self.nrm, self.uv, self.idx = [], [], [], []
+        # For skinned meshes: per vertex, up to four joints (indices into the skin's joint
+        # list) and how much each moves the vertex (weights adding up to 1).
+        self.joints, self.weights = [], []
+
+    def skinned(self):
+        return len(self.joints) == len(self.pos) and len(self.pos) > 0
+
+    def append(self, other, xform=None, joint=None):
+        """Adds another mesh's triangles, moved by a rigid transform; with `joint`, every
+        added vertex follows that joint alone (weight 1)."""
+        base = len(self.pos)
+        for i, (p, n, t) in enumerate(zip(other.pos, other.nrm, other.uv)):
+            self.pos.append(xform_point(xform, p) if xform else p)
+            self.nrm.append(quat_rotate(xform[0], n) if xform else n)
+            self.uv.append(t)
+            if joint is not None:
+                self.joints.append((joint, 0, 0, 0)); self.weights.append((1.0, 0.0, 0.0, 0.0))
+            elif other.skinned():
+                self.joints.append(other.joints[i]); self.weights.append(other.weights[i])
+        self.idx += [base + i for i in other.idx]
 
     def quad(self, a, b, c, d, uvs=((0, 1), (1, 1), (1, 0), (0, 0))):
         """Counter-clockwise (seen from outside) quad a-b-c-d with a flat normal."""
@@ -117,7 +160,7 @@ class Mesh:
 class Builder:
     def __init__(self, generator='gltf_builder.py (Game3D)'):
         self.generator = generator
-        self.materials, self.meshes, self.nodes, self.animations = [], [], [], []
+        self.materials, self.meshes, self.nodes, self.animations, self.skins = [], [], [], [], []
 
     def material(self, name, color, metallic=0.0, roughness=0.6, emissive=None):
         """Returns the material's index. Colours are linear RGBA."""
@@ -133,11 +176,19 @@ class Builder:
         self.meshes.append((name, parts))
         return len(self.meshes) - 1
 
-    def node(self, name, parent=None, mesh=None, translation=(0, 0, 0), rotation=QUAT_IDENTITY):
-        """Returns the node's index. Its transform is relative to its parent."""
-        self.nodes.append(dict(name=name, parent=parent, mesh=mesh,
+    def node(self, name, parent=None, mesh=None, translation=(0, 0, 0), rotation=QUAT_IDENTITY, skin=None):
+        """Returns the node's index. Its transform is relative to its parent. A node with a
+        skin draws its (skinned) mesh deformed by that skin's joints."""
+        self.nodes.append(dict(name=name, parent=parent, mesh=mesh, skin=skin,
                                translation=tuple(translation), rotation=tuple(rotation)))
         return len(self.nodes) - 1
+
+    def skin(self, name, joints, bind_poses):
+        """A skin (Blender: an armature) moving a mesh by `joints` (node indices). bind_poses
+        are each joint's (rotation, translation) in model space in the pose the mesh was made
+        in: the bind pose. Returns the skin's index, for node(..., skin=)."""
+        self.skins.append((name, list(joints), [xform_matrix(xform_inverse(p)) for p in bind_poses]))
+        return len(self.skins) - 1
 
     def animation(self, name, channels):
         """channels: [(node, 'translation' | 'rotation', times, values), ...] (linear keys)."""
@@ -165,6 +216,12 @@ class Builder:
             accessors.append(acc)
             return len(accessors) - 1
 
+        def add_joints(values):
+            flat = [c for v in values for c in v]
+            accessors.append(dict(bufferView=add_view(struct.pack('<%dB' % len(flat), *flat), 34962),
+                                  componentType=5121, count=len(values), type='VEC4'))
+            return len(accessors) - 1
+
         def add_indices(values):
             accessors.append(dict(bufferView=add_view(struct.pack('<%dI' % len(values), *values), 34963),
                                   componentType=5125, count=len(values), type='SCALAR'))
@@ -174,16 +231,20 @@ class Builder:
         for name, parts in self.meshes:
             prims = []
             for m, mat in parts:
-                prims.append(dict(attributes=dict(POSITION=add_floats(m.pos, 3, 34962, bounds=True),
-                                                  NORMAL=add_floats(m.nrm, 3, 34962),
-                                                  TEXCOORD_0=add_floats(m.uv, 2, 34962)),
-                                  indices=add_indices(m.idx), material=mat))
+                attributes = dict(POSITION=add_floats(m.pos, 3, 34962, bounds=True),
+                                  NORMAL=add_floats(m.nrm, 3, 34962),
+                                  TEXCOORD_0=add_floats(m.uv, 2, 34962))
+                if m.skinned():
+                    attributes['JOINTS_0'] = add_joints(m.joints)
+                    attributes['WEIGHTS_0'] = add_floats(m.weights, 4, 34962)
+                prims.append(dict(attributes=attributes, indices=add_indices(m.idx), material=mat))
             gl_meshes.append(dict(name=name, primitives=prims))
 
         gl_nodes = []
         for i, n in enumerate(self.nodes):
             g = dict(name=n['name'])
             if n['mesh'] is not None: g['mesh'] = n['mesh']
+            if n['skin'] is not None: g['skin'] = n['skin']
             if any(abs(c) > 1e-9 for c in n['translation']): g['translation'] = [round(c, 6) for c in n['translation']]
             if n['rotation'] != QUAT_IDENTITY: g['rotation'] = [round(c, 6) for c in quat_norm(n['rotation'])]
             children = [j for j, c in enumerate(self.nodes) if c['parent'] == i]
@@ -208,6 +269,12 @@ class Builder:
                    accessors=accessors, bufferViews=views, buffers=[dict(byteLength=0)])
         if gl_anims:
             doc['animations'] = gl_anims
+        if self.skins:
+            doc['skins'] = []
+            for name, joints, inverse_bind in self.skins:
+                acc = add_floats([tuple(m) for m in inverse_bind], 16)
+                accessors[acc]['type'] = 'MAT4'
+                doc['skins'].append(dict(name=name, joints=joints, inverseBindMatrices=acc))
         while len(blob) % 4: blob.append(0)
         doc['buffers'][0]['byteLength'] = len(blob)
         js = json.dumps(doc, separators=(',', ':')).encode()
@@ -217,5 +284,6 @@ class Builder:
         with open(path, 'wb') as f:
             f.write(glb)
         tris = sum(len(m.idx) // 3 for _, parts in self.meshes for m, _ in parts)
-        print('wrote %s: %d bytes, %d triangles, %d nodes, %d animations'
-              % (path, len(glb), tris, len(self.nodes), len(self.animations)))
+        print('wrote %s: %d bytes, %d triangles, %d nodes, %d animations%s'
+              % (path, len(glb), tris, len(self.nodes), len(self.animations),
+                 ', %d joints' % sum(len(j) for _, j, _ in self.skins) if self.skins else ''))

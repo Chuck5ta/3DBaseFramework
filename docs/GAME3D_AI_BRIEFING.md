@@ -7,7 +7,7 @@
 > (design and internals), `docs/TUTORIAL.md` (the demo built step by step) or
 > `docs/BUILDING.md` (Windows, Linux, Steam Deck builds).
 >
-> Framework state: **2026-11-14**. If the user's copy of the framework is older or newer,
+> Framework state: **2026-11-15**. If the user's copy of the framework is older or newer,
 > trust the source code over this file.
 
 ## 1. What it is
@@ -15,10 +15,11 @@
 An engine-free C++20 starter for **3D games** on Windows, Linux and Steam Deck. The game
 owns all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer,
 a lit and textured forward renderer for meshes and **glTF models** (from Blender) with
-their **animations**, a fly camera, a 2D overlay for HUD text, 3D audio with effects and
+their **animations** and **skinning**, **instancing**, sun shadows, fly and third-person cameras, a 2D overlay for HUD text, 3D audio with effects and
 Doppler, and a debug UI. A demo scene (`DemoGame`: crates, spheres, a sun that can be animated, a humming
-crate, chiming spheres, a drone model circling with spinning rotors, and an animated gunner
-who tracks it, fires and reloads) shows how it fits together.
+crate, chiming spheres, a drone model circling with spinning rotors, an animated gunner
+built from rigid parts who tracks it, fires and reloads, a skinned player soldier you
+walk and run, and an instanced forest of 800 trees) shows how it fits together.
 
 - **Language and build:** C++20, CMake ≥ 3.22 with presets (`debug`, `relwithdebinfo`,
   `release`, `vs2022`, `vs2026`). Every dependency is downloaded by CMake at a pinned
@@ -39,17 +40,18 @@ src/
   core/                 Application (loop, hooks), Window, Input, Actions, GameState, SaveData, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
-  render3d/             MeshRenderer (Material, SceneLighting, ShadowSettings; sun shadows), Model (glTF), ModelAnimator, Mesh (+ primitives),
+  render3d/             MeshRenderer (Material, SceneLighting, ShadowSettings; sun shadows, GPU skinning, instancing), Model (glTF, skins), ModelAnimator, Mesh (+ primitives),
                         Camera3D, ThirdPersonCamera, Raycast
   render2d/             SpriteBatch, Camera2D, Font, Animation (used for the HUD)
   audio/                AudioEngine (miniaudio): sounds, music, 3D, effects, Doppler
   debugui/              DebugUI (Dear ImGui)
   game/                 DemoGame (the example); your game goes here
-shaders/                mesh.vert/.frag, shadow.vert/.frag, common.glsl, sprite.vert/.frag, imgui.frag
-assets/                 fonts/ (Roboto), models/ (drone, gunner, rifle .glb), sounds/, textures/ (copied next to the exe)
+shaders/                mesh.vert/.frag, shadow.vert/.frag, mesh_skinned.vert, shadow_skinned.vert, skin.glsl,
+                        instance.glsl, common.glsl, sprite.vert/.frag, imgui.frag
+assets/                 fonts/ (Roboto), models/ (drone, gunner, soldier, rifle, tree .glb), sounds/, textures/ (copied next to the exe)
 cmake/                  Dependencies.cmake, Shaders.cmake
-tools/                  make_drone.py, make_gunner.py (+ gltf_builder.py), make_gunner_sounds.py: the demo's
-                        models and gunner sounds, generated in plain Python
+tools/                  make_drone.py, make_gunner.py, make_tree.py (+ gltf_builder.py), make_gunner_sounds.py:
+                        the demo's models and gunner sounds, generated in plain Python
 docs/                   GAME3D_ARCHITECTURE, BUILDING, TUTORIAL, GAME3D_AI_BRIEFING (this file)
 ```
 
@@ -405,7 +407,7 @@ Y flipped), `viewProjection()`.
 `normal`, `uv`, `color` = linear vertex colour, white by default) + `indices` (uint32). Primitives: `primitives::cube(size)`,
 `plane(size, uvRepeat)` (XZ plane facing +Y), `sphere(radius, segments, rings)`.
 
-**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048)`,
+**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384)`,
 needs `config.renderer.depthBuffer = true`):
 `begin(frame, camera, lighting)` → `draw(mesh, modelMatrix, Material)` and/or
 `draw(model, transform, &pose)` × n → `end()` (see-through model parts are drawn in `end()`,
@@ -413,9 +415,28 @@ farthest first). It stops with a message if the renderer has no depth buffer.
 `Material{texture, color (sRGB tint), emissive (sRGB glow), emissiveStrength,
 emissiveTexture, roughness = 0.5, metallic = 0, doubleSided, castShadows = true}`.
 `setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
-`shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres). Per-object data travels
+`shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres), `jointsUsed()`,
+`maxJoints()`, `instancesUsed()`, `maxInstances()`. Per-object data travels
 as push constants (one draw call per object or model part). Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
+
+**Instancing** — many copies of one mesh or model in one draw call per part:
+`drawInstanced(mesh, matrices, Material)` and `drawInstanced(model, matrices, &pose)`, where
+`matrices` is a `std::span<const glm::mat4>` (a `std::vector<glm::mat4>` or a C array
+converts). Use it for anything repeated (trees, rocks, crates, crowds); keep `draw()` for
+one-offs.
+
+- Matrices go into a per-frame instance buffer (storage buffer, set 0 binding 3,
+  `maxInstances` × 64 B, 16384 = 1 MB per frame); the vertex shaders (`instance.glsl`,
+  included by all four) compute `instances[gl_InstanceIndex] * object.model`. Entry 0 is
+  the identity and single `draw()`s use it (`firstInstance = 0`): no extra pipelines.
+- Instanced model parts: push constant `model` = the part's node matrix in model space
+  (identity for meshes and skinned parts); the instance matrix places the copy.
+- Copies share the material and the pose (skinned: joints uploaded once per call). Mirrored
+  copies (negative determinant) are sorted last and drawn as a second draw with the
+  opposite winding. Blend parts are queued per copy for `end()`'s sorted pass.
+- Both passes append (each call costs its copy count twice with shadows); overflow skips
+  the call with one warning. No culling: every copy is drawn, in both passes.
 
 **Shadows (sun only)** — the scene is drawn twice through the same calls, so put all 3D
 drawing in one function (the demo's `drawScene(alpha)`):
@@ -475,8 +496,7 @@ meshes.draw(drone_, transform, &pose_);       // pose optional (nullptr = as exp
   `KHR_materials_emissive_strength`, × texture), metallic and roughness factors, alpha
   modes (opaque, mask + cutoff, blend), double-sided, `KHR_materials_unlit`; per-texture
   filter and per-axis wrap. Ignored with a logged warning: metallic-roughness, normal and
-  occlusion textures, skinned meshes (drawn in their rest pose), morph targets, cameras,
-  lights.
+  occlusion textures, morph targets, cameras, lights.
 - `render3d::loadModelData(path, data, &error)` loads into `ModelData` on the CPU only
   (tools and tests), returning false with a reason instead of stopping.
 - One `Model` in memory can be drawn many times with different transforms and poses.
@@ -516,16 +536,45 @@ meshes.draw(rifle_, gunner_.nodeMatrix(socket, transform, &anim_.pose()));
 - `pose()` is empty until the first `play()`; pass `nullptr` or skip drawing until then if
   that matters (the demo plays Idle in `onInit`).
 - Keeps a pointer to the `Model`: keep the model alive and in place (a member).
-- Only **node** animation (rigid parts; parts parented to armature bones also work, as the
-  bones are nodes). Skinned meshes aren't deformed yet.
+- Animations move **nodes**: rigid parts, armature bones (which are nodes), and through
+  the bones, skinned meshes. One animation per animator (plus cross-fades).
+
+**Skinned meshes** (Blender: a mesh with an Armature modifier, parented *With Automatic
+Weights*) are bent on the GPU automatically: load and draw them like any model, with a
+`ModelAnimator` pose. Nothing else to call.
+
+- Per vertex up to 4 joints + weights (`JOINTS_0`/`WEIGHTS_0`; `JOINTS_1` ignored with a
+  warning). `ModelSkin{name, joints (node indices), inverseBind}`, `model.skins()`,
+  `node(i).skin` (-1 = none), `ModelPrimitive::skinned`, `ModelData::skinVertices`
+  (`SkinVertex{u16vec4 joints; vec4 weights}`, parallel to `vertices`).
+- `draw(model, transform, &pose)`: per skinned node, joint matrix = node matrix (model
+  space) × inverse bind; appended to the frame's joint buffer (storage buffer, set 0
+  binding 2); `material.w` push constant = first joint; `mesh_skinned.vert` /
+  `shadow_skinned.vert` blend them (`skin.glsl`). The skinned node's own transform is
+  ignored (glTF rule); `transform` places the model.
+- Both passes append, so each skinned draw costs its joint count twice with shadows;
+  `maxJoints` (8192) is per frame; overflow skips draws with one warning. Bounds are of
+  the bent default pose.
+- Unusable skins (joints outside the scene, joint indices beyond the skin) draw unbent
+  with a warning. Tested with Khronos RiggedSimple, RiggedFigure, CesiumMan, Fox.
+- Blender export: *Data > Skinning* on, *Include All Bone Influences* off (4 per vertex);
+  apply scale. Linear blend skinning: extreme twists lose volume (no dual quaternions).
 - `Game3D/assets/models/gunner.glb` (CC0, 1.9 m soldier, 296 triangles): nodes `Gunner >
   Hips > Torso > Head > Helmet`, `UpperArm/Forearm/Hand_L/R`, `Thigh/Shin_L/R`,
   `Socket_Hand_R` (rifle goes here); animations `Idle` (4 s loop), `Fire` (0.45 s), `Load`
   (1.5 s; magazine out at 0.3 s, in at 1.0 s), `Walk` (1 s loop, made for ~1.35 m/s) and
   `Run` (0.6 s loop, ~3.4 m/s; play at `speed = actualSpeed / that` so the feet don't
-  slide). The arms keep the rifle ready in every animation. `rifle.glb` has a `Muzzle` node. Generated
-  by `tools/make_gunner.py` (arm poses solved with a small IK solver); sounds
-  `rifle_shot.wav`, `mag_click.wav` by `tools/make_gunner_sounds.py`. Tutorial step 13.
+  slide). The arms keep the rifle ready in every animation. `rifle.glb` has a `Muzzle` node.
+  `soldier.glb` (1128 triangles) is the same soldier **skinned**: the same nodes (root
+  `Soldier`), animations and socket, plus `Body`, one mesh bent by a 14-joint skin (smooth
+  tube limbs; bind pose: straight, arms hanging 12° out; 5 draw calls vs the gunner's 19).
+  Swap one for the other with no code changes beyond the file name. Generated
+  by `tools/make_gunner.py` (arm poses solved with a small IK solver; `gltf_builder.py`
+  writes skins); sounds
+  `rifle_shot.wav`, `mag_click.wav` by `tools/make_gunner_sounds.py`. Tutorial steps 13
+  (gunner) and 16 (skinned soldier).
+- `tree.glb` (CC0, `tools/make_tree.py`): a low-poly pine, 4.2 m, 148 triangles, one node
+  `Tree` with two parts (`Bark`, `Needles`); the demo's forest (tutorial step 17).
 - **Blender workflow, tested by Claude through the Blender MCP connection (Blender 5.2.3,
   2026-11-14):** build characters from separate objects (same names and hierarchy, origins
   at the joints). Recommended: bone-parent them to an armature (Ctrl+P > Bone), one Action
@@ -546,7 +595,10 @@ meshes.draw(rifle_, gunner_.nodeMatrix(socket, transform, &anim_.pose()));
   Blender 5.2.3 (`H:\Program Files\Blender Foundation\Blender 5.2`); Steam's Blender 5.3.0
   is also installed. Work in a new scene (`bpy.data.scenes.new`) so his open file is left
   alone, write test files to `tempfile.gettempdir()`, and save a test .blend with
-  `bpy.data.libraries.write` (doesn't rename his session). Binary results come back as
+  `bpy.data.libraries.write` (doesn't rename his session). The background tool
+  (`execute_blender_code_for_cli`) failed on 2026-11-15 ("Blender executable not found at
+  'blender'"): its process doesn't see `BLENDER_PATH`; use the live-session tool as above.
+  Binary results come back as
   base64 in `result`; pad it past the size limit and the tool saves it to a file you can
   decode. To check an export, load both files with `loadModelData` and compare every
   node's world matrix at many times.
@@ -584,12 +636,20 @@ Rays starting inside a sphere/box don't hit it. Typical ray function: the neares
 `raycast*` over the level's colliders (see `DemoGame::raycastScene`). Also for shooting,
 line of sight and mouse picking.
 
-**Demo (tutorial steps 14–15):** **G** toggles shadows (the debug UI has a Shadows
-section). Starts in third person behind a second soldier (the gunner's
-model, own `ModelAnimator`); **C** / gamepad Start toggles the fly camera. WASD/left stick
+**Demo (tutorial steps 14–17):** **G** toggles shadows (the debug UI has a Shadows
+section). Starts in third person behind a second soldier (`soldier_`: `soldier.glb`,
+skinned, own `ModelAnimator`; the gunner stays rigid for comparison); **C** / gamepad
+Start toggles the fly camera. WASD/left stick
 walk (camera-relative), Shift/L3 run, right mouse/Tab/right stick orbit, wheel/d-pad zoom.
 Shared layout helpers (`bigCrateMatrix`, `ringCrateMatrix`, `sphereCentre`) feed drawing,
 the player's push-out circles and the camera's `raycastScene`, so they can't disagree.
+The forest: 800 tree matrices (`trees_`), scattered once in `onInit` between 22 and 90 m
+with a small xorshift (`random01`, the same on every compiler), drawn with one
+`drawInstanced`; the ring of crates is one `drawInstanced` too. The trunks push the player
+out, and trunk and crown boxes (`kTrunkBox`, `kCrownBox` × the tree's matrix) stop the
+camera (only trees within 15 m of the ray are tested). Debug UI → *Forest*: tree count
+slider and an *Instancing* checkbox (off: one `draw()` per tree, 1647 draw calls instead
+of 49).
 
 **`render3d::SceneLighting`** (all colours sRGB): `sunDirection` (the direction light
 travels), `sunColor`, `sunIntensity`, `skyColor` and `groundColor` (hemisphere ambient),
@@ -792,26 +852,29 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   feature is added, update `README.md`, `docs/GAME3D_ARCHITECTURE.md`, `docs/BUILDING.md` if
   relevant, the tutorial, **and this briefing**.
 
-## 13. Known limitations (as of 2026-11-14)
+## 13. Known limitations (as of 2026-11-15)
 
-**Planned next (the owner's order, 2026-11-14):** skinned characters if needed (the
-third-person camera and shadows are done). Instancing was discussed and deferred: worth it
-for forests, crowds and particles, not for Drone Invaders' tens of objects. The 3D "Drone Invaders" will have a soldier gunner on the
+**Roadmap (the owner's order):** model animation, third-person camera, shadows and
+skinned characters are all done (skinning 2026-11-15), and so is instancing (2026-11-15,
+first deferred, then asked for). Nothing is queued; ask the owner. Candidates:
+upper-body animation layering (walk + fire), shadow cascades, frustum culling (per
+instance and per draw), gamepad polish for the Steam Deck (the owner gets one late
+November 2026). The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
 
-- Models: no skinned meshes (armature deformation), morph targets,
-  normal/occlusion/metallic-roughness textures, KTX2/WebP images or Draco/meshopt
-  compression (refused with a message). Animation is node-based (rigid parts), one
-  animation per animator at a time (plus cross-fades); no animation events beyond
-  `reached(time)`.
+- Models: no morph targets, normal/occlusion/metallic-roughness textures, KTX2/WebP
+  images or Draco/meshopt compression (refused with a message). Skinning is linear blend,
+  4 joints per vertex. One animation per animator at a time (plus cross-fades); no
+  per-body-part layering; no animation events beyond `reached(time)`.
 - Third-person camera: simple collider shapes only (no triangle-mesh ray tests), no
   player fade when close, no auto-follow swing; no character controller.
 - One directional light; only it casts shadows: one shadow map (no cascades), so shadows
   stop at `shadows.distance` and are equally sharp near and far; constant softness; Blend
   parts cast none; casters aren't culled for the shadow pass. Not PBR (roughness/metallic shape a Blinn-Phong
   highlight), no anti-aliasing, no skybox (the fog-coloured
-  clear colour stands in), no frustum culling or instancing (one draw call per object).
+  clear colour stands in), no frustum culling (every draw and every instance is drawn, in
+  both passes); instanced copies share material and pose (no per-copy colour).
 - Saves: no encryption/compression/cloud API (Steam Auto-Cloud works without code), no
   automatic `version` migration; window size/position aren't remembered.
 - Game states: no built-in transitions (fades) or menu widgets (copy the Game2D demo's

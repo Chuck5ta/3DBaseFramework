@@ -286,6 +286,27 @@ struct Loader {
         const bool haveColor = cAcc && cAcc->count == count && (colorComponents == 3 || colorComponents == 4) &&
                                readFloats(cAcc, colorComponents, col);
 
+        // Skinning: which joints move each vertex (any integer type), and how much.
+        std::vector<float> weights;
+        std::vector<glm::u16vec4> joints;
+        const cgltf_accessor* jAcc = findAttribute(p, cgltf_attribute_type_joints);
+        const cgltf_accessor* wAcc = findAttribute(p, cgltf_attribute_type_weights);
+        bool haveSkin = jAcc && wAcc && jAcc->count == count && cgltf_num_components(jAcc->type) == 4 &&
+                        wAcc->count == count && readFloats(wAcc, 4, weights);
+        if (haveSkin) {
+            joints.resize(count);
+            for (size_t i = 0; i < count && haveSkin; ++i) {
+                cgltf_uint j[4] = {};
+                haveSkin = cgltf_accessor_read_uint(jAcc, i, j, 4) && j[0] <= 0xFFFF && j[1] <= 0xFFFF &&
+                           j[2] <= 0xFFFF && j[3] <= 0xFFFF;
+                joints[i] = glm::u16vec4(j[0], j[1], j[2], j[3]);
+            }
+            if (!haveSkin)
+                warn("Mesh '" + meshName + "': unreadable joints; drawn without skinning");
+        }
+        if (findAttribute(p, cgltf_attribute_type_joints, 1))
+            warn("Mesh '" + meshName + "': only 4 bones per vertex are used (Blender: Limit Total, 4)");
+
         // The corners in order, then as a triangle list.
         std::vector<uint32_t> order;
         if (p.indices) {
@@ -317,6 +338,21 @@ struct Loader {
         if (tris.empty())
             return false;
 
+        const auto skinVertex = [&](uint32_t i) {
+            SkinVertex v;
+            v.joints = joints[i];
+            v.weights = glm::make_vec4(&weights[size_t(i) * 4]);
+            const float sum = v.weights.x + v.weights.y + v.weights.z + v.weights.w;
+            if (sum > 0.0f)
+                v.weights /= sum; // exporters round; the weights must add up to 1
+            else
+                v.weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            return v;
+        };
+        // Kept one per vertex, so start the joint data where this primitive's vertices start.
+        if (haveSkin)
+            out.skinVertices.resize(out.vertices.size());
+
         const auto vertex = [&](uint32_t i) {
             Vertex v{};
             v.position = glm::make_vec3(&pos[size_t(i) * 3]);
@@ -332,8 +368,11 @@ struct Loader {
         prim.firstIndex = uint32_t(out.indices.size());
         prim.vertexOffset = int32_t(out.vertices.size());
         if (haveNormals) {
-            for (size_t i = 0; i < count; ++i)
+            for (size_t i = 0; i < count; ++i) {
                 out.vertices.push_back(vertex(uint32_t(i)));
+                if (haveSkin)
+                    out.skinVertices.push_back(skinVertex(uint32_t(i)));
+            }
             out.indices.insert(out.indices.end(), tris.begin(), tris.end());
         } else {
             // No normals: glTF says to shade flat, so every triangle gets its own corners.
@@ -345,6 +384,9 @@ struct Loader {
                 const uint32_t base = uint32_t(out.vertices.size()) - uint32_t(prim.vertexOffset);
                 out.vertices.insert(out.vertices.end(), {a, b, c});
                 out.indices.insert(out.indices.end(), {base, base + 1, base + 2});
+                if (haveSkin)
+                    out.skinVertices.insert(out.skinVertices.end(),
+                                            {skinVertex(tris[t]), skinVertex(tris[t + 1]), skinVertex(tris[t + 2])});
             }
         }
         prim.indexCount = uint32_t(out.indices.size()) - prim.firstIndex;
@@ -357,6 +399,7 @@ struct Loader {
             prim.boundsMax = glm::max(prim.boundsMax, v);
         }
         prim.material = indexOf(p.material, gltf.materials);
+        prim.skinned = haveSkin;
         return true;
     }
 
@@ -381,9 +424,7 @@ struct Loader {
         node.name = nameOr(n.name, "node", size_t(&n - gltf.nodes));
         node.parent = parent;
         node.mesh = indexOf(n.mesh, gltf.meshes);
-        if (n.skin)
-            warn("Node '" + node.name + "': skinned (armature) deformation isn't supported yet; drawn in its rest "
-                 "pose. For rigid parts, parent the objects to bones instead (Ctrl+P > Bone)");
+        node.skin = n.mesh ? indexOf(n.skin, gltf.skins) : -1; // the glTF skin, until loadSkins()
         if (n.has_matrix) {
             glm::vec3 skew;
             glm::vec4 perspective;
@@ -425,6 +466,62 @@ struct Loader {
                 out.nodes.push_back(node);
             }
         }
+    }
+
+    void loadSkins()
+    {
+        std::vector<int> skinIndex(gltf.skins_count, -1); // glTF skin -> index in out.skins
+        for (cgltf_size s = 0; s < gltf.skins_count; ++s) {
+            const cgltf_skin& skin = gltf.skins[s];
+            ModelSkin ms;
+            ms.name = nameOr(skin.name, "skin", s);
+            bool ok = skin.joints_count > 0;
+            for (cgltf_size j = 0; j < skin.joints_count && ok; ++j) {
+                const auto found = nodeIndex.find(skin.joints[j]);
+                ok = found != nodeIndex.end();
+                if (ok)
+                    ms.joints.push_back(found->second);
+            }
+            ms.inverseBind.assign(ms.joints.size(), glm::mat4(1.0f)); // glTF's default
+            if (ok && skin.inverse_bind_matrices) {
+                ok = skin.inverse_bind_matrices->count >= skin.joints_count;
+                for (size_t j = 0; j < ms.joints.size() && ok; ++j)
+                    ok = cgltf_accessor_read_float(skin.inverse_bind_matrices, j, &ms.inverseBind[j][0][0], 16);
+            }
+            if (!ok) {
+                warn("Skin '" + ms.name + "' can't be used (its bones are outside the scene, or unreadable); "
+                     "its mesh is drawn unbent");
+                continue;
+            }
+            skinIndex[s] = int(out.skins.size());
+            out.skins.push_back(std::move(ms));
+        }
+
+        for (ModelNode& node : out.nodes) {
+            if (node.skin < 0)
+                continue;
+            node.skin = skinIndex[size_t(node.skin)];
+            if (node.skin < 0)
+                continue;
+            // Every part of the mesh must have joints within this skin's list.
+            const size_t jointCount = out.skins[size_t(node.skin)].joints.size();
+            bool usable = true;
+            for (const ModelPrimitive& prim : out.meshes[size_t(node.mesh)].primitives) {
+                usable = usable && prim.skinned;
+                for (uint32_t i = prim.firstIndex; usable && i < prim.firstIndex + prim.indexCount; ++i) {
+                    const SkinVertex& v = out.skinVertices[size_t(prim.vertexOffset) + out.indices[i]];
+                    for (int k = 0; k < 4; ++k)
+                        usable = usable && (v.weights[k] == 0.0f || v.joints[k] < jointCount);
+                }
+            }
+            if (!usable) {
+                warn("Node '" + node.name + "': its mesh doesn't match its skin (missing or wrong joints); "
+                     "drawn unbent");
+                node.skin = -1;
+            }
+        }
+        if (!out.skinVertices.empty())
+            out.skinVertices.resize(out.vertices.size()); // one per vertex, unskinned ones too
     }
 
     void loadAnimations()
@@ -495,6 +592,29 @@ struct Loader {
         for (size_t i = 0; i < out.nodes.size(); ++i) {
             const ModelNode& n = out.nodes[i];
             world[i] = (n.parent < 0 ? glm::mat4(1.0f) : world[size_t(n.parent)]) * n.transform.matrix();
+        }
+        for (size_t i = 0; i < out.nodes.size(); ++i) {
+            const ModelNode& n = out.nodes[i];
+            if (n.mesh >= 0 && n.skin >= 0) {
+                // Bend every vertex into the default pose, as the GPU will.
+                const ModelSkin& skin = out.skins[size_t(n.skin)];
+                std::vector<glm::mat4> joints(skin.joints.size());
+                for (size_t j = 0; j < joints.size(); ++j)
+                    joints[j] = world[size_t(skin.joints[j])] * skin.inverseBind[j];
+                for (const ModelPrimitive& p : out.meshes[size_t(n.mesh)].primitives)
+                    for (uint32_t k = p.firstIndex; k < p.firstIndex + p.indexCount; ++k) {
+                        const size_t v = size_t(p.vertexOffset) + out.indices[k];
+                        const SkinVertex& sv = out.skinVertices[v];
+                        glm::mat4 m(0.0f);
+                        for (int c = 0; c < 4; ++c)
+                            if (sv.weights[c] > 0.0f)
+                                m += joints[sv.joints[c]] * sv.weights[c];
+                        const glm::vec3 w = glm::vec3(m * glm::vec4(out.vertices[v].position, 1.0f));
+                        lo = glm::min(lo, w);
+                        hi = glm::max(hi, w);
+                    }
+                continue;
+            }
             if (n.mesh < 0)
                 continue;
             for (const ModelPrimitive& p : out.meshes[size_t(n.mesh)].primitives)
@@ -559,6 +679,7 @@ bool loadModelData(const std::string& path, ModelData& out, std::string* error)
     loader.loadMaterials();
     loader.loadMeshes();
     loader.loadNodes();
+    loader.loadSkins();
     loader.loadAnimations();
     loader.computeBounds();
     if (out.indices.empty())
@@ -666,6 +787,10 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
     geometry.vertices = data.vertices;
     geometry.indices = data.indices;
     m.geometry_ = Mesh(gpu, geometry, debugName.c_str());
+    if (!data.skinVertices.empty())
+        m.skinVertices_ = gfx::Buffer::createWithData(gpu, data.skinVertices.data(),
+                                                      data.skinVertices.size() * sizeof(SkinVertex),
+                                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, (debugName + " joints").c_str());
 
     for (const ModelTexture& t : data.textures) {
         const ModelImage* img = t.image >= 0 ? &data.images[size_t(t.image)] : nullptr;
@@ -685,6 +810,7 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
     m.materials_ = data.materials;
     m.meshes_ = data.meshes;
     m.nodes_ = data.nodes;
+    m.skins_ = data.skins;
     m.animations_ = data.animations;
     m.boundsMin_ = data.boundsMin;
     m.boundsMax_ = data.boundsMax;
@@ -750,6 +876,14 @@ void Model::nodeMatrices(const glm::mat4& transform, const ModelPose* pose, std:
         const int parent = nodes_[i].parent;
         out[i] = (parent < 0 ? transform : out[size_t(parent)]) * t.matrix();
     }
+}
+
+void Model::jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, std::vector<glm::mat4>& out) const
+{
+    const ModelSkin& s = skins_[size_t(skin)];
+    out.resize(s.joints.size());
+    for (size_t j = 0; j < s.joints.size(); ++j)
+        out[j] = nodeMatrices[size_t(s.joints[j])] * s.inverseBind[j];
 }
 
 } // namespace render3d

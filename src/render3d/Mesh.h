@@ -37,11 +37,14 @@ public:
     Mesh() = default;
     Mesh(gfx::VulkanContext& ctx, const MeshData& data, const char* debugName = nullptr);
 
-    // Binds the buffers and issues one indexed draw.
-    void draw(VkCommandBuffer cmd) const;
+    // Binds the buffers and issues one indexed draw. instanceCount > 1 draws that many
+    // copies at once (instancing), numbered from firstInstance in the vertex shader's
+    // gl_InstanceIndex.
+    void draw(VkCommandBuffer cmd, uint32_t instanceCount = 1, uint32_t firstInstance = 0) const;
     // For drawing parts of the buffers (a Model's pieces): bind once, then draw ranges.
     void bind(VkCommandBuffer cmd) const;
-    void drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset) const;
+    void drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset,
+                   uint32_t instanceCount = 1, uint32_t firstInstance = 0) const;
 
     uint32_t indexCount() const { return indexCount_; }
     bool valid() const { return vertices_.valid(); }

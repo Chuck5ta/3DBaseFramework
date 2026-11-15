@@ -26,12 +26,18 @@
 //   const glm::mat4 at = soldier_.nodeMatrix(hand, transform, &animator_.pose());
 //   meshes.draw(rifle_, at);
 //
+// Skinned meshes (Blender: a mesh with an Armature modifier) bend instead of moving in
+// one piece: each vertex follows up to four bones (joints), weighted, so an elbow or knee
+// bends smoothly. The bones are nodes like any other, so animations, poses and sockets
+// work the same way, and MeshRenderer bends the mesh on the GPU as it draws it.
+//
 // Units are metres and +Y is up. A model's front faces +Z (Blender's -Y after export).
 
 #include "gfx/Texture.h"
 #include "render3d/Mesh.h"
 
 #include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/type_precision.hpp>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
@@ -86,12 +92,29 @@ struct ModelPrimitive {
     uint32_t indexCount = 0;
     int32_t vertexOffset = 0;
     int material = -1; // -1 = plain white
-    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f};
+    bool skinned = false; // has joints and weights (in ModelData::skinVertices)
+    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // before any skinning
 };
 
 struct ModelMesh {
     std::string name;
     std::vector<ModelPrimitive> primitives;
+};
+
+// Which joints move a vertex of a skinned mesh, and how much (glTF JOINTS_0 / WEIGHTS_0).
+// One per vertex in ModelData::vertices, kept in a second vertex buffer.
+struct SkinVertex {
+    glm::u16vec4 joints{0};  // indices into the node's ModelSkin::joints
+    glm::vec4 weights{0.0f}; // add up to 1; 0 = unused
+};
+
+// A skin (Blender: an armature) bends the mesh of the node that uses it. Its joints are
+// nodes (Blender: bones). inverseBind takes a vertex from the mesh into each joint's own
+// frame as it was when the mesh was made (the bind pose): it then moves with that joint.
+struct ModelSkin {
+    std::string name;
+    std::vector<int> joints;            // node indices
+    std::vector<glm::mat4> inverseBind; // one per joint
 };
 
 // A node's transform relative to its parent.
@@ -106,6 +129,7 @@ struct ModelNode {
     std::string name;
     int parent = -1; // always lower than this node's index
     int mesh = -1;   // -1 = an empty (a pivot or group)
+    int skin = -1;   // >= 0: the mesh is bent by this skin (and the node's own transform is ignored)
     NodeTransform transform;
 };
 
@@ -142,12 +166,14 @@ struct ModelAnimation {
 // and tests (no GPU needed).
 struct ModelData {
     std::vector<Vertex> vertices;
+    std::vector<SkinVertex> skinVertices; // empty, or one per vertex if anything is skinned
     std::vector<uint32_t> indices;
     std::vector<ModelMesh> meshes;
     std::vector<ModelMaterial> materials;
     std::vector<ModelImage> images;
     std::vector<ModelTexture> textures;
     std::vector<ModelNode> nodes;       // parents before children
+    std::vector<ModelSkin> skins;
     std::vector<ModelAnimation> animations;
     glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // of the whole model, in its default pose
     std::vector<std::string> warnings;  // things that were skipped (also logged)
@@ -196,6 +222,7 @@ public:
 
     const std::vector<ModelMaterial>& materials() const { return materials_; }
     const std::vector<ModelMesh>& meshes() const { return meshes_; }
+    const std::vector<ModelSkin>& skins() const { return skins_; }
 
     // The model's size in its default pose (metres): for placing it on the ground,
     // scaling it to fit, or collision.
@@ -213,13 +240,21 @@ public:
     glm::mat4 nodeMatrix(int node, const glm::mat4& transform, const ModelPose* pose = nullptr) const;
     // World matrix of every node for a pose (nullptr = default pose).
     void nodeMatrices(const glm::mat4& transform, const ModelPose* pose, std::vector<glm::mat4>& out) const;
+    // The joint vertex data (an invalid buffer if nothing is skinned).
+    const gfx::Buffer& skinVertices() const { return skinVertices_; }
+    // For each joint of a skin: the matrix taking a bind-pose vertex to where that joint
+    // has moved it, in model space, given the node matrices from nodeMatrices() with an
+    // identity transform.
+    void jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, std::vector<glm::mat4>& out) const;
 
 private:
     Mesh geometry_;
+    gfx::Buffer skinVertices_;
     std::vector<gfx::Texture> textures_;
     std::vector<ModelMaterial> materials_;
     std::vector<ModelMesh> meshes_;
     std::vector<ModelNode> nodes_;
+    std::vector<ModelSkin> skins_;
     std::vector<ModelAnimation> animations_;
     glm::vec3 boundsMin_{0.0f}, boundsMax_{0.0f};
     std::string name_;

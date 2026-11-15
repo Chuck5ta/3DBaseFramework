@@ -13,6 +13,7 @@
 #include <glm/vec4.hpp>
 
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace render3d {
@@ -75,6 +76,21 @@ struct SceneLighting {
 // Skip the shadow pass (or set lighting.shadows.enabled = false) and the scene is simply
 // drawn without shadows.
 //
+// Skinned models bend on the GPU: draw(model, ...) works out each joint's matrix for the
+// pose, appends them to this frame's joint buffer (set 0, binding 2), and draws the mesh
+// with a vertex shader that blends the matrices of each vertex's joints.
+//
+// Many copies of the same thing (trees, rocks, crates) are quicker drawn together: one
+// draw call per part instead of one per copy, however many copies there are.
+//
+//   std::vector<glm::mat4> trees = ...;          // one matrix per tree
+//   meshes.drawInstanced(treeModel, trees);      // all of them, in one draw per part
+//   meshes.drawInstanced(cube, crates, {&crateTexture});
+//
+// The matrices go into this frame's instance buffer (set 0, binding 3); the vertex shader
+// picks each copy's matrix by its gl_InstanceIndex. Every copy shares the material and
+// the pose, and every copy is drawn, on screen or not.
+//
 // Per-frame data (camera, lights) lives in a uniform buffer (set 0); the base colour and
 // emission textures are set 1; the model matrix and material values are push constants.
 // Opaque and alpha-masked parts are drawn straight away; see-through (Blend) parts are
@@ -85,7 +101,12 @@ class MeshRenderer {
 public:
     // shadowMapSize: the shadow map's width and height in texels. Bigger is sharper and
     // slower; 2048 (16 MB) suits a few dozen metres around the camera.
-    MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize = 2048);
+    // maxJoints: how many joint matrices a frame can hold, shadow pass included (each
+    // skinned model drawn uses one per bone, twice with shadows). 8192 is 512 KB per frame.
+    // maxInstances: how many instance matrices a frame can hold, shadow pass included (each
+    // drawInstanced uses one per copy, twice with shadows). 16384 is 1 MB per frame.
+    MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize = 2048,
+                 uint32_t maxJoints = 8192, uint32_t maxInstances = 16384);
     ~MeshRenderer();
 
     // The shadow pass: call before the main pass begins (onPreRender), with the camera
@@ -96,6 +117,10 @@ public:
     void begin(const gfx::FrameContext& frame, const Camera3D& camera, const SceneLighting& lighting);
     void draw(const Mesh& mesh, const glm::mat4& model, const Material& material = {});
     void draw(const Model& model, const glm::mat4& transform, const ModelPose* pose = nullptr);
+    // Instancing: a copy for each matrix, all with the same material (or, for a Model, the
+    // same pose), in one draw call per part. A std::vector<glm::mat4> or array works here.
+    void drawInstanced(const Mesh& mesh, std::span<const glm::mat4> models, const Material& material = {});
+    void drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose = nullptr);
     void end();
 
     void setWireframe(bool enabled) { wireframe_ = enabled && wireframePipeline_.valid(); }
@@ -104,6 +129,12 @@ public:
 
     uint32_t drawCalls() const { return drawCalls_; }
     uint32_t shadowDrawCalls() const { return shadowDrawCalls_; }
+    // Joint matrices used so far this frame (both passes), and how many fit.
+    uint32_t jointsUsed() const { return jointsUsed_; }
+    uint32_t maxJoints() const { return maxJoints_; }
+    // The same for instance matrices (entry 0 is kept for single copies, so this starts at 1).
+    uint32_t instancesUsed() const { return instancesUsed_; }
+    uint32_t maxInstances() const { return maxInstances_; }
     uint32_t shadowMapSize() const { return shadowMap_.extent().width; }
     // How much ground one shadow-map texel covers, in metres, at the last beginShadows.
     float shadowTexelSize() const { return shadowTexel_; }
@@ -116,6 +147,9 @@ private:
     gfx::Pipeline pipeline_;
     gfx::Pipeline blendPipeline_;     // see-through parts: blended, no depth writes
     gfx::Pipeline wireframePipeline_;
+    // The same four for skinned meshes: a vertex shader that bends them, and their joint
+    // data in a second vertex buffer.
+    gfx::Pipeline skinnedPipeline_, skinnedBlendPipeline_, skinnedWireframePipeline_, skinnedShadowPipeline_;
     gfx::Texture white_;
 
     // Shadows: a depth image the sun "sees", and a sampler that compares against it.
@@ -135,19 +169,43 @@ private:
     void fitShadowMap(const Camera3D& camera, const SceneLighting& lighting);
     void bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission);
     void setCulling(bool doubleSided, bool mirrored);
-    void drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix);
+    // Which copies a draw makes: `count` matrices from `first` in the instance buffer, the
+    // last `mirrored` of them mirrored (a negative scale, so drawn with the other winding).
+    // The default is entry 0, the identity: a single copy placed by the push constants.
+    struct Instances {
+        uint32_t first = 0;
+        uint32_t count = 1;
+        uint32_t mirrored = 0;
+    };
+    bool uploadInstances(std::span<const glm::mat4> matrices, Instances& out); // false if out of room
+    // Draws a whole mesh (prim == nullptr) or one primitive of `geometry`, once per group
+    // of copies that wind their triangles the same way.
+    void drawCopies(const Mesh& geometry, const ModelPrimitive* prim, const Instances& copies, bool doubleSided,
+                    bool mirrored);
+    void drawMesh(const Mesh& mesh, const glm::mat4& model, const Material& material, const Instances& copies);
+    // firstJoint: where its joint matrices start in the joint buffer; -1 = not skinned.
+    void drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix, int firstJoint,
+                       const Instances& copies);
+    void usePipeline(bool skinned);
+    int uploadJoints(const Model& model, int skin); // returns the first joint's index, or -1
 
     struct BlendedDraw {
         const Model* model;
         const ModelPrimitive* primitive;
         glm::mat4 matrix;
         float distance;
+        int firstJoint;
     };
     std::vector<BlendedDraw> blended_;
     std::vector<glm::mat4> nodeMatrices_; // scratch
+    std::vector<glm::mat4> modelSpace_;   // scratch: node matrices without the transform
+    std::vector<glm::mat4> joints_;       // scratch
+    std::vector<glm::mat4> instances_;    // scratch: matrices sorted, the mirrored ones last
 
     struct PerFrame {
         gfx::Buffer uniforms;
+        gfx::Buffer joints;    // joint matrices of the skinned models drawn this frame
+        gfx::Buffer instances; // matrices of the copies drawn by drawInstanced; [0] = identity
         VkDescriptorSet set = VK_NULL_HANDLE;
         // Texture pairs used this frame, each with its set. Rebuilt every frame (the pool
         // is reset when the frame comes round again), so no set outlives its textures.
@@ -163,7 +221,16 @@ private:
     std::vector<PerFrame> frames_;
 
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    const gfx::Pipeline* active_ = nullptr;
+    const gfx::Pipeline* active_ = nullptr;        // for this pass: rigid meshes...
+    const gfx::Pipeline* activeSkinned_ = nullptr; // ...and skinned ones
+    const gfx::Pipeline* bound_ = nullptr;
+    const gfx::Buffer* boundSkin_ = nullptr;
+    uint32_t maxJoints_ = 0;
+    uint32_t jointsUsed_ = 0;
+    bool warnedJoints_ = false;
+    uint32_t maxInstances_ = 0;
+    uint32_t instancesUsed_ = 1;
+    bool warnedInstances_ = false;
     VkDescriptorSet boundTexture_ = VK_NULL_HANDLE;
     const Mesh* boundGeometry_ = nullptr;
     VkCullModeFlags cullMode_ = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;

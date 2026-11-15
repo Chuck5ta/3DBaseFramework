@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 class DemoGame : public core::Game {
 public:
@@ -57,12 +58,21 @@ private:
     CameraMode cameraMode_ = CameraMode::ThirdPerson;
     render3d::ThirdPersonCamera follow_;
 
-    // The player: a second soldier (the gunner's model, with his own animator) who walks
-    // and runs where you steer him in third person.
+    // The player: a second soldier, with his own animator, who walks and runs where you
+    // steer him in third person. His model is skinned: one mesh that bends at the joints.
     glm::vec3 playerPos_{2.0f, 0.0f, 10.0f}; // his feet
     float playerYaw_ = glm::pi<float>();      // which way he faces (pi = along -Z)
     float playerSpeed_ = 0.0f;                // metres per second, eased
     render3d::ModelAnimator playerAnim_;
+    render3d::Model soldier_;
+    int soldierSocket_ = -1; // node in soldier_: where his rifle goes
+
+    // A forest around the scene: one tree model, drawn many times with instancing (all the
+    // copies in one draw call per part). One matrix per tree, made once in onInit.
+    render3d::Model tree_;
+    std::vector<glm::mat4> trees_;
+    int treesShown_ = 0;         // how many to draw (the debug UI's slider)
+    bool instanceTrees_ = true;  // false: one draw() per tree, to compare
 
     // 2D overlay for the HUD, drawn on top of the 3D scene.
     std::unique_ptr<render2d::SpriteBatch> hud_;

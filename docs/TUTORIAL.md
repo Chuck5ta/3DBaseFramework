@@ -8,8 +8,9 @@ every step you can build and run the game and see the result.
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
 3D sound with Doppler, audio effects, a debug UI, 3D models from Blender (glTF), animated,
-a third-person camera that follows a walking character and keeps out of walls, and
-shadows from the sun.
+a third-person camera that follows a walking character and keeps out of walls,
+shadows from the sun, a skinned character that bends at the joints, and a forest drawn
+with instancing.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
@@ -31,6 +32,8 @@ background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECT
 | [13](#step-13--an-animated-gunner) | Animations from Blender, sockets | A soldier who follows the drone, fires (**F**) and reloads (**L**) |
 | [14](#step-14--a-third-person-camera) | `ThirdPersonCamera`, ray tests, a player character | Walk and run a second soldier; the camera follows him and won't go through crates; **C** switches cameras |
 | [15](#step-15--shadows-from-the-sun) | A shadow pass in `onPreRender`, `drawScene` | Everything casts shadows on the ground and on each other; **G** switches them off |
+| [16](#step-16--a-skinned-soldier) | A skinned model (one mesh bent by its bones) | The player's elbows and knees bend smoothly; the gunner keeps his rigid parts |
+| [17](#step-17--a-forest-instancing) | Instancing: many copies in one draw call | A forest of 800 trees around the scene, in two draw calls |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -574,8 +577,8 @@ Things to notice:
   material colour is used as-is.
 - The renderer skips re-binding the texture when consecutive draws use the same one, so
   drawing all crates together is slightly cheaper than interleaving them with spheres.
-- 20 objects is nothing for the GPU. For thousands of objects you would add *instancing*
-  (one draw for many copies); see "Where to go next".
+- 20 objects is nothing for the GPU. For thousands of objects you would use *instancing*
+  (one draw for many copies); Step 17 does that for the ring and a whole forest.
 
 **Run it:** the full demo scene: a spinning crate, a slowly turning ring of crates, and
 six bobbing spheres with specular highlights.
@@ -1631,9 +1634,9 @@ and leave *Animation > Mode* on **Actions** (the default) so each Action becomes
 animation with its name. Don't use *NLA Tracks*: tested with Blender 5.2, it mixed the
 other tracks into each animation and moved the rest pose. Blender exports whole frames,
 so keys between frames are rounded (frame 1 is 1/24 s at 24 fps, unless you tick *Set
-All glTF Animation Starting at 0*). Use Linear keyframes for loops. Skinned meshes
-(vertices bent by several bones with *Automatic Weights*) aren't supported yet: they
-load in their rest pose with a warning.
+All glTF Animation Starting at 0*). Use Linear keyframes for loops. For a body that
+bends at the joints instead of rigid parts (parented *With Automatic Weights*), see Step
+16.
 
 **Run it:** the gunner stands on the left, turning to follow the drone, breathing and
 glancing around. Press **F** to fire (watch the recoil and the muzzle flash), five
@@ -2278,14 +2281,324 @@ Things to notice:
   fences) cut their holes out of the shadow too.
 - **The cost.** The scene is drawn twice: 72 draw calls on screen and 71 for the shadows
   in this scene. Drawing depth only is cheap, but with thousands of objects you'd skip
-  those too far from the camera, or use instancing (Where to go next).
+  those too far from the camera, or use instancing (Step 17).
 
-**Try it:** in the debug UI, drag *Sun direction* down towards the horizon for long evening shadows. Change *Softness* from 0 (hard, pixelated edges) to 3,
-and *Distance* to 100 m: the shadows reach further but get blurrier.
+**Try it:** in the debug UI, drag *Sun direction* down towards the horizon for long
+evening shadows. Change *Softness* from 0 (hard, pixelated edges) to 3, and *Distance* to
+100 m: the shadows reach further but get blurrier.
 
 **Run it:** the crates, spheres and soldiers cast shadows on the ground and on each other,
 and the drone's shadow sweeps across the scene below it.
 **G** switches them off and on.
+
+---
+
+## Step 16 — A skinned soldier
+
+Look closely at either soldier as he walks: each arm and leg is a separate box, turning
+about its joint, and at the elbows and knees the boxes pass through each other. That's
+fine for a robot or a toy. A person needs **skinning**: the body is one mesh, and where it
+bends, its vertices follow both bones a little, so the elbow or knee bends smoothly.
+
+How a skinned mesh works:
+
+- **Bones (joints)** are nodes, exactly like the gunner's parts: `Hips`, `Thigh_L`,
+  `Forearm_R`... The animations turn them, the same as before.
+- **Weights.** Every vertex names up to four joints and how much each moves it. A vertex
+  halfway along the forearm follows `Forearm_L` alone; one at the elbow follows
+  `UpperArm_L` and `Forearm_L` half each.
+- **The bind pose.** The mesh is modelled in one pose (standing straight, arms hanging).
+  For each joint the file stores an *inverse bind matrix*: it takes a vertex into that
+  joint's frame as it was then. Multiply by where the joint is now, and the vertex moves
+  with the joint.
+- **On the GPU.** Each frame `MeshRenderer` works out one matrix per joint and puts them
+  in a buffer. The vertex shader (`mesh_skinned.vert`) blends the four matrices of each
+  vertex by its weights and moves the vertex with the result.
+
+`assets/models/soldier.glb` is the gunner remade like that, by the same script
+(`tools/make_gunner.py`): the same bones with the same names, the same animations, and
+one mesh, `Body`, whose limbs are smooth tubes. Because the bones are ordinary nodes,
+everything you've used works unchanged: `ModelAnimator`, `ModelPose`, and the socket the
+rifle hangs from. So swapping the player's model takes only a few lines.
+
+In **`MyGame.h`**, replace the player's members with these, which add his own model and
+its socket:
+
+```cpp
+    // The player: a second soldier, with his own animator, who walks and runs where you
+    // steer him in third person. His model is skinned: one mesh that bends at the joints.
+    glm::vec3 playerPos_{2.0f, 0.0f, 10.0f}; // his feet
+    float playerYaw_ = glm::pi<float>();      // which way he faces (pi = along -Z)
+    float playerSpeed_ = 0.0f;                // metres per second, eased
+    render3d::ModelAnimator playerAnim_;
+    render3d::Model soldier_;
+    int soldierSocket_ = -1; // node in soldier_: where his rifle goes
+```
+
+In **`MyGame.cpp`**'s `onInit`, load it where the player's animator starts:
+
+```cpp
+    // The player: the soldier again, skinned (soldier.glb: the same bones and animations,
+    // one mesh that bends), with his own animator (and so his own pose).
+    soldier_ = render3d::Model::load(app.gpu(), core::assetPath("models/soldier.glb"));
+    soldierSocket_ = soldier_.findNode("Socket_Hand_R");
+    playerAnim_.play(soldier_, "Idle");
+```
+
+At the end of `updatePlayer`, play his animations on the new model (`soldier_` instead of
+`gunner_`, three times):
+
+```cpp
+    if (playerSpeed_ < 0.2f) {
+        playerAnim_.play(soldier_, "Idle");
+        playerAnim_.speed = 1.0f;
+    } else if (playerSpeed_ < (kWalkSpeed + kRunSpeed) * 0.5f) {
+        playerAnim_.play(soldier_, "Walk");
+        playerAnim_.speed = playerSpeed_ / kWalkAnimSpeed;
+    } else {
+        playerAnim_.play(soldier_, "Run");
+        playerAnim_.speed = playerSpeed_ / kRunAnimSpeed;
+    }
+    playerAnim_.update(dt);
+```
+
+In `drawScene`, draw him, and the rifle at the new model's socket:
+
+```cpp
+    // The player: the skinned soldier and the rifle, in his own pose.
+    const glm::mat4 p = playerTransform();
+    meshRenderer_->draw(soldier_, p, &playerAnim_.pose());
+    meshRenderer_->draw(rifle_, soldier_.nodeMatrix(soldierSocket_, p, &playerAnim_.pose()));
+```
+
+Finally, in `onDebugUI`, after the draw calls, show how many joint matrices the frame uses:
+
+```cpp
+    ImGui::Text("Joint matrices: %u of %u", meshRenderer_->jointsUsed(), meshRenderer_->maxJoints());
+```
+
+Things to notice:
+
+- **Nothing else changes.** `draw(soldier_, p, &playerAnim_.pose())` is the same call as
+  before. The renderer sees that the model has a skin and draws it with the skinned
+  shaders, in the shadow pass as well, so his shadow bends too.
+- **The node transform is ignored.** A skinned mesh is placed only by its joints (and the
+  transform you draw it with), as glTF specifies, wherever its own node sits.
+- **Fewer draw calls.** The gunner is 19 parts, each a draw call; the skinned soldier is 5
+  (one per material). The HUD now shows 58 draw calls instead of 72. Each skinned model
+  drawn adds one matrix per joint to the frame (14 for the soldier, twice with shadows):
+  the debug UI shows 28 of 8192. `MeshRenderer`'s constructor takes a bigger number
+  if a crowd needs more.
+- **Your own characters.** In Blender: model the body, add an Armature, select the mesh
+  then the armature and parent with **Ctrl+P > With Automatic Weights**, fix the weights in
+  Weight Paint mode, and make each animation an Action. Export as glTF 2.0 with
+  *Data > Skinning* ticked and *Include All Bone Influences* unticked (4 per vertex). Apply
+  the scale (Ctrl+A) first, so 1 unit is 1 metre.
+
+**Try it:** press **F1** for wireframe and compare the two soldiers: the gunner's boxes
+against the player's tubes. Walk and run (third person, **W** and **Shift**) and watch his
+knees bend.
+
+**Run it:** the player is now one bending mesh, the gunner still rigid parts beside him.
+Both play the same animations, hold the same rifle and cast shadows.
+
+---
+
+## Step 17 — A forest (instancing)
+
+The scene stands on an empty plain. Let's plant a forest around it: 800 trees. Drawing each
+one with `draw()` would work, but every draw call costs the CPU time: it sets up the
+material, pushes the matrix and tells the GPU what to draw. The tree has two parts (trunk
+and branches), so 800 trees are 1600 draw calls, and the shadow pass doubles that. The GPU
+could draw all those triangles easily; asking for them one copy at a time is what makes
+the CPU the bottleneck.
+
+**Instancing** asks for all the copies at once:
+
+- **One matrix per copy.** You give `drawInstanced` a list of matrices. `MeshRenderer`
+  copies them into this frame's *instance buffer*, a GPU buffer like the joint buffer of
+  Step 16.
+- **One draw call per part.** Each part of the model is drawn once, with an instance count
+  of 800. The GPU runs the vertex shader for every vertex of every copy and numbers the
+  copies in `gl_InstanceIndex`; the shader (`instance.glsl`) reads that copy's matrix from
+  the buffer.
+- **What they share.** The copies share the mesh and the material (and, for an animated
+  model, the pose). Turn, move and scale each copy as you like: that's all in its matrix.
+- **Nothing changes for `draw()`.** A single copy uses entry 0 of the buffer, which always
+  holds the identity matrix, so the same shaders draw both.
+
+`assets/models/tree.glb` is a low-poly pine, made by `tools/make_tree.py` like the other
+models: one node with two parts, `Bark` and `Needles`, 148 triangles.
+
+In **`MyGame.h`**, add `#include <vector>` after `#include <string>`:
+
+```cpp
+#include <vector>
+```
+
+and these members after `soldierSocket_`:
+
+```cpp
+    // A forest around the scene: one tree model, drawn many times with instancing (all the
+    // copies in one draw call per part). One matrix per tree, made once in onInit.
+    render3d::Model tree_;
+    std::vector<glm::mat4> trees_;
+    int treesShown_ = 0;         // how many to draw (the debug UI's slider)
+    bool instanceTrees_ = true;  // false: one draw() per tree, to compare
+```
+
+In **`MyGame.cpp`**, add two headers around `<cstdio>` (`<span>` is the standard
+library's view of a run of values: a vector, an array, or part of one):
+
+```cpp
+#include <cstdint>
+#include <cstdio>
+#include <span>
+```
+
+After `kPlayerRadius` in the anonymous namespace, add the forest's size, a small random
+number generator, and two boxes for the camera's collisions:
+
+```cpp
+// The forest: trees scattered between these distances from the centre.
+constexpr int kTrees = 800;
+constexpr float kForestInner = 22.0f, kForestOuter = 90.0f;
+
+// A tiny random number generator (xorshift): the same forest every run, on every compiler
+// (std::uniform_real_distribution may give different numbers on MSVC and GCC).
+float random01(uint32_t& state)
+{
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return float(state >> 8) / float(1u << 24); // 0 .. 1
+}
+
+// Boxes around a tree's trunk and crown, for the camera's ray tests, before the tree's own
+// matrix places them (tree.glb: the trunk is 0.28 m wide and 1.4 m tall; the crown is
+// up to 2.7 m across, from 0.9 m up to 4.2 m: the box is narrower, around its thick part).
+const glm::mat4 kTrunkBox = glm::scale(glm::translate(glm::mat4(1.0f), {0.0f, 0.7f, 0.0f}), {0.28f, 1.4f, 0.28f});
+const glm::mat4 kCrownBox = glm::scale(glm::translate(glm::mat4(1.0f), {0.0f, 2.4f, 0.0f}), {1.6f, 3.0f, 1.6f});
+```
+
+In `onInit`, after the player's `playerAnim_.play(...)`, load the tree and make a matrix
+for each copy:
+
+```cpp
+    // The forest: one model, and a matrix for each copy, each turned and sized a little
+    // differently so they don't look stamped out.
+    tree_ = render3d::Model::load(app.gpu(), core::assetPath("models/tree.glb"));
+    uint32_t seed = 12345;
+    for (int i = 0; i < kTrees; ++i) {
+        const float angle = random01(seed) * glm::two_pi<float>();
+        // Picking the squared distance spreads them evenly over the ring's area, rather than
+        // crowding them at its inner edge.
+        const float r = std::sqrt(glm::mix(kForestInner * kForestInner, kForestOuter * kForestOuter, random01(seed)));
+        const glm::vec3 position(std::cos(angle) * r, 0.0f, std::sin(angle) * r);
+        const float size = glm::mix(0.8f, 1.3f, random01(seed));
+        const float height = glm::mix(0.9f, 1.25f, random01(seed));
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), position);
+        m = glm::rotate(m, random01(seed) * glm::two_pi<float>(), glm::vec3(0, 1, 0));
+        trees_.push_back(glm::scale(m, glm::vec3(size, size * height, size)));
+    }
+    treesShown_ = kTrees;
+```
+
+In `drawScene`, replace the crates (the big crate and the ring's loop) with this. The ring
+of crates becomes one instanced draw too: `drawInstanced` takes the mesh, the matrices (an
+array works as well as a vector) and the material:
+
+```cpp
+    // Centrepiece: a big crate, and a ring of crates around it, all twelve in one draw call
+    // (instancing: the same mesh and material, a matrix for each copy).
+    meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
+    glm::mat4 ring[kRing];
+    for (int i = 0; i < kRing; ++i)
+        ring[i] = ringCrateMatrix(i, spin);
+    meshRenderer_->drawInstanced(cube_, ring, {&crateTexture_});
+
+    // The forest: hundreds of trees, one draw call for the trunks and one for the crowns.
+    const std::span<const glm::mat4> trees(trees_.data(), size_t(treesShown_));
+    if (instanceTrees_) {
+        meshRenderer_->drawInstanced(tree_, trees);
+    } else {
+        for (const glm::mat4& tree : trees)
+            meshRenderer_->draw(tree_, tree);
+    }
+```
+
+That's enough to see the forest. Two more pieces make it solid. In `updatePlayer`, after
+the gunner's `pushOut`, keep the player out of the trunks:
+
+```cpp
+    for (const glm::mat4& tree : trees_) { // the trunks (their x scale is the tree's size)
+        const glm::vec3 c(tree[3]);
+        pushOut({c.x, c.z}, 0.14f * glm::length(glm::vec3(tree[0])));
+    }
+```
+
+and in `raycastScene`, before `return nearest;`, let the trees stop the camera:
+
+```cpp
+    // Trees: a box for the trunk and one for the crown, but only for those near the ray's
+    // start (the camera never looks far past the player).
+    for (const glm::mat4& tree : trees_) {
+        if (glm::distance(glm::vec3(tree[3]), ray.origin) < 15.0f) {
+            consider(raycastBox(ray, tree * kTrunkBox));
+            consider(raycastBox(ray, tree * kCrownBox));
+        }
+    }
+```
+
+Finally, in `onDebugUI`, show how full the instance buffer is, after the joint matrices:
+
+```cpp
+    ImGui::Text("Instance matrices: %u of %u", meshRenderer_->instancesUsed(), meshRenderer_->maxInstances());
+```
+
+and add a section to compare drawing with and without instancing, before the
+`"Lighting"` section:
+
+```cpp
+    if (ImGui::CollapsingHeader("Forest")) {
+        ImGui::SliderInt("Trees", &treesShown_, 0, int(trees_.size()));
+        ImGui::Checkbox("Instancing", &instanceTrees_); // off: watch the draw calls go up
+    }
+```
+
+Things to notice:
+
+- **Draw calls.** The HUD shows 49 draw calls (+48 for shadows), fewer than before the
+  forest: the twelve ring crates are one call now (11 fewer) and 800 trees are two. Untick
+  **Instancing** in the debug UI's *Forest* section and they jump to 1647 (+1646), drawing
+  exactly the same picture. Watch the frame rate as you do: on a laptop or a Steam Deck the
+  difference is easy to see (turn vsync off with **V** to measure it).
+- **The instance buffer.** Each `drawInstanced` uses one entry per copy, in each pass:
+  1625 of 16384 here (812 copies, twice, plus entry 0). `MeshRenderer`'s constructor takes a
+  bigger number if you need more; if a frame runs out, the calls that don't fit are skipped
+  with a warning in the log.
+- **Mirrored copies** (a negative scale) are fine: their triangles wind the other way, so
+  `drawInstanced` sorts them to the end and draws them as a second group with the other
+  winding.
+- **See-through parts** can't be drawn in one go: each copy has to be sorted by distance
+  against everything else see-through. `drawInstanced` queues them one copy at a time, as
+  `draw()` would.
+- **Every copy is drawn**, on screen or not, in both passes. For 800 trees that's nothing
+  for a GPU. For tens of thousands, skip the copies the camera can't see before calling
+  `drawInstanced` (see *Where to go next*).
+- **Collisions are your code.** The renderer only draws. The player's `pushOut` and the
+  camera's ray tests use the same matrices, so what you see is what stops you. They check
+  all 800 trees (or those near the camera), which is quick; for many more, a grid that
+  finds the trees near a point is the next step.
+- **Random, but the same every time.** `random01` gives the same forest on every run and
+  every compiler. Change the seed (`12345`) for a different one.
+
+**Try it:** in the debug UI, drag the *Trees* slider down and up: from one tree to 800,
+the draw calls stay at 49. Walk the player into the forest (third person) and let the camera
+find its way between the trunks.
+
+**Run it:** a pine forest rings the scene, fading into the fog, its shadows falling across
+the clearing; the ring of crates and all 800 trees take three draw calls.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
@@ -2298,22 +2611,26 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 
 1. **Your own meshes.** Fill a `render3d::MeshData` (positions, normals, UVs, and
    counter-clockwise triangles) and construct a `Mesh` — try a pyramid or a cylinder.
-2. **Aiming over the shoulder.** While the right mouse button is held, zoom in (a smaller
+2. **Firing on the move.** Play *Walk* on the legs and *Fire* on the upper body at once:
+   two `ModelAnimator`s, then copy the torso's and arms' nodes from the second pose into
+   the first before drawing.
+3. **Aiming over the shoulder.** While the right mouse button is held, zoom in (a smaller
    `distance`, a bigger `shoulder`), turn the player to face where the camera looks, and
    cast a ray from the camera through the middle of the screen with `raycastScene` to
    find what he'd hit.
-3. **A squadron.** Draw several drones from the one `droneModel_`, each with its own
+4. **A squadron.** Draw several drones from the one `droneModel_`, each with its own
    `ModelPose`, flight path and rotor speed: one `Model` in memory, many on screen. Or a
    squad of gunners, each with its own `ModelAnimator`, firing in turn.
-4. **A skybox.** A cube drawn around the camera with a sky texture, rendered first with
+5. **A skybox.** A cube drawn around the camera with a sky texture, rendered first with
    depth writes off.
-5. **Sharper shadows further away.** One shadow map spreads its texels over the whole
+6. **Sharper shadows further away.** One shadow map spreads its texels over the whole
    shadow distance. *Cascades* split the view into 2–4 ranges, near to far, each with its
    own map: sharp shadows at your feet and shadows reaching to the horizon.
-6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
-   buffer; essential for forests, crowds and particles.
-7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
-8. **Saving tuned values.** Store `lighting_` with `core::SaveData` from a "Save" button in
+7. **Culling.** Skip what the camera can't see: test each tree's bounding sphere against
+   the camera's view (its six planes, from `camera.viewProjection()`) and pass only the
+   visible ones to `drawInstanced`. For a huge forest, cull square patches of trees first.
+8. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
+9. **Saving tuned values.** Store `lighting_` with `core::SaveData` from a "Save" button in
    the debug UI and load it in `onInit`, so tuned values survive a restart.
-9. **World-space labels.** Project a 3D position to the screen with
-   `camera.viewProjection()` and draw a name tag there with the HUD batch.
+10. **World-space labels.** Project a 3D position to the screen with
+    `camera.viewProjection()` and draw a name tag there with the HUD batch.

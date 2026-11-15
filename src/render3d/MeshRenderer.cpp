@@ -39,7 +39,7 @@ struct PushConstants {
     glm::mat4 model;
     glm::vec4 color;    // linear base colour and alpha
     glm::vec4 emissive; // rgb = linear glow; a = alpha cutoff (0 = none)
-    glm::vec4 material; // x = roughness, y = metallic, z = 1 if unlit
+    glm::vec4 material; // x = roughness, y = metallic, z = 1 if unlit, w = first joint (skinned)
 };
 static_assert(sizeof(PushConstants) <= 128);
 
@@ -77,8 +77,9 @@ glm::vec3 srgbToLinear(const glm::vec3& c)
 
 } // namespace
 
-MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize)
-    : ctx_(ctx)
+MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize,
+                           uint32_t maxJoints, uint32_t maxInstances)
+    : ctx_(ctx), maxJoints_(std::max(maxJoints, 1u)), maxInstances_(std::max(maxInstances, 2u))
 {
     // Without a depth buffer, whatever is drawn last ends up in front.
     if (renderer.depthFormat() == VK_FORMAT_UNDEFINED)
@@ -87,9 +88,13 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
                           .add(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                           .add(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT) // shadow map
+                          .add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // joint matrices
+                          .add(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // instance matrices
                           .build(ctx.device());
     descriptors_.init(ctx.device(), renderer.framesInFlight(),
-                      {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1.0f}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1.0f}},
+                      {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1.0f},
+                       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1.0f},
+                       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2.0f}},
                       /*allowFree*/ false);
     materialSetLayout_ = gfx::DescriptorLayoutBuilder()
                              .add(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -112,11 +117,26 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
                        .descriptorSetLayout(materialSetLayout_)     // set 1
                        .pushConstants(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                       sizeof(PushConstants));
-    pipeline_ = builder.build(ctx);
-    blendPipeline_ = gfx::PipelineBuilder(builder).blend(gfx::BlendMode::Alpha).depthTest(true, false).build(ctx);
+    // Skinned meshes: the same, plus each vertex's joints and weights from a second buffer.
+    const auto addSkin = [](gfx::PipelineBuilder b, const char* vertexShader, const char* fragmentShader) {
+        return b.shaders(core::shaderPath(vertexShader), core::shaderPath(fragmentShader))
+            .vertexBinding(1, sizeof(SkinVertex))
+            .vertexAttribute(4, 1, VK_FORMAT_R16G16B16A16_UINT, offsetof(SkinVertex, joints))
+            .vertexAttribute(5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(SkinVertex, weights));
+    };
+    gfx::PipelineBuilder skinned = addSkin(builder, "mesh_skinned.vert.spv", "mesh.frag.spv");
 
-    if (ctx.wireframeSupported())
+    pipeline_ = builder.build(ctx);
+    skinnedPipeline_ = skinned.build(ctx);
+    blendPipeline_ = gfx::PipelineBuilder(builder).blend(gfx::BlendMode::Alpha).depthTest(true, false).build(ctx);
+    skinnedBlendPipeline_ =
+        gfx::PipelineBuilder(skinned).blend(gfx::BlendMode::Alpha).depthTest(true, false).build(ctx);
+
+    if (ctx.wireframeSupported()) {
         wireframePipeline_ = builder.polygonMode(VK_POLYGON_MODE_LINE).cullMode(VK_CULL_MODE_NONE).build(ctx);
+        skinnedWireframePipeline_ =
+            skinned.polygonMode(VK_POLYGON_MODE_LINE).cullMode(VK_CULL_MODE_NONE).build(ctx);
+    }
 
     // --- Shadow map ---
     bool linear = false;
@@ -151,25 +171,32 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
 
     // Depth only (no colour attachment), and no culling: a crate's back faces cast its
     // shadow just as well, and open meshes (planes, leaves) cast from both sides.
-    shadowPipeline_ = gfx::PipelineBuilder()
-                          .shaders(core::shaderPath("shadow.vert.spv"), core::shaderPath("shadow.frag.spv"))
-                          .vertexBinding(0, sizeof(Vertex))
-                          .vertexAttribute(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position))
-                          .vertexAttribute(2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv))
-                          .vertexAttribute(3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color))
-                          .cullMode(VK_CULL_MODE_NONE)
-                          .depthTest(true, true, VK_COMPARE_OP_LESS)
-                          .colorFormat(VK_FORMAT_UNDEFINED)
-                          .depthFormat(shadowFormat)
-                          .descriptorSetLayout(frameSetLayout_)     // same layout as the main pass,
-                          .descriptorSetLayout(materialSetLayout_)  // so the same sets bind
-                          .pushConstants(kPushStages, sizeof(PushConstants))
-                          .build(ctx);
+    const auto shadowBuilder = gfx::PipelineBuilder()
+                                   .shaders(core::shaderPath("shadow.vert.spv"), core::shaderPath("shadow.frag.spv"))
+                                   .vertexBinding(0, sizeof(Vertex))
+                                   .vertexAttribute(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position))
+                                   .vertexAttribute(2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv))
+                                   .vertexAttribute(3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color))
+                                   .cullMode(VK_CULL_MODE_NONE)
+                                   .depthTest(true, true, VK_COMPARE_OP_LESS)
+                                   .colorFormat(VK_FORMAT_UNDEFINED)
+                                   .depthFormat(shadowFormat)
+                                   .descriptorSetLayout(frameSetLayout_)     // same layout as the main pass,
+                                   .descriptorSetLayout(materialSetLayout_)  // so the same sets bind
+                                   .pushConstants(kPushStages, sizeof(PushConstants));
+    shadowPipeline_ = gfx::PipelineBuilder(shadowBuilder).build(ctx);
+    skinnedShadowPipeline_ = addSkin(shadowBuilder, "shadow_skinned.vert.spv", "shadow.frag.spv").build(ctx);
 
     for (uint32_t i = 0; i < renderer.framesInFlight(); ++i) {
         PerFrame f;
         f.uniforms = gfx::Buffer(ctx, sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                  gfx::MemoryUsage::CpuToGpu, "frame uniforms");
+        f.joints = gfx::Buffer(ctx, VkDeviceSize(maxJoints_) * sizeof(glm::mat4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               gfx::MemoryUsage::CpuToGpu, "joint matrices");
+        f.instances = gfx::Buffer(ctx, VkDeviceSize(maxInstances_) * sizeof(glm::mat4),
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gfx::MemoryUsage::CpuToGpu, "instance matrices");
+        const glm::mat4 identity(1.0f); // entry 0, for every draw of a single copy; never overwritten
+        f.instances.write(&identity, sizeof(identity));
         f.set = descriptors_.allocate(frameSetLayout_).set;
         f.materialSets = std::make_unique<gfx::DescriptorAllocator>();
         f.materialSets->init(ctx.device(), 64, {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2.0f}}, /*allowFree*/ false);
@@ -177,6 +204,8 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
             .buffer(0, f.uniforms.handle(), sizeof(FrameUniforms), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
             .image(1, shadowMap_.view(), shadowSampler_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            .buffer(2, f.joints.handle(), f.joints.size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            .buffer(3, f.instances.handle(), f.instances.size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             .update(ctx.device(), f.set);
         frames_.push_back(std::move(f));
     }
@@ -272,6 +301,7 @@ void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& 
     cmd_ = frame.cmd;
     boundTexture_ = VK_NULL_HANDLE;
     boundGeometry_ = nullptr;
+    boundSkin_ = nullptr;
     blended_.clear();
 
     fitShadowMap(camera, light);
@@ -281,6 +311,8 @@ void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& 
     PerFrame& f = frames_[frame.frameIndex];
     f.materialSets->reset(); // this frame slot's previous use has finished on the GPU
     f.cache.clear();
+    jointsUsed_ = 0;
+    instancesUsed_ = 1;
     frame_ = &f;
 
     // Wait for earlier frames to finish reading the map, then render into it. Its old
@@ -317,7 +349,9 @@ void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& 
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
 
     active_ = &shadowPipeline_;
-    active_->bind(cmd_);
+    activeSkinned_ = &skinnedShadowPipeline_;
+    bound_ = nullptr;
+    usePipeline(false);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, active_->layout(), 0, 1, &f.set, 0, nullptr);
 }
 
@@ -334,7 +368,7 @@ void MeshRenderer::endShadows()
     }
     pass_ = Pass::None;
     cmd_ = VK_NULL_HANDLE;
-    active_ = nullptr;
+    active_ = activeSkinned_ = bound_ = nullptr;
     frame_ = nullptr;
 }
 
@@ -345,6 +379,7 @@ void MeshRenderer::begin(const gfx::FrameContext& frame, const Camera3D& camera,
     drawCalls_ = 0;
     boundTexture_ = VK_NULL_HANDLE;
     boundGeometry_ = nullptr;
+    boundSkin_ = nullptr;
     cullMode_ = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
     frontFace_ = VK_FRONT_FACE_MAX_ENUM;
     cameraPosition_ = camera.position;
@@ -358,12 +393,71 @@ void MeshRenderer::begin(const gfx::FrameContext& frame, const Camera3D& camera,
     if (shadowFrame_ != frame.frameNumber) {
         f.materialSets->reset(); // (beginShadows did this already otherwise)
         f.cache.clear();
+        jointsUsed_ = 0;
+        instancesUsed_ = 1;
     }
     frame_ = &f;
 
     active_ = wireframe_ ? &wireframePipeline_ : &pipeline_;
-    active_->bind(cmd_);
+    activeSkinned_ = wireframe_ ? &skinnedWireframePipeline_ : &skinnedPipeline_;
+    bound_ = nullptr;
+    usePipeline(false);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, active_->layout(), 0, 1, &f.set, 0, nullptr);
+}
+
+void MeshRenderer::usePipeline(bool skinned)
+{
+    const gfx::Pipeline* p = skinned ? activeSkinned_ : active_;
+    if (p != bound_) {
+        // Same layout, so the descriptor sets stay bound; the dynamic culling state carries
+        // over too.
+        p->bind(cmd_);
+        bound_ = p;
+    }
+}
+
+int MeshRenderer::uploadJoints(const Model& model, int skin)
+{
+    model.jointMatrices(skin, modelSpace_, joints_);
+    if (jointsUsed_ + joints_.size() > maxJoints_) {
+        if (!warnedJoints_)
+            LOG_WARN("MeshRenderer: more than %u joint matrices this frame; some skinned models aren't drawn "
+                     "(pass a bigger maxJoints to the MeshRenderer)", maxJoints_);
+        warnedJoints_ = true;
+        return -1;
+    }
+    const int first = int(jointsUsed_);
+    frame_->joints.write(joints_.data(), joints_.size() * sizeof(glm::mat4), VkDeviceSize(first) * sizeof(glm::mat4));
+    jointsUsed_ += uint32_t(joints_.size());
+    return first;
+}
+
+bool MeshRenderer::uploadInstances(std::span<const glm::mat4> matrices, Instances& out)
+{
+    if (matrices.size() > maxInstances_ - instancesUsed_) {
+        if (!warnedInstances_)
+            LOG_WARN("MeshRenderer: more than %u instance matrices this frame; some drawInstanced calls aren't "
+                     "drawn (pass a bigger maxInstances to the MeshRenderer)", maxInstances_);
+        warnedInstances_ = true;
+        return false;
+    }
+    // A mirrored copy (negative scale) turns its triangles inside out, so it needs the other
+    // winding: put those last, to draw them as a second group.
+    instances_.clear();
+    for (const glm::mat4& m : matrices)
+        if (glm::determinant(glm::mat3(m)) >= 0.0f)
+            instances_.push_back(m);
+    out.mirrored = uint32_t(matrices.size() - instances_.size());
+    if (out.mirrored > 0)
+        for (const glm::mat4& m : matrices)
+            if (glm::determinant(glm::mat3(m)) < 0.0f)
+                instances_.push_back(m);
+    out.first = instancesUsed_;
+    out.count = uint32_t(instances_.size());
+    frame_->instances.write(instances_.data(), instances_.size() * sizeof(glm::mat4),
+                            VkDeviceSize(out.first) * sizeof(glm::mat4));
+    instancesUsed_ += out.count;
+    return true;
 }
 
 void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission)
@@ -410,12 +504,47 @@ void MeshRenderer::setCulling(bool doubleSided, bool mirrored)
     }
 }
 
+void MeshRenderer::drawCopies(const Mesh& geometry, const ModelPrimitive* prim, const Instances& copies,
+                              bool doubleSided, bool mirrored)
+{
+    // Up to two draws: the copies that wind their triangles as the part does, then the
+    // mirrored ones, which wind them the other way.
+    const uint32_t groups[2] = {copies.count - copies.mirrored, copies.mirrored};
+    uint32_t first = copies.first;
+    for (int g = 0; g < 2; ++g) {
+        if (groups[g] == 0)
+            continue;
+        setCulling(doubleSided, mirrored != (g == 1));
+        if (prim)
+            geometry.drawRange(cmd_, prim->firstIndex, prim->indexCount, prim->vertexOffset, groups[g], first);
+        else
+            geometry.draw(cmd_, groups[g], first);
+        first += groups[g];
+        ++(pass_ == Pass::Shadow ? shadowDrawCalls_ : drawCalls_);
+    }
+}
+
 void MeshRenderer::draw(const Mesh& mesh, const glm::mat4& model, const Material& material)
 {
     if (pass_ == Pass::SkippedShadow || (pass_ == Pass::Shadow && !material.castShadows))
         return;
+    drawMesh(mesh, model, material, {});
+}
+
+void MeshRenderer::drawInstanced(const Mesh& mesh, std::span<const glm::mat4> models, const Material& material)
+{
+    if (models.empty() || pass_ == Pass::SkippedShadow || (pass_ == Pass::Shadow && !material.castShadows))
+        return;
+    Instances copies;
+    if (uploadInstances(models, copies))
+        drawMesh(mesh, glm::mat4(1.0f), material, copies); // the instance matrices place each copy
+}
+
+void MeshRenderer::drawMesh(const Mesh& mesh, const glm::mat4& model, const Material& material,
+                            const Instances& copies)
+{
+    usePipeline(false);
     bindTextures(material.texture, material.emissiveTexture);
-    setCulling(material.doubleSided, glm::determinant(glm::mat3(model)) < 0.0f);
 
     PushConstants pc;
     pc.model = model;
@@ -424,9 +553,8 @@ void MeshRenderer::draw(const Mesh& mesh, const glm::mat4& model, const Material
     pc.material = glm::vec4(material.roughness, material.metallic, 0.0f, 0.0f);
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
-    mesh.draw(cmd_);
+    drawCopies(mesh, nullptr, copies, material.doubleSided, glm::determinant(glm::mat3(model)) < 0.0f);
     boundGeometry_ = &mesh;
-    ++(pass_ == Pass::Shadow ? shadowDrawCalls_ : drawCalls_);
 }
 
 void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const ModelPose* pose)
@@ -434,28 +562,85 @@ void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const Mo
     if (!model.valid() || pass_ == Pass::SkippedShadow)
         return;
     model.nodeMatrices(transform, pose, nodeMatrices_);
+    bool modelSpaceReady = false;
     for (int n = 0; n < model.nodeCount(); ++n) {
-        const int mesh = model.node(n).mesh;
-        if (mesh < 0)
+        const ModelNode& node = model.node(n);
+        if (node.mesh < 0)
             continue;
-        const glm::mat4& matrix = nodeMatrices_[size_t(n)];
-        for (const ModelPrimitive& prim : model.meshes()[size_t(mesh)].primitives) {
+        // A skinned mesh: its joints place it (in model space), then `transform` places the
+        // model; the node's own transform is ignored, as glTF says.
+        const bool skinned = node.skin >= 0 && model.skinVertices().valid();
+        int firstJoint = -1;
+        if (skinned) {
+            if (!modelSpaceReady) {
+                model.nodeMatrices(glm::mat4(1.0f), pose, modelSpace_);
+                modelSpaceReady = true;
+            }
+            firstJoint = uploadJoints(model, node.skin);
+            if (firstJoint < 0)
+                continue; // out of room (warned)
+        }
+        const glm::mat4& matrix = skinned ? transform : nodeMatrices_[size_t(n)];
+        for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
             const bool blend = prim.material >= 0 &&
                                model.materials()[size_t(prim.material)].alphaMode == AlphaMode::Blend;
             if (blend && pass_ == Pass::Shadow) {
                 continue; // see-through parts cast no shadow
             } else if (blend) {
                 // Later, farthest first: see-through parts must go over what's behind them.
+                // (For a skinned part, roughly: where it was before bending.)
                 const glm::vec3 centre = glm::vec3(matrix * glm::vec4((prim.boundsMin + prim.boundsMax) * 0.5f, 1.0f));
-                blended_.push_back({&model, &prim, matrix, glm::length(centre - cameraPosition_)});
+                blended_.push_back({&model, &prim, matrix, glm::length(centre - cameraPosition_), firstJoint});
             } else {
-                drawPrimitive(model, prim, matrix);
+                drawPrimitive(model, prim, matrix, firstJoint, {});
             }
         }
     }
 }
 
-void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix)
+void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose)
+{
+    if (!model.valid() || transforms.empty() || pass_ == Pass::SkippedShadow)
+        return;
+    Instances copies;
+    if (!uploadInstances(transforms, copies))
+        return; // out of room (warned)
+    // Each part is placed within the model by its node (the push constants), and the model
+    // by each copy's matrix (the instance buffer): instance * node, in the vertex shader.
+    model.nodeMatrices(glm::mat4(1.0f), pose, modelSpace_);
+    for (int n = 0; n < model.nodeCount(); ++n) {
+        const ModelNode& node = model.node(n);
+        if (node.mesh < 0)
+            continue;
+        // Skinned: bent once for the shared pose, the joints already in model space.
+        const bool skinned = node.skin >= 0 && model.skinVertices().valid();
+        const int firstJoint = skinned ? uploadJoints(model, node.skin) : -1;
+        if (skinned && firstJoint < 0)
+            continue; // out of room (warned)
+        const glm::mat4 matrix = skinned ? glm::mat4(1.0f) : modelSpace_[size_t(n)];
+        for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
+            const bool blend = prim.material >= 0 &&
+                               model.materials()[size_t(prim.material)].alphaMode == AlphaMode::Blend;
+            if (blend && pass_ == Pass::Shadow) {
+                continue;
+            } else if (blend) {
+                // See-through parts are sorted one copy at a time (and drawn one at a time,
+                // in end()): each copy must go over whatever is behind it.
+                const glm::vec4 centre((prim.boundsMin + prim.boundsMax) * 0.5f, 1.0f);
+                for (const glm::mat4& t : transforms) {
+                    const glm::mat4 m = t * matrix;
+                    blended_.push_back({&model, &prim, m, glm::length(glm::vec3(m * centre) - cameraPosition_),
+                                        firstJoint});
+                }
+            } else {
+                drawPrimitive(model, prim, matrix, firstJoint, copies);
+            }
+        }
+    }
+}
+
+void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix,
+                                 int firstJoint, const Instances& copies)
 {
     static const ModelMaterial plain = [] {
         ModelMaterial m;
@@ -465,22 +650,28 @@ void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim,
     }();
     const ModelMaterial& mat = prim.material >= 0 ? model.materials()[size_t(prim.material)] : plain;
 
+    const bool skinned = firstJoint >= 0;
+    usePipeline(skinned);
     bindTextures(model.texture(mat.baseColorTexture), model.texture(mat.emissiveTexture));
-    setCulling(mat.doubleSided, glm::determinant(glm::mat3(matrix)) < 0.0f);
     if (boundGeometry_ != &model.geometry()) {
         model.geometry().bind(cmd_);
         boundGeometry_ = &model.geometry();
+    }
+    if (skinned && boundSkin_ != &model.skinVertices()) {
+        const VkBuffer buffer = model.skinVertices().handle();
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd_, 1, 1, &buffer, &offset);
+        boundSkin_ = &model.skinVertices();
     }
 
     PushConstants pc;
     pc.model = matrix;
     pc.color = mat.baseColor; // glTF colours are already linear
     pc.emissive = glm::vec4(mat.emissive, mat.alphaMode == AlphaMode::Mask ? mat.alphaCutoff : 0.0f);
-    pc.material = glm::vec4(mat.roughness, mat.metallic, mat.unlit ? 1.0f : 0.0f, 0.0f);
+    pc.material = glm::vec4(mat.roughness, mat.metallic, mat.unlit ? 1.0f : 0.0f, skinned ? float(firstJoint) : 0.0f);
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
-    model.geometry().drawRange(cmd_, prim.firstIndex, prim.indexCount, prim.vertexOffset);
-    ++(pass_ == Pass::Shadow ? shadowDrawCalls_ : drawCalls_);
+    drawCopies(model.geometry(), &prim, copies, mat.doubleSided, glm::determinant(glm::mat3(matrix)) < 0.0f);
 }
 
 void MeshRenderer::end()
@@ -492,17 +683,17 @@ void MeshRenderer::end()
             // Same layout, so the frame and texture sets stay bound; dynamic culling state
             // carries over to the new pipeline too, but set it again to be safe.
             active_ = &blendPipeline_;
-            active_->bind(cmd_);
+            activeSkinned_ = &skinnedBlendPipeline_;
             cullMode_ = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
             frontFace_ = VK_FRONT_FACE_MAX_ENUM;
         }
         for (const BlendedDraw& d : blended_)
-            drawPrimitive(*d.model, *d.primitive, d.matrix);
+            drawPrimitive(*d.model, *d.primitive, d.matrix, d.firstJoint, {});
         blended_.clear();
     }
     pass_ = Pass::None;
     cmd_ = VK_NULL_HANDLE;
-    active_ = nullptr;
+    active_ = activeSkinned_ = bound_ = nullptr;
     frame_ = nullptr;
 }
 
