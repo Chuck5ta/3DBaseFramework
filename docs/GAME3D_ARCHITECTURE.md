@@ -112,12 +112,14 @@ src/
     ModelAnimator.h/.cpp      plays a model's animations into a ModelPose (blending, loops, moments)
     Raycast.h/.cpp            Ray; distance to a plane, sphere or (transformed) box
     ThirdPersonCamera.h/.cpp  follow/orbit camera with zoom, shoulder offset and collision
-    MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models; Material, SceneLighting
+    MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models, with sun shadows;
+                              Material, SceneLighting, ShadowSettings
   game/
     DemoGame.h/.cpp           example scene: fly and third-person cameras, a walking player
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
-  mesh.vert, mesh.frag        the mesh shaders
+  mesh.vert, mesh.frag        the mesh shaders (mesh.frag also reads the shadow map)
+  shadow.vert, shadow.frag    the shadow pass: depth from the sun (alpha-masked parts cut out)
   sprite.vert, sprite.frag    the 2D overlay shaders (shared with Game2D)
   imgui.frag                  Dear ImGui's fragment shader, sRGB-correct (debug UI)
 assets/                       runtime data (copied next to the executable)
@@ -479,17 +481,23 @@ sequenceDiagram
     T->>C: position, yaw, pitch
 ```
 
-**`render3d::MeshRenderer`**: forward renderer for lit, textured meshes and models
-(details in §6). API: `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`,
-`draw(model, transform, pose = nullptr)`, `end()`, `setWireframe(bool)`, `drawCalls()`.
-It needs a depth buffer, and says so at start-up if there isn't one.
+**`render3d::MeshRenderer`**: forward renderer for lit, textured meshes and models, with
+shadows from the sun (details in §6). API: `MeshRenderer(gpu, renderer, shadowMapSize = 2048)`,
+`begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`,
+`draw(model, transform, pose = nullptr)`, `end()`, `setWireframe(bool)`, `drawCalls()`;
+for shadows `beginShadows(frame, camera, lighting)` / `endShadows()` around the same
+`draw()` calls in `onPreRender`, `shadowDrawCalls()`, `shadowMapSize()`,
+`shadowTexelSize()`. It needs a depth buffer, and says so at start-up if there isn't one.
 
 - `Material { texture, color, emissive, emissiveStrength, emissiveTexture, roughness,
-  metallic, doubleSided }`: textures may be `nullptr` (an internal 1×1 white texture is
-  used); colours are sRGB. A model brings its own `ModelMaterial`s (linear colours, as in
-  glTF).
+  metallic, doubleSided, castShadows }`: textures may be `nullptr` (an internal 1×1 white
+  texture is used); colours are sRGB. A model brings its own `ModelMaterial`s (linear
+  colours, as in glTF); models always cast shadows, except their Blend parts.
 - `SceneLighting`: sun direction/colour/intensity, sky and ground ambient colours with an
-  ambient intensity, fog colour and density. All colours are sRGB.
+  ambient intensity, fog colour and density, and `shadows`. All colours are sRGB.
+- `ShadowSettings { enabled, distance (30 m), strength (1), softness (1 texel),
+  normalBias (1 texel), depthBias (1.5 texels) }`: biases and softness are in shadow-map
+  texels, so they hold when the distance or map size changes (§6.5).
 
 ### 3.4 render2d (HUD)
 
@@ -812,7 +820,7 @@ resources with it), `imageIndex`, `frameNumber` and `extent`.
 ```mermaid
 flowchart LR
     subgraph perFrame["Per frame (once in begin)"]
-        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog"]
+        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map"]
     end
     subgraph perMaterial["Per texture change"]
         tex["Set 1: base colour + emission<br/>(two combined image samplers)"]
@@ -827,7 +835,8 @@ flowchart LR
 
 | Binding | Contents | Update frequency |
 |---|---|---|
-| Set 0, binding 0 (UBO, vertex + fragment) | `FrameUniforms`: matrices, camera position, lights, fog (std140) | once per frame, written into that frame's own buffer |
+| Set 0, binding 0 (UBO, vertex + fragment) | `FrameUniforms`: matrices, camera position, lights, fog, shadow matrix and settings (std140) | once per frame, written into that frame's own buffer |
+| Set 0, binding 1 (comparison sampler, fragment) | the shadow map | never (one image, rewritten by each shadow pass) |
 | Set 1, bindings 0 and 1 (samplers, fragment) | base colour and emission textures | when either texture changes between draws |
 | Push constants (vertex + fragment) | model matrix, colour, emissive + alpha cutoff, roughness/metallic/unlit | every draw |
 | Dynamic state | cull mode, front face | when a draw needs different culling (double-sided material, mirrored node) |
@@ -879,13 +888,18 @@ sequenceDiagram
 
 ### 6.3 Pipeline state
 
-| State | Solid pipeline | Wireframe pipeline |
-|---|---|---|
-| Polygon mode | `FILL` | `LINE` (only created if `fillModeNonSolid` is supported) |
-| Culling | dynamic: back faces (none for double-sided), front = counter-clockwise (clockwise for mirrored nodes) | none |
-| Depth | test + write, `LESS` | test + write, `LESS` |
-| Blending | opaque (a third pipeline, for Blend parts: alpha blending, no depth writes) | opaque |
-| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`) | same |
+| State | Solid pipeline | Wireframe pipeline | Shadow pipeline |
+|---|---|---|---|
+| Shaders | `mesh.vert` / `mesh.frag` | same | `shadow.vert` / `shadow.frag` |
+| Polygon mode | `FILL` | `LINE` (only created if `fillModeNonSolid` is supported) | `FILL` |
+| Culling | dynamic: back faces (none for double-sided), front = counter-clockwise (clockwise for mirrored nodes) | none | none (static) |
+| Depth | test + write, `LESS` | test + write, `LESS` | test + write, `LESS`, into the shadow map's format |
+| Colour | swapchain format | swapchain format | one attachment of format `UNDEFINED` (depth only) |
+| Blending | opaque (a fourth pipeline, for Blend parts: alpha blending, no depth writes) | opaque | — |
+| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`) | same | position, uv, colour (no normal) |
+
+All four share one pipeline layout (set 0, set 1, the push constants), so the shadow pass
+binds the same sets and pushes the same constants as the main pass.
 
 Alpha-masked parts use `discard` in the fragment shader. Under SPIR-V 1.6 that compiles to
 "demote to helper invocation", so `VulkanContext` enables the Vulkan 1.3 feature
@@ -897,10 +911,11 @@ Alpha-masked parts use `discard` in the fragment shader. Under SPIR-V 1.6 that c
 albedo   = texture(uv) · material colour · vertex colour      (discarded if alpha < cutoff)
 N        = normalize(normal)   (flipped for back faces, e.g. double-sided or wireframe)
 ambient  = mix(groundColour, skyColour, N.y · 0.5 + 0.5)      hemisphere light
-diffuse  = sunColour · max(N·L, 0)                              Lambert
+sun      = sunlight(position, N)                               1 lit … 0 in shadow (§6.5)
+diffuse  = sunColour · max(N·L, 0) · sun                        Lambert
 shininess = 2^(10·(1 − roughness) + 1)                          roughness 0.5 → 64
 strength  = 0.5 · (1 − roughness) · mix(1, 3, metallic)         roughness 0.5 → 0.25
-specular = sunColour · mix(white, albedo, metallic) · strength · max(N·H, 0)^shininess
+specular = sunColour · mix(white, albedo, metallic) · strength · max(N·H, 0)^shininess · sun
 colour   = albedo · (1 − 0.7·metallic) · (ambient + diffuse) + specular
            (unlit materials: colour = albedo)
 colour  += emissive · emissionTexture(uv)                       glow, ignores lighting
@@ -912,7 +927,64 @@ The clear colour is set to the (linearised) fog colour, so distant geometry fade
 into the background. Shared declarations live in `shaders/common.glsl`, included by both
 stages with `GL_GOOGLE_include_directive`.
 
-### 6.5 Text
+### 6.5 Shadows
+
+One **shadow map** for the sun: a square depth image (2048² `D32_SFLOAT` by default,
+16 MB; `D16_UNORM` if a GPU can't sample D32) holding, for each texel, the distance to the
+first surface the sun meets.
+
+```mermaid
+sequenceDiagram
+    participant G as Game
+    participant MR as MeshRenderer
+    participant Cmd as Command buffer
+
+    G->>MR: onPreRender: beginShadows(frame, camera, lighting)
+    MR->>MR: fit the map to the view, write FrameUniforms
+    MR->>Cmd: barrier: shadow map → DEPTH_STENCIL_ATTACHMENT (after earlier frames' reads)
+    MR->>Cmd: vkCmdBeginRendering (depth only, clear 1.0), shadow pipeline, set 0
+    G->>MR: drawScene(): draw(...) for everything (castShadows = false skipped)
+    G->>MR: endShadows()
+    MR->>Cmd: vkCmdEndRendering, barrier → SHADER_READ_ONLY (fragment shader reads)
+    Note over G,Cmd: Renderer::beginMainPass()
+    G->>MR: onRender: begin(frame, camera, lighting)
+    G->>MR: drawScene(): the same draw(...) calls, now lit and shadowed
+    G->>MR: end()
+```
+
+- **Same calls, two passes.** Between `beginShadows` and `endShadows`, `draw()` records
+  into the shadow map with the shadow pipeline; otherwise into the main pass. A game keeps
+  one `drawScene()` and calls it from both hooks. Skipping the shadow pass, or
+  `shadows.enabled = false`, gives an unshadowed frame: `begin()` sees that no shadow pass
+  ran for this `frameNumber` and sets the strength to 0, and the map's layout is always
+  `SHADER_READ_ONLY_OPTIMAL` outside the pass (it is transitioned once at start-up).
+- **Fitting.** The map covers the smallest sphere around the camera frustum's slice from
+  the near plane to `distance`. Its radius depends only on the field of view, aspect
+  ratio and distances, not on the camera's direction, so texels keep their size as the
+  camera turns. The sphere's centre is moved in whole texels in the sun's view, so the
+  texel grid stays fixed on the ground as the camera moves: no shimmering edges. This
+  needs a still sun: when `sunDirection` changes, the grid turns with it and edges crawl
+  (the demo's *Animate sun* is off by default for this reason). The
+  orthographic projection reaches 100 m further towards the sun than the sphere
+  (`kCasterReach`), so casters above the shadowed area (the drone) are in the map too.
+- **Sampling.** A comparison sampler (`compareOp LESS_OR_EQUAL`, linear filtering, clamp
+  to an opaque white border: outside the map counts as lit) gives a 2×2 filtered result
+  per lookup; `mesh.frag` averages a 3×3 grid of lookups spaced `softness` texels apart.
+  Shadows only reduce the sun's diffuse and specular light; ambient stays.
+- **Bias.** `normalBias` texels push the lookup point out along the normal; `depthBias`
+  texels are subtracted from its depth. Both are converted from texels to metres and
+  depth units on the CPU. The shadow pipeline draws both faces with no culling, so open
+  meshes cast correctly. There's no rasteriser depth bias (`PipelineBuilder` has none),
+  so all bias is in the receiver.
+- **Fade.** From 80 % of `distance` to `distance` (measured from the camera) the shadows
+  fade out; beyond it `mesh.frag` skips the lookups.
+- **Synchronisation.** One shadow map serves all frames in flight, like the depth buffer:
+  the barrier before each shadow pass waits for earlier fragment-shader reads, and the
+  one after it makes the writes visible to this frame's main pass.
+- **Cost.** Every caster is drawn a second time (depth only, nine lookups per lit pixel
+  in the main pass). In the demo: 71 shadow draws beside 72 main draws.
+
+### 6.6 Text
 
 ```mermaid
 flowchart LR
@@ -1055,7 +1127,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Add your own geometry | Fill `render3d::MeshData` (CCW triangles, normals, UVs) and construct a `Mesh` |
 | Load models | Add a glTF loader (cgltf / fastgltf) that produces `MeshData` + `Texture`s |
 | Add a new renderer (skybox, particles, instancing) | New class in `render3d/` following `MeshRenderer`: own `Pipeline` with `renderer.depthFormat()`, per-frame buffers indexed by `frame.frameIndex` |
-| Shadows | Depth-only `Image` + pipeline rendered from the sun in `onPreRender`; sample it in `mesh.frag` |
+| Sharper or further shadows | Change `shadows.distance` and the constructor's `shadowMapSize`; for both at once, cascades: several maps for near-to-far slices of the view, fitted like `fitShadowMap` |
+| Shadows from other lights | Spot light: a perspective version of the sun's map; point light: a cube map. Same pattern: a depth-only pass in `onPreRender`, sampled in `mesh.frag` |
 | Render off-screen (post-processing, bloom, tone mapping) | Create an `Image` with `COLOR_ATTACHMENT \| SAMPLED` usage, render to it in `onPreRender`, sample it in the main pass |
 | Change GPU features | Feature chain in `VulkanContext::createDevice()` |
 | Upload data at runtime | `Buffer` with `CpuToGpu` per frame in flight, or `immediateSubmit` at load time |
@@ -1084,6 +1157,10 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Camera jumps in when blocked, eases out when clear | The player is never hidden behind a wall, and the camera doesn't jitter in and out past posts | A sudden cut when something passes between player and camera |
 | Moments by time (`reached`) rather than named events | glTF has no animation events; times come straight from Blender's timeline | Times live in code; rename-safe events would need a side file |
 | Single shared depth buffer | Saves memory; correct thanks to the per-frame barrier | Frames' depth work is serialised (negligible) |
+| One shadow map, fitted to a sphere and moved in whole texels | Stable edges with no shimmering as the camera turns or moves; one pass, simple code; plenty for a few dozen metres around a third-person camera | Resolution is spread evenly over `distance` (3.5 cm per texel at 30 m): shadows far away or at your feet are no sharper than in between; cascades would fix that |
+| The game draws its scene twice through the same `draw()` calls | One `drawScene()` serves both passes, so shadows can't get out of step with what's drawn; no scene graph needed | The game makes the calls twice (CPU work); `castShadows` per material is the only way to leave something out |
+| Biases and softness in texels, applied in the receiver | Settings hold when the distance or map size changes; no `PipelineBuilder` change (it stays identical to Game2D's) | Normal-offset bias can let light leak at very thin geometry; tune per scene |
+| Comparison sampler + 3×3 lookups | Hardware 2×2 filtering on every GPU; soft, stable edges for nine lookups | Constant softness (no contact hardening as in PCSS) |
 | Blinn-Phong + hemisphere ambient + fog, driven by roughness/metallic | Small, readable shader that looks good immediately and uses glTF's material values | Not PBR (no image-based lighting, no energy conservation); replace when materials need it |
 | Wait-idle on swapchain recreation | Simplest correct approach | Brief stall on resize only |
 | Settings remembered by the framework, from the live systems | A game gets saved volume, fullscreen, vsync and controls with no code; nothing can drift out of step, because the file is written from what the window, renderer and audio engine actually are | Settings are saved at exit (or on `saveSettings()`), so a crash loses changes made since; the layout of the `video`/`audio`/`controls` keys is the framework's |
@@ -1101,7 +1178,11 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - Models: no skinned meshes, morph targets, normal/occlusion/metallic-roughness textures,
   KTX2/WebP images or Draco/meshopt compression yet. Animations move nodes (rigid parts,
   or parts parented to bones); one animation plays at a time per animator (plus blends).
-- No shadows; one directional light only.
+- One directional light only, so only the sun casts shadows. One shadow map (no
+  cascades): shadows reach `distance` (30 m) and fade out there; Blend (see-through)
+  parts cast none; constant softness. Every caster is drawn again for the shadow pass
+  (no culling of casters outside the map). A moving sun makes shadow edges crawl; keep
+  `sunDirection` still, or change it very slowly.
 - Third-person camera: collision with simple shapes only (planes, spheres, boxes); it
   doesn't fade the player out when it moves in very close; no automatic swing behind a
   running player. No character controller (the demo keeps its player out of circles

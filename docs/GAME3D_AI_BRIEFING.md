@@ -16,7 +16,7 @@ An engine-free C++20 starter for **3D games** on Windows, Linux and Steam Deck. 
 owns all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer,
 a lit and textured forward renderer for meshes and **glTF models** (from Blender) with
 their **animations**, a fly camera, a 2D overlay for HUD text, 3D audio with effects and
-Doppler, and a debug UI. A demo scene (`DemoGame`: crates, spheres, a moving sun, a humming
+Doppler, and a debug UI. A demo scene (`DemoGame`: crates, spheres, a sun that can be animated, a humming
 crate, chiming spheres, a drone model circling with spinning rotors, and an animated gunner
 who tracks it, fires and reloads) shows how it fits together.
 
@@ -39,13 +39,13 @@ src/
   core/                 Application (loop, hooks), Window, Input, Actions, GameState, SaveData, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
-  render3d/             MeshRenderer (Material, SceneLighting), Model (glTF), ModelAnimator, Mesh (+ primitives),
+  render3d/             MeshRenderer (Material, SceneLighting, ShadowSettings; sun shadows), Model (glTF), ModelAnimator, Mesh (+ primitives),
                         Camera3D, ThirdPersonCamera, Raycast
   render2d/             SpriteBatch, Camera2D, Font, Animation (used for the HUD)
   audio/                AudioEngine (miniaudio): sounds, music, 3D, effects, Doppler
   debugui/              DebugUI (Dear ImGui)
   game/                 DemoGame (the example); your game goes here
-shaders/                mesh.vert/.frag, common.glsl, sprite.vert/.frag, imgui.frag
+shaders/                mesh.vert/.frag, shadow.vert/.frag, common.glsl, sprite.vert/.frag, imgui.frag
 assets/                 fonts/ (Roboto), models/ (drone, gunner, rifle .glb), sounds/, textures/ (copied next to the exe)
 cmake/                  Dependencies.cmake, Shaders.cmake
 tools/                  make_drone.py, make_gunner.py (+ gltf_builder.py), make_gunner_sounds.py: the demo's
@@ -213,7 +213,7 @@ and runs the loop. A game is a subclass of `core::Game`; every hook is optional:
 | `onFixedUpdate(app, dt)` | 0..n times per frame at a fixed rate (60 Hz) | gameplay simulation, physics, timers |
 | `onUpdate(app, dt)` | once per frame, real frame time | input, camera, UI state, audio listener |
 | `onDebugUI(app)` | after `onUpdate`, only while the debug UI is visible | ImGui windows (the only place to call ImGui) |
-| `onPreRender(app, frame)` | before the main render pass | uploads, off-screen passes, compute |
+| `onPreRender(app, frame)` | before the main render pass | the shadow pass (`beginShadows` … `endShadows`), uploads, off-screen passes, compute |
 | `onRender(app, frame)` | inside the main pass (cleared, viewport set) | all drawing |
 | `onResize(app, w, h)` | swapchain size changed (pixels) | resize render targets |
 | `onShutdown(app)` | after `vkDeviceWaitIdle` | destroy GPU objects (reset `unique_ptr`s) |
@@ -405,16 +405,53 @@ Y flipped), `viewProjection()`.
 `normal`, `uv`, `color` = linear vertex colour, white by default) + `indices` (uint32). Primitives: `primitives::cube(size)`,
 `plane(size, uvRepeat)` (XZ plane facing +Y), `sphere(radius, segments, rings)`.
 
-**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer())`, needs
-`config.renderer.depthBuffer = true`):
+**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048)`,
+needs `config.renderer.depthBuffer = true`):
 `begin(frame, camera, lighting)` → `draw(mesh, modelMatrix, Material)` and/or
 `draw(model, transform, &pose)` × n → `end()` (see-through model parts are drawn in `end()`,
 farthest first). It stops with a message if the renderer has no depth buffer.
 `Material{texture, color (sRGB tint), emissive (sRGB glow), emissiveStrength,
-emissiveTexture, roughness = 0.5, metallic = 0, doubleSided}`. `setWireframe(bool)`,
-`wireframe()`, `wireframeSupported()`, `drawCalls()`. Per-object data travels as push
-constants (one draw call per object or model part). Build model matrices with
+emissiveTexture, roughness = 0.5, metallic = 0, doubleSided, castShadows = true}`.
+`setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
+`shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres). Per-object data travels
+as push constants (one draw call per object or model part). Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
+
+**Shadows (sun only)** — the scene is drawn twice through the same calls, so put all 3D
+drawing in one function (the demo's `drawScene(alpha)`):
+
+```cpp
+void MyGame::onPreRender(core::Application& app, gfx::FrameContext& frame)
+{
+    camera_.setAspect(float(frame.extent.width) / float(frame.extent.height)); // before the fit
+    meshes_->beginShadows(frame, camera_, lighting_); // draw() now writes depth from the sun
+    drawScene(app.interpolationAlpha());
+    meshes_->endShadows();
+}
+void MyGame::onRender(core::Application& app, gfx::FrameContext& frame)
+{
+    meshes_->begin(frame, camera_, lighting_);        // same camera and lighting
+    drawScene(app.interpolationAlpha());
+    meshes_->end();
+    // ...HUD...
+}
+```
+
+- One 2048² shadow map (D32) fitted to a sphere around the view out to
+  `lighting.shadows.distance`, moved in whole texels: no shimmering while the sun is
+  still. Changing `sunDirection` every frame makes edges crawl, so the demo's sun
+  animation (`animateSun_`) defaults to off. ~3.5 cm per texel at
+  30 m (16:9). Shadows fade out over the last 20 % of the distance. Casters up to 100 m
+  towards the sun beyond that sphere still cast (a high drone).
+- `ShadowSettings{enabled = true, distance = 30 m, strength = 1, softness = 1,
+  normalBias = 1, depthBias = 1.5}` in `SceneLighting::shadows`; softness and biases are in
+  **texels**. Acne (stripes) → raise the biases; shadows detached from casters → lower them.
+- Skip the shadow pass (or `enabled = false`) and the frame renders without shadows.
+  `castShadows = false` for the ground, glows and effects; Blend model parts never cast;
+  alpha-masked parts cut holes in the shadow. Shadows dim the sun only (ambient stays).
+- Shadow pipeline: depth only (a colour attachment of format `UNDEFINED`, null view), no
+  culling, same layout and sets as the main pass; shaders `shadow.vert`/`shadow.frag`.
+  `mesh.frag` reads the map at set 0, binding 1 (`sampler2DShadow`, 3×3 filtered lookups).
 
 **`render3d::Model`** (`render3d/Model.h`): glTF 2.0, `.glb` (one file, preferred) or
 `.gltf` (+ `.bin` + images beside it), e.g. Blender's *File > Export > glTF 2.0*.
@@ -547,7 +584,8 @@ Rays starting inside a sphere/box don't hit it. Typical ray function: the neares
 `raycast*` over the level's colliders (see `DemoGame::raycastScene`). Also for shooting,
 line of sight and mouse picking.
 
-**Demo (tutorial step 14):** starts in third person behind a second soldier (the gunner's
+**Demo (tutorial steps 14–15):** **G** toggles shadows (the debug UI has a Shadows
+section). Starts in third person behind a second soldier (the gunner's
 model, own `ModelAnimator`); **C** / gamepad Start toggles the fly camera. WASD/left stick
 walk (camera-relative), Shift/L3 run, right mouse/Tab/right stick orbit, wheel/d-pad zoom.
 Shared layout helpers (`bigCrateMatrix`, `ringCrateMatrix`, `sphereCentre`) feed drawing,
@@ -756,8 +794,8 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
 
 ## 13. Known limitations (as of 2026-11-14)
 
-**Planned next (the owner's order, 2026-11-14):** shadows, then skinned characters if
-needed (the third-person camera is done). Instancing was discussed and deferred: worth it
+**Planned next (the owner's order, 2026-11-14):** skinned characters if needed (the
+third-person camera and shadows are done). Instancing was discussed and deferred: worth it
 for forests, crowds and particles, not for Drone Invaders' tens of objects. The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
@@ -769,7 +807,9 @@ can be mixed and matched from the same pieces.
   `reached(time)`.
 - Third-person camera: simple collider shapes only (no triangle-mesh ray tests), no
   player fade when close, no auto-follow swing; no character controller.
-- One directional light, no shadows, not PBR (roughness/metallic shape a Blinn-Phong
+- One directional light; only it casts shadows: one shadow map (no cascades), so shadows
+  stop at `shadows.distance` and are equally sharp near and far; constant softness; Blend
+  parts cast none; casters aren't culled for the shadow pass. Not PBR (roughness/metallic shape a Blinn-Phong
   highlight), no anti-aliasing, no skybox (the fog-coloured
   clear colour stands in), no frustum culling or instancing (one draw call per object).
 - Saves: no encryption/compression/cloud API (Steam Auto-Cloud works without code), no

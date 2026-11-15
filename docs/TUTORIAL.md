@@ -8,7 +8,8 @@ every step you can build and run the game and see the result.
 textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
 3D sound with Doppler, audio effects, a debug UI, 3D models from Blender (glTF), animated,
-and a third-person camera that follows a walking character and keeps out of walls.
+a third-person camera that follows a walking character and keeps out of walls, and
+shadows from the sun.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
@@ -29,6 +30,7 @@ background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECT
 | [12](#step-12--a-drone-model-gltf) | A glTF model with moving parts | The drone becomes a proper model, rotors spinning, leaning into its turn |
 | [13](#step-13--an-animated-gunner) | Animations from Blender, sockets | A soldier who follows the drone, fires (**F**) and reloads (**L**) |
 | [14](#step-14--a-third-person-camera) | `ThirdPersonCamera`, ray tests, a player character | Walk and run a second soldier; the camera follows him and won't go through crates; **C** switches cameras |
+| [15](#step-15--shadows-from-the-sun) | A shadow pass in `onPreRender`, `drawScene` | Everything casts shadows on the ground and on each other; **G** switches them off |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -2082,6 +2084,209 @@ or use the right stick to look around him; zoom with the mouse wheel or the d-pa
 behind the big crate and turn the camera so the crate is between you and it: the camera
 moves in front of it ("blocked" in the HUD). **C** switches to the fly camera and back.
 
+---
+
+## Step 15 — Shadows from the sun
+
+Without shadows, things don't quite sit on the ground: a crate could be resting on it or
+hovering an inch above. A shadow settles that at a glance, and it shows where things are
+in the air too: you can tell how high the drone is, and where, from its shadow on the
+ground.
+
+The `MeshRenderer` makes shadows with a **shadow map**, the way most games do:
+
+1. **The shadow pass.** First the scene is drawn from the sun's point of view, keeping
+   only depth: for every point of a square grid (the *map*), how far from the sun the
+   first surface is. Nothing is drawn on the screen.
+2. **The main pass.** Then the scene is drawn from the camera as before. For each pixel,
+   `mesh.frag` works out where that point is in the shadow map. If the map saw something
+   nearer the sun there, the point is in shadow, and only the sky's ambient light reaches
+   it.
+
+The shadow pass must happen before the main pass begins: you can't draw into the shadow
+map while drawing onto the screen. That is what `onPreRender` is for. Both passes draw the
+same scene, so move the drawing into a function of its own, `drawScene`, and call it
+twice. Between `beginShadows` and `endShadows` the same `draw()` calls draw into the
+shadow map instead.
+
+In **`MyGame.h`**, declare `onPreRender` after `onUpdate`:
+
+```cpp
+    void onPreRender(core::Application& app, gfx::FrameContext& frame) override;
+```
+
+and `drawScene` first in the private section:
+
+```cpp
+    void drawScene(float alpha); // the 3D scene: drawn twice, for the shadows and for the screen
+```
+
+and, among the debug UI settings, change `animateSun_` so that the sun stays still unless
+you tick *Animate sun* (Things to notice, below, says why):
+
+```cpp
+    bool animateSun_ = false; // off: a turning sun makes shadow edges crawl
+```
+
+In **`MyGame.cpp`**, replace the start of `onRender`, from its first line down to the
+ground's draw call, with the start of `drawScene`:
+
+```cpp
+// Everything in the 3D scene. Drawn twice a frame: first from the sun, into the shadow
+// map (onPreRender), then from the camera, onto the screen (onRender).
+void MyGame::drawScene(float alpha)
+{
+    // The fixed-step animation state, interpolated for smooth motion (in onUpdate).
+    const float spin = spinNow_;
+    const float t = simTimeNow_;
+
+    // Ground: checker texture with a green tint. Flat on the ground, it has nothing to
+    // cast a shadow on, so it skips the shadow pass.
+    render3d::Material ground{&checkerTexture_, {0.55f, 0.62f, 0.5f, 1.0f}};
+    ground.castShadows = false;
+    meshRenderer_->draw(ground_, glm::mat4(1.0f), ground);
+```
+
+The rest stays as it was, down to the player's rifle: crates, spheres, drone, gunner and
+player are now drawn in `drawScene`. The muzzle flash is light, not a solid thing, so it
+shouldn't cast a shadow either; after `flash.emissiveStrength = 3.0f;` add:
+
+```cpp
+        flash.castShadows = false; // a flash of light casts no shadow
+```
+
+After the player's rifle, close `drawScene` and start the two passes. Replace the line
+between the rifle and `meshRenderer_->end();` (an empty line) like this, so that the HUD
+code below stays in `onRender`:
+
+```cpp
+    meshRenderer_->draw(rifle_, gunner_.nodeMatrix(gunnerSocket_, p, &playerAnim_.pose()));
+}
+
+// Before the main pass: the shadow pass. The same scene, drawn from the sun.
+void MyGame::onPreRender(core::Application& app, gfx::FrameContext& frame)
+{
+    camera_.setAspect(float(frame.extent.width) / float(frame.extent.height)); // (the shadows' fit uses it)
+    meshRenderer_->beginShadows(frame, camera_, lighting_);
+    drawScene(app.interpolationAlpha());
+    meshRenderer_->endShadows();
+}
+
+void MyGame::onRender(core::Application& app, gfx::FrameContext& frame)
+{
+    meshRenderer_->begin(frame, camera_, lighting_);
+    drawScene(app.interpolationAlpha());
+    meshRenderer_->end();
+```
+
+`camera_.setAspect` moved from `onRender` to `onPreRender`, which comes first: the shadow
+map is fitted to what the camera sees, which depends on the window's shape.
+
+Add a key to switch the shadows on and off, after the **F1** wireframe toggle in
+`onUpdate`:
+
+```cpp
+    if (in.keyPressed(SDL_SCANCODE_G))
+        lighting_.shadows.enabled = !lighting_.shadows.enabled;
+```
+
+and in the HUD, count the shadow pass's draw calls too:
+
+```cpp
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls (+%u shadow)\ncamera  %s   %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
+                  double(app.fps()), meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls(),
+```
+
+then show a tag when the shadows are off. Change the comment above the tags to
+`// Top right: wireframe, mute, reverb and shadow indicators.` and after the reverb tag
+add:
+
+```cpp
+    if (!lighting_.shadows.enabled)
+        hud_->drawText(font_, "NO SHADOWS", {viewport.x - 16.0f * ui, 78.0f * ui}, tag);
+```
+
+Add **G** to the help text:
+
+```cpp
+        const char* help = cameraMode_ == CameraMode::Fly
+            ? "FLY CAMERA      C / (Start): follow the soldier\n"
+              "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down      Shift: fast\n"
+              "F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      G: shadows      H: hide help      ` (below Esc): debug UI"
+            : "THIRD PERSON      C / (Start): fly camera\n"
+              "WASD / left stick: walk      Shift / (L3): run      Right mouse / Tab / right stick: look around\n"
+              "Mouse wheel / d-pad: zoom      F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
+              "M: mute      R: reverb      V: vsync      G: shadows      H: hide help      ` (below Esc): debug UI";
+```
+
+Finally the debug UI. Show the shadow draw calls with the others:
+
+```cpp
+    ImGui::Text("Draw calls: %u (+%u for shadows)", meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls());
+```
+
+and add a Shadows section after the Lighting section:
+
+```cpp
+    if (ImGui::CollapsingHeader("Shadows")) {
+        render3d::ShadowSettings& sh = lighting_.shadows;
+        ImGui::Checkbox("Enabled", &sh.enabled);
+        ImGui::SliderFloat("Distance", &sh.distance, 5.0f, 150.0f, "%.0f m");
+        ImGui::SliderFloat("Strength", &sh.strength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Softness", &sh.softness, 0.0f, 4.0f, "%.1f texels");
+        ImGui::SliderFloat("Normal bias", &sh.normalBias, 0.0f, 5.0f, "%.1f texels");
+        ImGui::SliderFloat("Depth bias", &sh.depthBias, 0.0f, 5.0f, "%.1f texels");
+        ImGui::Text("Map %u x %u, one texel = %.1f cm", meshRenderer_->shadowMapSize(), meshRenderer_->shadowMapSize(),
+                    double(meshRenderer_->shadowTexelSize() * 100.0f));
+    }
+```
+
+Things to notice:
+
+- **The settings live with the lighting.** `lighting_.shadows` is a
+  `render3d::ShadowSettings`: on or off, how far from the camera there are shadows
+  (`distance`), how dark they are (`strength`) and how soft their edges (`softness`).
+  `MeshRenderer`'s constructor takes the map's size, 2048 x 2048 by default.
+- **One map, sized for the view.** The map covers a ball around everything the camera sees
+  out to `distance` (30 m), so with 2048 texels each texel is about 3.5 cm of ground.
+  Double the distance and the shadows get twice as coarse. Past about 80% of `distance`
+  the shadows fade out, so there's no hard line where they end.
+- **No crawling edges.** The ball's size depends only on the field of view and the
+  distance, not on which way the camera looks, and the map moves in whole texels as the
+  camera moves. A texel always covers the same patch of ground, so shadow edges stay still
+  instead of shimmering as you walk.
+- **A still sun.** That only works while the sun stays put. As the sun turns, the map's
+  grid turns with it, and every shadow edge redraws its little steps in new places each
+  frame: the edges crawl and buzz. The Step 6 animation turns the sun fast enough for
+  that to be about a texel per frame, so it is now off by default. Tick *Animate sun* to
+  see the effect. Games either keep the sun still or move it so slowly that it doesn't
+  show (a whole day over many minutes).
+- **Shadow acne.** A surface compared with its own depth in the map is "in front of itself"
+  or "behind itself" at random, from rounding, and stripes of shadow appear all over it.
+  `normalBias` (looking the shadow up slightly off the surface) and `depthBias` (allowing
+  a point to be a little in front of what the map saw) prevent that. Turn both to 0 in the
+  debug UI to see the acne: stripes and rings all over the spheres. Too much bias and
+  shadows start to come loose from the things casting them (*peter-panning*), most
+  visibly where a crate stands on the ground. The defaults (1 and 1.5) sit between.
+- **Soft edges.** The map is read through a *comparison sampler*: the GPU compares four
+  texels at once and blends the answers. `mesh.frag` averages nine such lookups in a
+  3 x 3 grid `softness` texels apart.
+- **What casts.** Every draw casts a shadow unless its `Material` has
+  `castShadows = false`: the ground (flat, so it has nothing to shade) and the flash
+  don't. See-through (Blend) parts of models never cast; alpha-masked ones (leaves,
+  fences) cut their holes out of the shadow too.
+- **The cost.** The scene is drawn twice: 72 draw calls on screen and 71 for the shadows
+  in this scene. Drawing depth only is cheap, but with thousands of objects you'd skip
+  those too far from the camera, or use instancing (Where to go next).
+
+**Try it:** in the debug UI, drag *Sun direction* down towards the horizon for long evening shadows. Change *Softness* from 0 (hard, pixelated edges) to 3,
+and *Distance* to 100 m: the shadows reach further but get blurrier.
+
+**Run it:** the crates, spheres and soldiers cast shadows on the ground and on each other,
+and the drone's shadow sweeps across the scene below it.
+**G** switches them off and on.
+
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
 
@@ -2102,8 +2307,9 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
    squad of gunners, each with its own `ModelAnimator`, firing in turn.
 4. **A skybox.** A cube drawn around the camera with a sky texture, rendered first with
    depth writes off.
-5. **Shadows.** Render the scene's depth from the sun in `onPreRender`, then sample that
-   *shadow map* in `mesh.frag`.
+5. **Sharper shadows further away.** One shadow map spreads its texels over the whole
+   shadow distance. *Cascades* split the view into 2–4 ranges, near to far, each with its
+   own map: sharp shadows at your feet and shadows reaching to the horizon.
 6. **Instancing.** Draw many copies of a mesh in one call by putting the model matrices in a
    buffer; essential for forests, crowds and particles.
 7. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.

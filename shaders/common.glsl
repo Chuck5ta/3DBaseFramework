@@ -1,5 +1,5 @@
-// Shared declarations for mesh.vert / mesh.frag. Included with
-// #extension GL_GOOGLE_include_directive.
+// Shared declarations for mesh.vert / mesh.frag and shadow.vert / shadow.frag. Included
+// with #extension GL_GOOGLE_include_directive.
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view;
@@ -11,6 +11,9 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 skyColor;      // linear * ambient intensity
     vec4 groundColor;
     vec4 fog;           // rgb colour, a = density
+    mat4 shadowMatrix;  // world -> the sun's clip space (the shadow map)
+    vec4 shadow;        // x = strength (0 = off), y = normal offset (m), z = depth bias, w = texel (uv)
+    vec4 shadowFade;    // x, y = fade out from/to this distance from the camera; z = softness (texels)
 } frame;
 
 layout(push_constant) uniform PushConstants {

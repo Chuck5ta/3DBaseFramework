@@ -450,7 +450,10 @@ directly, so performance is close to native. For release, prefer the native buil
 
 - 1280×800 resolution and text/UI legibility on a 7" screen.
 - Performance with Steam's frame limiter (30/40/60 Hz) and the performance overlay
-  (*… button → Performance*), and battery drain.
+  (*… button → Performance*), and battery drain. Compare GPU time with shadows on and
+  off (**G** in the demo): the shadow pass draws the scene a second time. If it costs too
+  much, a 1024 map (`MeshRenderer(gpu, renderer, 1024)`) with a shorter `shadows.distance`
+  is a quarter of the work per texel.
 - Controller only: every menu reachable without mouse or keyboard. In the demo, Start
   (the Menu button) switches cameras; the right stick orbits and the d-pad zooms.
 - Suspend/resume (power button) while the game runs: the swapchain is recreated
@@ -504,6 +507,10 @@ A short checklist (full details in the Steamworks documentation:
 | *Failed to load model '…': …* | The message says why. Common ones: the file isn't next to the exe in `assets/models/` (rebuild to copy assets); a `.gltf`'s `.bin` or textures weren't copied with it (export as `.glb` instead); it was exported with Draco compression (untick *Compression* in Blender's glTF export). |
 | A model's animation doesn't play, or a part doesn't move | The log lists the animations the file has (*has no animation called 'Fire' (it has: …)*). In Blender's glTF export, tick *Animation* and keep *Mode: Actions*: each Action becomes one animation (*NLA Tracks* mixed animations together in testing). Parts animated as separate objects must share one Action per animation, or each part exports as its own animation (Tutorial Step 13). A part that should move must be its own object (or parented to a bone), not joined into another mesh. A part that turns about the wrong point needs its origin on the joint. |
 | The third-person camera goes through a wall, or jumps in for no reason | It only avoids what your ray function reports: add the object to it (`raycastBox(ray, matrix)` with the matrix you draw it with, or a sphere or plane). If it jumps in with nothing in the way, a collider is too big or misplaced, or the player stands inside one: draw the shapes for a moment to check. |
+| No shadows | The HUD says *NO SHADOWS*: press **G** (or tick *Enabled* in the debug UI's Shadows section). In your own game: the shadow pass must run in `onPreRender`, with the same draw calls as `onRender`, between `beginShadows` and `endShadows`; and `lighting.shadows.strength` must be above 0. Things further than `shadows.distance` (30 m) from the camera get none. |
+| Stripes or rings of shadow all over surfaces (*shadow acne*) | Raise *Normal bias* and *Depth bias* in the Shadows section (`lighting.shadows.normalBias` / `depthBias`, in shadow-map texels). If shadows instead come loose from what casts them, lower them. Bigger `shadows.distance` means bigger texels and coarser shadows, not more acne: the biases scale with it. |
+| Shadow edges shimmer, crawl or buzz | The sun is moving: the map's texel grid turns with `sunDirection`, so edges redraw differently every frame. Untick *Animate sun* in the debug UI (it is off by default). In your own game, keep `lighting.sunDirection` still, or change it very slowly. Moving the camera alone doesn't cause this. |
+| Shadows look blocky, or a thin object casts none | Each shadow-map texel covers roughly `distance × 2.4 / map size` of ground (about 3.5 cm by default; the debug UI shows it). Lower `shadows.distance`, raise *Softness*, or construct the `MeshRenderer` with a bigger map (`MeshRenderer(gpu, renderer, 4096)`: 64 MB). Objects thinner than a texel or two may cast broken or no shadows. |
 | A model is invisible, inside out or faces the wrong way | Faces seen from behind are culled: in Blender, *Mesh > Normals > Recalculate Outside*, or tick *Backface Culling* off in the material's settings to export it double-sided. Apply rotation and scale before export (*Ctrl+A*). The framework's front is +Z, Blender's -Y. |
 | No sound | The log shows the device at startup (*Audio: … via WASAPI / PulseAudio / …*). *Audio: no output device* means none was found: the game keeps running silently. Check that `GAME_AUDIO` isn't set to `0`, the game isn't muted (**M** in the demo) and the sound files are in `assets/sounds/` next to the executable. |
 | Linux: *ALSA lib …* or *jack server is not running* lines in the console | Harmless. miniaudio is trying audio backends in turn; it uses the first one that works. |

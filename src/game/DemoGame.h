@@ -25,10 +25,12 @@ public:
     void onShutdown(core::Application& app) override;
     void onFixedUpdate(core::Application& app, float dt) override;
     void onUpdate(core::Application& app, float dt) override;
+    void onPreRender(core::Application& app, gfx::FrameContext& frame) override;
     void onRender(core::Application& app, gfx::FrameContext& frame) override;
     void onDebugUI(core::Application& app) override;
 
 private:
+    void drawScene(float alpha); // the 3D scene: drawn twice, for the shadows and for the screen
     void updateMouseCapture(core::Application& app);
     void updateFlyCamera(core::Application& app, float dt);
     void updateFollowCamera(core::Application& app, float dt);
@@ -83,7 +85,7 @@ private:
     int nextPing_ = 0;       // which sphere chimes next
 
     // Settings changed in the debug UI.
-    bool animateSun_ = true;
+    bool animateSun_ = false; // off: a turning sun makes shadow edges crawl
     float humVolume_ = 0.6f;
 
     int reverbPreset_ = 0;         // index into audio::ReverbPreset (0 = off), cycled with R

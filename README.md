@@ -2,8 +2,9 @@
 
 A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**.
 You own all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a
-depth buffer, a lit, textured mesh renderer that also draws glTF models from Blender, fly
-and third-person cameras and 3D audio, plus a demo scene showing how they fit together.
+depth buffer, a lit, textured mesh renderer with sun shadows that also draws glTF models
+from Blender, fly and third-person cameras and 3D audio, plus a demo scene showing how
+they fit together.
 
 | Layer | What it does | Library |
 |---|---|---|
@@ -12,7 +13,7 @@ and third-person cameras and 3D audio, plus a demo scene showing how they fit to
 | Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
-| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, wireframe | your code |
+| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, soft sun shadows (a stable shadow map around the camera), wireframe | your code |
 | Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
@@ -127,7 +128,8 @@ src/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
     Model               glTF 2.0 models: parts, materials, textures, poses, animations
     ModelAnimator       plays a model's animations (blending, looping, moments)
-    MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants)
+    MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants),
+                        sun shadows (a shadow pass in onPreRender)
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
     ThirdPersonCamera   follows a character: orbit, zoom, shoulder offset, collision
     Raycast             ray tests against planes, spheres and boxes
@@ -217,13 +219,18 @@ Tips
   `render3d::ThirdPersonCamera follow`. `rayFn` returns the nearest hit of your level's
   colliders (`render3d::raycastBox(ray, crateMatrix)` and friends) so the camera stays out
   of walls. Tutorial step 14.
+- Shadows: put your 3D drawing in one function and call it twice, between
+  `meshes_->beginShadows(frame, camera_, lighting_)` and `endShadows()` in
+  `onPreRender`, then between `begin()` and `end()` in `onRender`. Tune them with
+  `lighting_.shadows` (distance, strength, softness, biases); leave something out with
+  `material.castShadows = false`. Tutorial step 15.
 - Your own geometry: fill a `render3d::MeshData` (positions, normals, UVs, indices —
   counter-clockwise triangles) and construct a `Mesh`.
 - New shaders: drop `foo.vert`/`foo.frag` in `shaders/`, load
   `core::shaderPath("foo.vert.spv")`, build a pipeline with `gfx::PipelineBuilder`
   (copy the one in `MeshRenderer` and use `renderer.depthFormat()`).
-- Off-screen passes (shadow maps, post-processing) go in `Game::onPreRender`, which runs
-  before the main pass begins.
+- Other off-screen passes (post-processing, reflections) go in `Game::onPreRender` too,
+  which runs before the main pass begins.
 - Destroying a texture/buffer that an in-flight frame still uses is an error; call
   `app.renderer().waitIdle()` first (or destroy in `onShutdown`).
 - Sound: `app.audio().play(path, {.spatial = true, .position = p})` for 3D sound, with
@@ -273,6 +280,7 @@ The demo starts in third person, behind a soldier you can walk around.
 | Up / down (fly) | Space or E / Ctrl or Q | Right / left trigger |
 | Gunner fires / reloads | F / L | B / X |
 | Wireframe | F1 | Y |
+| Shadows on / off | G | |
 | Mute sound | M | |
 | Reverb: off / room / hall / cave | R | |
 | Debug UI (Debug builds) | ` (key below Esc) | |
@@ -321,7 +329,7 @@ limits (Steam's performance overlay helps), suspend/resume (swapchain recreation
 ## 7. Where to go next
 
 - **Skinned characters:** meshes bent by armature bones (GPU skinning), for smoother elbows and faces.
-- **Shadows:** a depth-only pass for the sun in `onPreRender`, sampled in `mesh.frag`.
+- **Shadow cascades:** several shadow maps from near to far, for sharp shadows close up that also reach the horizon.
 - **PBR materials:** metallic/roughness + image-based lighting.
 - **MSAA or FXAA/TAA** for smoother edges.
 - **Tools in the debug UI:** grow `onDebugUI` into a level editor or a tuning panel that saves to a file.

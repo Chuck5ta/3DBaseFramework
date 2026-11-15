@@ -225,6 +225,8 @@ void DemoGame::onUpdate(core::Application& app, float dt)
         app.renderer().setVsync(!app.renderer().vsync());
     if (in.keyPressed(SDL_SCANCODE_F1) || in.gamepadPressed(SDL_GAMEPAD_BUTTON_NORTH))
         meshRenderer_->setWireframe(!meshRenderer_->wireframe());
+    if (in.keyPressed(SDL_SCANCODE_G))
+        lighting_.shadows.enabled = !lighting_.shadows.enabled;
     if (in.keyPressed(SDL_SCANCODE_H))
         showHelp_ = !showHelp_;
     if (in.keyPressed(SDL_SCANCODE_M))
@@ -527,7 +529,7 @@ void DemoGame::onDebugUI(core::Application& app)
         return;
     }
 
-    ImGui::Text("Draw calls: %u", meshRenderer_->drawCalls());
+    ImGui::Text("Draw calls: %u (+%u for shadows)", meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls());
     bool wireframe = meshRenderer_->wireframe();
     if (ImGui::Checkbox("Wireframe", &wireframe))
         meshRenderer_->setWireframe(wireframe);
@@ -582,6 +584,18 @@ void DemoGame::onDebugUI(core::Application& app)
         ImGui::SliderFloat("Fog density", &lighting_.fogDensity, 0.0f, 0.1f, "%.4f", ImGuiSliderFlags_Logarithmic);
     }
 
+    if (ImGui::CollapsingHeader("Shadows")) {
+        render3d::ShadowSettings& sh = lighting_.shadows;
+        ImGui::Checkbox("Enabled", &sh.enabled);
+        ImGui::SliderFloat("Distance", &sh.distance, 5.0f, 150.0f, "%.0f m");
+        ImGui::SliderFloat("Strength", &sh.strength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Softness", &sh.softness, 0.0f, 4.0f, "%.1f texels");
+        ImGui::SliderFloat("Normal bias", &sh.normalBias, 0.0f, 5.0f, "%.1f texels");
+        ImGui::SliderFloat("Depth bias", &sh.depthBias, 0.0f, 5.0f, "%.1f texels");
+        ImGui::Text("Map %u x %u, one texel = %.1f cm", meshRenderer_->shadowMapSize(), meshRenderer_->shadowMapSize(),
+                    double(meshRenderer_->shadowTexelSize() * 100.0f));
+    }
+
     if (ImGui::CollapsingHeader("Sound")) {
         if (ImGui::SliderFloat("Crate hum", &humVolume_, 0.0f, 1.0f))
             app.audio().setVolume(crateHum_, humVolume_);
@@ -611,19 +625,19 @@ void DemoGame::onDebugUI(core::Application& app)
     ImGui::End();
 }
 
-void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
+// Everything in the 3D scene. Drawn twice a frame: first from the sun, into the shadow
+// map (onPreRender), then from the camera, onto the screen (onRender).
+void DemoGame::drawScene(float alpha)
 {
-    camera_.setAspect(float(frame.extent.width) / float(frame.extent.height));
-
     // The fixed-step animation state, interpolated for smooth motion (in onUpdate).
-    const float alpha = app.interpolationAlpha();
     const float spin = spinNow_;
     const float t = simTimeNow_;
 
-    meshRenderer_->begin(frame, camera_, lighting_);
-
-    // Ground: checker texture with a green tint.
-    meshRenderer_->draw(ground_, glm::mat4(1.0f), {&checkerTexture_, {0.55f, 0.62f, 0.5f, 1.0f}});
+    // Ground: checker texture with a green tint. Flat on the ground, it has nothing to
+    // cast a shadow on, so it skips the shadow pass.
+    render3d::Material ground{&checkerTexture_, {0.55f, 0.62f, 0.5f, 1.0f}};
+    ground.castShadows = false;
+    meshRenderer_->draw(ground_, glm::mat4(1.0f), ground);
 
     // Centrepiece: a big crate, and a ring of crates around it.
     meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
@@ -663,6 +677,7 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
         render3d::Material flash{nullptr, {1.0f, 0.75f, 0.3f, 1.0f}};
         flash.emissive = {1.0f, 0.7f, 0.25f};
         flash.emissiveStrength = 3.0f;
+        flash.castShadows = false; // a flash of light casts no shadow
         meshRenderer_->draw(sphere_, glm::scale(glm::translate(muzzle, {0.0f, 0.0f, 0.06f}), glm::vec3(0.12f, 0.12f, 0.22f)),
                             flash);
     }
@@ -671,7 +686,21 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     const glm::mat4 p = playerTransform();
     meshRenderer_->draw(gunner_, p, &playerAnim_.pose());
     meshRenderer_->draw(rifle_, gunner_.nodeMatrix(gunnerSocket_, p, &playerAnim_.pose()));
+}
 
+// Before the main pass: the shadow pass. The same scene, drawn from the sun.
+void DemoGame::onPreRender(core::Application& app, gfx::FrameContext& frame)
+{
+    camera_.setAspect(float(frame.extent.width) / float(frame.extent.height)); // (the shadows' fit uses it)
+    meshRenderer_->beginShadows(frame, camera_, lighting_);
+    drawScene(app.interpolationAlpha());
+    meshRenderer_->endShadows();
+}
+
+void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
+{
+    meshRenderer_->begin(frame, camera_, lighting_);
+    drawScene(app.interpolationAlpha());
     meshRenderer_->end();
 
     // ===== HUD: 2D text and shapes on top, with a camera where 1 unit = 1 pixel =====
@@ -687,8 +716,8 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
 
     // Top left: performance and camera info, with a soft shadow for readability.
     char info[256];
-    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls\ncamera  %s   %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
-                  double(app.fps()), meshRenderer_->drawCalls(),
+    std::snprintf(info, sizeof(info), "%.0f fps   %u draw calls (+%u shadow)\ncamera  %s   %.1f, %.1f, %.1f\ngunner  %s   ammo %d",
+                  double(app.fps()), meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls(),
                   cameraMode_ == CameraMode::Fly ? "fly" : (follow_.blocked() ? "third person (blocked)" : "third person"),
                   double(camera_.position.x), double(camera_.position.y), double(camera_.position.z),
                   gunnerAnim_.animationName().c_str(), ammo_);
@@ -697,7 +726,7 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     hud_->drawText(font_, info, glm::vec2(17.0f, 13.0f) * ui, shadow);
     hud_->drawText(font_, info, glm::vec2(16.0f, 12.0f) * ui, text);
 
-    // Top right: wireframe and mute indicators.
+    // Top right: wireframe, mute, reverb and shadow indicators.
     render2d::TextStyle tag = text;
     tag.align = render2d::TextAlign::Right;
     tag.color = render2d::colors::Yellow;
@@ -708,6 +737,8 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
     const char* reverbNames[] = {"", "REVERB: ROOM", "REVERB: HALL", "REVERB: CAVE"};
     if (reverbPreset_ > 0)
         hud_->drawText(font_, reverbNames[reverbPreset_], {viewport.x - 16.0f * ui, 56.0f * ui}, tag);
+    if (!lighting_.shadows.enabled)
+        hud_->drawText(font_, "NO SHADOWS", {viewport.x - 16.0f * ui, 78.0f * ui}, tag);
 
     // Bottom: a help panel, sized to fit its text.
     if (showHelp_) {
@@ -715,11 +746,11 @@ void DemoGame::onRender(core::Application& app, gfx::FrameContext& frame)
             ? "FLY CAMERA      C / (Start): follow the soldier\n"
               "Right mouse / Tab: look      WASD / left stick: move      Space / Ctrl: up / down      Shift: fast\n"
               "F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
-              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI"
+              "M: mute      R: reverb      V: vsync      G: shadows      H: hide help      ` (below Esc): debug UI"
             : "THIRD PERSON      C / (Start): fly camera\n"
               "WASD / left stick: walk      Shift / (L3): run      Right mouse / Tab / right stick: look around\n"
               "Mouse wheel / d-pad: zoom      F / (B): gunner fires      L / (X): gunner reloads      F1 / (Y): wireframe\n"
-              "M: mute      R: reverb      V: vsync      H: hide help      ` (below Esc): debug UI";
+              "M: mute      R: reverb      V: vsync      G: shadows      H: hide help      ` (below Esc): debug UI";
         render2d::TextStyle style = text;
         style.align = render2d::TextAlign::Center;
         const glm::vec2 size = font_.measure(help, style.size);
