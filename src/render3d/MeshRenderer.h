@@ -26,6 +26,12 @@ struct Material {
     glm::vec3 emissive{0.0f};              // sRGB glow colour (lights, LEDs), unaffected by lighting
     float emissiveStrength = 1.0f;         // above 1 for a brighter glow
     const gfx::Texture* emissiveTexture = nullptr; // where it glows (times `emissive`); nullptr = everywhere
+    // Bumps, grooves and grain without extra triangles: which way the surface faces, per
+    // texel (tangent space; green = up, as Blender and glTF make them). Load it with
+    // TextureDesc::srgb = false: it's data, not a colour. The mesh needs tangents
+    // (generateTangents; the primitives have them).
+    const gfx::Texture* normalTexture = nullptr;
+    float normalScale = 1.0f;              // how strongly it bends the surface (0 = flat)
     float roughness = 0.5f;                // 0 = glossy, small sharp highlight; 1 = matte
     float metallic = 0.0f;                 // 1 = metal: highlights take the surface colour
     bool doubleSided = false;              // visible from behind too (thin planes)
@@ -98,8 +104,13 @@ struct SceneLighting {
 // around the whole model; only the copies left go into the instance buffer. Nothing to
 // do: it's on unless you call setFrustumCulling(false).
 //
-// Per-frame data (camera, lights) lives in a uniform buffer (set 0); the base colour and
-// emission textures are set 1; the model matrix and material values are push constants.
+// Normal maps: a Material's normalTexture, or a glTF material's normal texture, bends the
+// surface's normal per pixel along the vertex's tangent frame (Vertex::tangent), so light
+// catches grooves, bevels and grain that aren't in the geometry.
+//
+// Per-frame data (camera, lights) lives in a uniform buffer (set 0); the base colour,
+// emission and normal textures are set 1; the model matrix and material values are push
+// constants.
 // Opaque and alpha-masked parts are drawn straight away; see-through (Blend) parts are
 // collected and drawn in end(), farthest first, so they blend over everything behind them.
 // The shadow map is the depth of the scene as the sun sees it (set 0, binding 1).
@@ -137,6 +148,10 @@ public:
     void setCullingFrozen(bool frozen) { cullingFrozen_ = frozen; }
     bool cullingFrozen() const { return cullingFrozen_; }
 
+    // Normal maps on (the default) or off, to compare.
+    void setNormalMaps(bool enabled) { normalMaps_ = enabled; }
+    bool normalMaps() const { return normalMaps_; }
+
     void setWireframe(bool enabled) { wireframe_ = enabled && wireframePipeline_.valid(); }
     bool wireframe() const { return wireframe_; }
     bool wireframeSupported() const { return wireframePipeline_.valid(); }
@@ -161,7 +176,7 @@ public:
 private:
     gfx::VulkanContext& ctx_;
     VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout materialSetLayout_ = VK_NULL_HANDLE; // binding 0 base colour, 1 emission
+    VkDescriptorSetLayout materialSetLayout_ = VK_NULL_HANDLE; // binding 0 base colour, 1 emission, 2 normal
     gfx::DescriptorAllocator descriptors_;
     gfx::Pipeline pipeline_;
     gfx::Pipeline blendPipeline_;     // see-through parts: blended, no depth writes
@@ -170,6 +185,8 @@ private:
     // data in a second vertex buffer.
     gfx::Pipeline skinnedPipeline_, skinnedBlendPipeline_, skinnedWireframePipeline_, skinnedShadowPipeline_;
     gfx::Texture white_;
+    gfx::Texture flatNormal_; // "straight out": stands in when there's no normal map
+    bool normalMaps_ = true;
 
     // Shadows: a depth image the sun "sees", and a sampler that compares against it.
     gfx::Image shadowMap_;
@@ -203,7 +220,7 @@ private:
     void writeFrameUniforms(uint32_t frameIndex, const Camera3D& camera, const SceneLighting& lighting,
                             bool shadows);
     void fitShadowMap(const Camera3D& camera, const SceneLighting& lighting);
-    void bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission);
+    void bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission, const gfx::Texture* normal);
     void setCulling(bool doubleSided, bool mirrored);
     // Which copies a draw makes: `count` matrices from `first` in the instance buffer, the
     // last `mirrored` of them mirrored (a negative scale, so drawn with the other winding).
@@ -245,12 +262,13 @@ private:
         gfx::Buffer joints;    // joint matrices of the skinned models drawn this frame
         gfx::Buffer instances; // matrices of the copies drawn by drawInstanced; [0] = identity
         VkDescriptorSet set = VK_NULL_HANDLE;
-        // Texture pairs used this frame, each with its set. Rebuilt every frame (the pool
+        // Texture sets (base colour, emission, normal) used this frame, each with its set. Rebuilt every frame (the pool
         // is reset when the frame comes round again), so no set outlives its textures.
         std::unique_ptr<gfx::DescriptorAllocator> materialSets;
         struct Cached {
             const gfx::Texture* baseColor;
             const gfx::Texture* emission;
+            const gfx::Texture* normal;
             VkDescriptorSet set;
         };
         std::vector<Cached> cache;

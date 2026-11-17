@@ -65,6 +65,8 @@ struct ModelMaterial {
     int baseColorTexture = -1;   // index into ModelData::textures, -1 = none
     glm::vec3 emissive{0.0f};    // linear glow colour, already times the emission strength
     int emissiveTexture = -1;    // multiplied with `emissive` (glowing windows, screens, LEDs)
+    int normalTexture = -1;      // a normal map (tangent space, OpenGL/glTF convention: green = up)
+    float normalScale = 1.0f;    // how strongly it bends the surface (glTF's normalTexture.scale)
     float metallic = 1.0f;       // glTF's defaults; Blender writes its own values
     float roughness = 1.0f;
     AlphaMode alphaMode = AlphaMode::Opaque;

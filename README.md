@@ -2,7 +2,7 @@
 
 A small, engine-free base for 3D games on **Windows, Linux and Steam Deck**. You own all
 the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer, a
-lit, textured mesh renderer with sun shadows, instancing and frustum culling that also draws glTF models
+lit, textured mesh renderer with sun shadows, normal maps, instancing and frustum culling that also draws glTF models
 from Blender (animated, rigid or skinned), fly and third-person cameras and 3D audio, plus
 a demo scene showing how they fit together.
 
@@ -13,8 +13,8 @@ a demo scene showing how they fit together.
 | Game states | A stack of screens (title, pause, game over) above the game: each can pause or hide what's below; safe push/pop/replace | your code |
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
-| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, soft sun shadows (a stable shadow map around the camera), instancing (hundreds of copies in one draw call), frustum culling (what the camera or the sun can't see isn't drawn), wireframe | your code |
-| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; skinned meshes bent on the GPU (4 bones per vertex); named parts posed in code (spinning rotors, turrets) | cgltf |
+| 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, normal maps (MikkTSpace tangents, so Blender bakes line up), soft sun shadows (a stable shadow map around the camera), instancing (hundreds of copies in one draw call), frustum culling (what the camera or the sun can't see isn't drawn), wireframe | your code, MikkTSpace |
+| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, normal-mapped, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; skinned meshes bent on the GPU (4 bones per vertex); named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
@@ -126,11 +126,14 @@ src/
     Font                .ttf/.otf baked into a texture atlas
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
+    Tangents            generateTangents: MikkTSpace tangents for normal maps
     Model               glTF 2.0 models: parts, materials, textures, poses, animations, skins
     ModelAnimator       plays a model's animations (blending, looping, moments)
     MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants),
-                        sun shadows (a shadow pass in onPreRender), GPU skinning
+                        sun shadows (a shadow pass in onPreRender), GPU skinning, normal maps,
+                        instancing, frustum culling
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
+    Frustum             the six planes of a view: is a box or sphere in it?
     ThirdPersonCamera   follows a character: orbit, zoom, shoulder offset, collision
     Raycast             ray tests against planes, spheres and boxes
   game/
@@ -238,6 +241,10 @@ Tips
   `material.castShadows = false`. Tutorial step 15.
 - Your own geometry: fill a `render3d::MeshData` (positions, normals, UVs, indices —
   counter-clockwise triangles) and construct a `Mesh`.
+- Normal maps (bumps, grooves, grain without extra triangles): load the map with
+  `gfx::TextureDesc` `srgb = false` and set `material.normalTexture`. Primitives and glTF
+  models come with tangents; for your own `MeshData`, call `render3d::generateTangents(data)`
+  first. A glTF material's normal texture is used automatically. Tutorial step 19.
 - New shaders: drop `foo.vert`/`foo.frag` in `shaders/`, load
   `core::shaderPath("foo.vert.spv")`, build a pipeline with `gfx::PipelineBuilder`
   (copy the one in `MeshRenderer` and use `renderer.depthFormat()`).

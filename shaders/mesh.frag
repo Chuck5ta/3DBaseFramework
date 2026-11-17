@@ -7,11 +7,14 @@ layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap; // compares: 1 =
 
 layout(set = 1, binding = 0) uniform sampler2D albedoTexture;
 layout(set = 1, binding = 1) uniform sampler2D emissiveTexture; // white if the material has none
+layout(set = 1, binding = 2) uniform sampler2D normalTexture;   // (0.5, 0.5, 1) if it has none
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inColor;
+layout(location = 4) in vec3 inTangent;   // zero if the mesh has no tangents
+layout(location = 5) in vec3 inBitangent;
 
 layout(location = 0) out vec4 outColor;
 
@@ -52,9 +55,20 @@ void main()
     if (albedo.a < object.emissive.a)
         discard; // alpha mask: cut-out leaves, fences, decals
 
-    vec3 N = normalize(inNormal);
-    if (!gl_FrontFacing)
+    // The surface's own normal (for the shadow lookup), then bent by the normal map: the
+    // map's x, y and z say how much of the tangent, bitangent and normal make up this
+    // pixel's normal (tangents.glsl). Its strength scales the bend (glTF's normal scale).
+    vec3 geometryNormal = normalize(inNormal);
+    vec3 N = geometryNormal;
+    if (object.surface.x > 0.0 && dot(inTangent, inTangent) > 0.0) {
+        vec3 t = texture(normalTexture, inUV).xyz * 2.0 - 1.0;
+        t.xy *= object.surface.x;
+        N = normalize(t.x * inTangent + t.y * inBitangent + t.z * inNormal);
+    }
+    if (!gl_FrontFacing) {
         N = -N; // correct lighting for double-sided / wireframe draws
+        geometryNormal = -geometryNormal;
+    }
     vec3 L = normalize(frame.sunDirection.xyz);
     vec3 V = normalize(frame.cameraPosition.xyz - inWorldPos);
     vec3 H = normalize(L + V);
@@ -74,7 +88,7 @@ void main()
 
         float NdotL = max(dot(N, L), 0.0);
         // Shadows block the sun only; the sky's ambient light still gets in.
-        float sun = NdotL > 0.0 ? sunlight(inWorldPos, N) : 0.0;
+        float sun = NdotL > 0.0 ? sunlight(inWorldPos, geometryNormal) : 0.0;
         vec3 ambient = mix(frame.groundColor.rgb, frame.skyColor.rgb, N.y * 0.5 + 0.5);
         vec3 diffuse = frame.sunColor.rgb * NdotL * sun;
         float specular = pow(max(dot(N, H), 0.0), shininess) * strength * sun;

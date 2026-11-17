@@ -10,7 +10,8 @@ animation on the fixed timestep with interpolation, a 2D text HUD on top of the 
 3D sound with Doppler, audio effects, a debug UI, 3D models from Blender (glTF), animated,
 a third-person camera that follows a walking character and keeps out of walls,
 shadows from the sun, a skinned character that bends at the joints, a forest drawn
-with instancing, and frustum culling, which leaves out what can't be seen.
+with instancing, frustum culling, which leaves out what can't be seen, and normal maps,
+which add bumps and grooves without triangles.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
@@ -35,6 +36,7 @@ background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECT
 | [16](#step-16--a-skinned-soldier) | A skinned model (one mesh bent by its bones) | The player's elbows and knees bend smoothly; the gunner keeps his rigid parts |
 | [17](#step-17--a-forest-instancing) | Instancing: many copies in one draw call | A forest of 800 trees around the scene, in two draw calls |
 | [18](#step-18--out-of-sight-frustum-culling) | Frustum culling, triangle counts, a frozen view | The same picture with most of the forest left out; freeze it and fly out to see |
+| [19](#step-19--bumps-without-triangles-normal-maps) | A normal map for the crates | Bevelled frames, grooves between the planks and a little grain, on the same twelve triangles |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -2677,6 +2679,106 @@ all (0 draw calls), but the shadow pass still draws what casts shadows around yo
 
 **Run it:** the scene looks exactly as before, but the triangle count drops as you turn
 away from the forest and climbs as you look into it.
+
+---
+
+## Step 19 — Bumps without triangles (normal maps)
+
+Walk up to the big crate: its frame, brace and planks are painted on. The light falls on
+the whole face evenly, so up close it looks like a picture of a crate glued to a cube. The
+real thing would catch the light on the bevelled edges and have shadowy grooves between
+the planks. Modelling those would take hundreds of triangles per crate. A **normal map**
+gets the look with none.
+
+- **What it stores.** Lighting only needs to know which way the surface faces at each
+  pixel: its *normal*. A normal map is a texture of those directions, relative to the
+  surface: red says how far it leans along the texture's u (to the right), green along v
+  (up the image), blue how much it faces straight out. That's why normal maps look
+  lilac: (0.5, 0.5, 1) is "straight out".
+- **The tangent frame.** To turn "right and up the image" into directions in the world,
+  each vertex needs to know which way u and v run across the surface: its *tangent*
+  (`Vertex::tangent`). `render3d::generateTangents` works them out with MikkTSpace, the
+  method Blender and most bakers use, so a normal map baked in Blender lines up exactly.
+  The primitives and glTF models get them automatically.
+- **Where maps come from.** Painted or generated from a height map (like the crate's,
+  made by `tools/make_crate_normal.py` from the crate texture's layout), or *baked*: a
+  detailed model's surface captured into a map for a simpler one, so a low-poly character
+  looks high-poly.
+
+In **`MyGame.h`**, add a texture after `crateTexture_`:
+
+```cpp
+    gfx::Texture crateNormals_; // its normal map: bevels, grooves and grain
+```
+
+In **`MyGame.cpp`**'s `onInit`, load it after the crate texture. It's data (directions),
+not a colour, so it mustn't be treated as sRGB:
+
+```cpp
+    gfx::TextureDesc normalMap;
+    normalMap.srgb = false; // directions, not colours: no sRGB decoding
+    normalMap.debugName = "crate normals";
+    crateNormals_ = gfx::Texture::fromFile(gpu, core::assetPath("textures/crate_normal.png"), normalMap);
+```
+
+In `drawScene`, give the crates a material with the normal map. Replace the crate lines
+(from the big crate's `draw` to the ring's `drawInstanced`) with:
+
+```cpp
+    // Centrepiece: a big crate, and a ring of crates around it, all twelve in one draw call
+    // (instancing: the same mesh and material, a matrix for each copy). The normal map
+    // gives the frame, brace and planks their bevels and grooves.
+    render3d::Material crate{&crateTexture_};
+    crate.normalTexture = &crateNormals_;
+    meshRenderer_->draw(cube_, bigCrateMatrix(spin), crate);
+    glm::mat4 ring[kRing];
+    for (int i = 0; i < kRing; ++i)
+        ring[i] = ringCrateMatrix(i, spin);
+    meshRenderer_->drawInstanced(cube_, ring, crate);
+```
+
+Finally, in `onDebugUI`, add a switch beside *Wireframe*:
+
+```cpp
+    ImGui::SameLine();
+    bool normalMaps = meshRenderer_->normalMaps();
+    if (ImGui::Checkbox("Normal maps", &normalMaps)) // off: the crates go flat
+        meshRenderer_->setNormalMaps(normalMaps);
+```
+
+and show the map in the *Textures* section, between the crate and the checkerboard:
+
+```cpp
+        ImGui::Image(ui.texture(crateNormals_), size);
+        ImGui::SameLine();
+```
+
+Things to notice:
+
+- **Only the light changes.** Look at a crate's edge against the sky: it's as straight as
+  ever. A normal map changes shading, not shape; the silhouette, the shadow it casts and
+  collisions stay the cube's.
+- **It moves with the light.** Turn on *Animate sun* in the *Lighting* section, or walk
+  around a crate: the lit and shaded edges of the frame swap sides as the light comes from
+  elsewhere. A painted-on highlight couldn't do that.
+- **Mirrored and instanced copies** work as they are: a copy with a negative scale flips
+  its tangent frame in the vertex shader, so its bumps still face the light the right way.
+- **From far away** the grooves fade: the GPU reads smaller, blurred versions of the map
+  (mipmaps), which average the directions out. That's expected, and it's what stops the
+  pattern shimmering.
+- **Strength.** `crate.normalScale = 2.0f` exaggerates the bumps; `0.5f` softens them. A
+  glTF file's normal texture brings its own strength.
+- **Green up.** Game3D expects the OpenGL / glTF / Blender convention: green means "up the
+  image". Some tools make DirectX-style maps (green down): bumps then look like dents.
+  Invert the green channel to fix one.
+- **Your own meshes** need tangents before they can use a normal map: call
+  `render3d::generateTangents(data)` on the `MeshData` before making the `Mesh`.
+
+**Try it:** untick *Normal maps* in the debug UI and look at the big crate from close up:
+the frame and brace go flat. Then try `crate.normalScale = 3.0f`.
+
+**Run it:** the crates' frames and braces stand out from the planks, with grooves between
+the planks, catching the sun on one side and in shade on the other.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.

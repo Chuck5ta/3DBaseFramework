@@ -15,7 +15,7 @@
 An engine-free C++20 starter for **3D games** on Windows, Linux and Steam Deck. The game
 owns all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer,
 a lit and textured forward renderer for meshes and **glTF models** (from Blender) with
-their **animations** and **skinning**, **instancing**, **frustum culling**, sun shadows, fly and third-person cameras, a 2D overlay for HUD text, 3D audio with effects and
+their **animations** and **skinning**, **normal maps**, **instancing**, **frustum culling**, sun shadows, fly and third-person cameras, a 2D overlay for HUD text, 3D audio with effects and
 Doppler, and a debug UI. A demo scene (`DemoGame`: crates, spheres, a sun that can be animated, a humming
 crate, chiming spheres, a drone model circling with spinning rotors, an animated gunner
 built from rigid parts who tracks it, fires and reloads, a skinned player soldier you
@@ -47,11 +47,11 @@ src/
   debugui/              DebugUI (Dear ImGui)
   game/                 DemoGame (the example); your game goes here
 shaders/                mesh.vert/.frag, shadow.vert/.frag, mesh_skinned.vert, shadow_skinned.vert, skin.glsl,
-                        instance.glsl, common.glsl, sprite.vert/.frag, imgui.frag
-assets/                 fonts/ (Roboto), models/ (drone, gunner, soldier, rifle, tree .glb), sounds/, textures/ (copied next to the exe)
+                        instance.glsl, tangents.glsl, common.glsl, sprite.vert/.frag, imgui.frag
+assets/                 fonts/ (Roboto), models/ (drone, gunner, soldier, rifle, tree .glb), sounds/, textures/ (crate + its normal map) (copied next to the exe)
 cmake/                  Dependencies.cmake, Shaders.cmake
-tools/                  make_drone.py, make_gunner.py, make_tree.py (+ gltf_builder.py), make_gunner_sounds.py:
-                        the demo's models and gunner sounds, generated in plain Python
+tools/                  make_drone.py, make_gunner.py, make_tree.py (+ gltf_builder.py), make_gunner_sounds.py,
+                        make_crate_normal.py: the demo's models, gunner sounds and crate normal map, in plain Python
 docs/                   GAME3D_ARCHITECTURE, BUILDING, TUTORIAL, GAME3D_AI_BRIEFING (this file)
 ```
 
@@ -404,8 +404,11 @@ to about ±1.55), `fovY`, `nearPlane`, `farPlane`. `setAspect(w / h)` every fram
 Y flipped), `viewProjection()`.
 
 **`render3d::Mesh`:** `Mesh(app.gpu(), MeshData, "name")`; `MeshData` = `vertices` (`position`,
-`normal`, `uv`, `color` = linear vertex colour, white by default) + `indices` (uint32). Primitives: `primitives::cube(size)`,
-`plane(size, uvRepeat)` (XZ plane facing +Y), `sphere(radius, segments, rings)`.
+`normal`, `uv`, `color` = linear vertex colour, white by default, `tangent` = vec4 for normal
+maps, xyz along +u, w = ±1, all zero = none; 64 bytes) + `indices` (uint32). Primitives:
+`primitives::cube(size)`, `plane(size, uvRepeat)` (XZ plane facing +Y), `sphere(radius,
+segments, rings)`, all with tangents. For your own `MeshData` with a normal map, call
+`render3d::generateTangents(data)` (`render3d/Tangents.h`) before making the `Mesh`.
 
 **`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384)`,
 needs `config.renderer.depthBuffer = true`):
@@ -413,12 +416,14 @@ needs `config.renderer.depthBuffer = true`):
 `draw(model, transform, &pose)` × n → `end()` (see-through model parts are drawn in `end()`,
 farthest first). It stops with a message if the renderer has no depth buffer.
 `Material{texture, color (sRGB tint), emissive (sRGB glow), emissiveStrength,
-emissiveTexture, roughness = 0.5, metallic = 0, doubleSided, castShadows = true}`.
-`setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
+emissiveTexture, normalTexture, normalScale = 1, roughness = 0.5, metallic = 0, doubleSided,
+castShadows = true}` (load a normal map with `TextureDesc::srgb = false`).
+`setNormalMaps(bool)` / `normalMaps()` (all normal maps on/off, to compare), `setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
 `shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres), `jointsUsed()`,
 `maxJoints()`, `instancesUsed()`, `maxInstances()`, `triangles()`, `shadowTriangles()`.
 Per-object data travels
-as push constants (one draw call per object or model part). Build model matrices with
+as push constants (one draw call per object or model part); the block is 128 bytes, the
+guaranteed maximum, and full (three floats of `surface` are spare). Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
 
 **Instancing** — many copies of one mesh or model in one draw call per part:
@@ -438,6 +443,23 @@ one-offs.
   opposite winding. Blend parts are queued per copy for `end()`'s sorted pass.
 - Both passes append (each call costs its copy count twice with shadows); overflow skips
   the call with one warning. Only copies that pass frustum culling are uploaded.
+
+**Normal maps** — `Material::normalTexture` (+ `normalScale`) or a glTF material's normal
+texture. Tangent space, OpenGL/glTF/Blender convention (green = up the image). Set 1
+binding 2 (a flat (0.5, 0.5, 1) texture when there's none); push constant
+`surface.x` = strength (0 = off; also off when the vertex has no tangent).
+
+- Tangents: `Vertex::tangent` (xyz, w = ±1), from MikkTSpace (`render3d/Tangents.h`,
+  library fetched in Game3D's own `CMakeLists.txt`, not the shared `Dependencies.cmake`)
+  with UV v fed as `1 - v`; or from the glTF file.
+- Shaders (`tangents.glsl`): per vertex `N = normalize(normalMatrix · n)`,
+  `T = normalize(mat3(model) · t)`, `B = t.w · sign(det(model)) · cross(N, T)`; per pixel
+  `N' = normalize(m.x·T + m.y·B + m.z·N)` with the interpolated vectors not renormalised,
+  `m = texel·2 − 1` with xy × strength (the MikkTSpace pixel transform, so maps baked by a
+  MikkTSpace baker, such as CharacterCreator's planned one, line up). Skinned meshes bend
+  the tangent with the same skin matrix. Shadow lookups use the surface's own normal.
+- Demo: the crates (`assets/textures/crate_normal.png` from `tools/make_crate_normal.py`);
+  debug UI *Normal maps* checkbox next to *Wireframe*.
 
 **Frustum culling** — automatic, nothing to call. `begin()` builds a `render3d::Frustum`
 from the camera, `beginShadows()` from the shadow map's box (which reaches 100 m towards the
@@ -514,10 +536,16 @@ meshes.draw(drone_, transform, &pose_);       // pose optional (nullptr = as exp
   `parent`, `mesh` and the default transform; `nodeCount()`.
 - Bounds of the default pose: `boundsMin()`, `boundsMax()`, `size()`, `center()`.
 - Materials used: base colour (factor × texture × vertex colour), emissive (×
-  `KHR_materials_emissive_strength`, × texture), metallic and roughness factors, alpha
+  `KHR_materials_emissive_strength`, × texture), normal texture + scale
+  (`ModelMaterial::normalTexture`, `normalScale`), metallic and roughness factors, alpha
   modes (opaque, mask + cutoff, blend), double-sided, `KHR_materials_unlit`; per-texture
-  filter and per-axis wrap. Ignored with a logged warning: metallic-roughness, normal and
+  filter and per-axis wrap. Ignored with a logged warning: metallic-roughness and
   occlusion textures, morph targets, cameras, lights.
+- Normal-mapped parts get tangents at load: the file's `TANGENT`, or MikkTSpace
+  (`generateTangents`, with UV v flipped to count up as Blender does; verified identical
+  to Blender's tangents on Khronos' NormalTangentMirrorTest, 2026-11-17). Vertices needing
+  two tangents are copied (with their skin data). Textures used as normal maps are
+  uploaded linear.
 - `render3d::loadModelData(path, data, &error)` loads into `ModelData` on the CPU only
   (tools and tests), returning false with a reason instead of stopping.
 - One `Model` in memory can be drawn many times with different transforms and poses.
@@ -879,14 +907,16 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
 
 **Roadmap (the owner's order):** model animation, third-person camera, shadows and
 skinned characters are all done (skinning 2026-11-15), and so are instancing (2026-11-15)
-and frustum culling (2026-11-17). Nothing is queued; ask the owner. Candidates:
+and frustum culling and normal maps (2026-11-17; normal maps asked for by the
+CharacterCreator project, stage 2 of its bake plan). Nothing is queued; ask the owner. Candidates:
 upper-body animation layering (walk + fire), shadow cascades, gamepad polish for the Steam Deck (the owner gets one late
 November 2026). The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
 
-- Models: no morph targets, normal/occlusion/metallic-roughness textures, KTX2/WebP
-  images or Draco/meshopt compression (refused with a message). Skinning is linear blend,
+- Models: no morph targets, occlusion/metallic-roughness textures, KTX2/WebP images or
+  Draco/meshopt compression (refused with a message). Normal maps: first UV map only, no
+  parallax. Skinning is linear blend,
   4 joints per vertex. One animation per animator at a time (plus cross-fades); no
   per-body-part layering; no animation events beyond `reached(time)`.
 - Third-person camera: simple collider shapes only (no triangle-mesh ray tests), no

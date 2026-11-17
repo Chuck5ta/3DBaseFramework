@@ -124,6 +124,10 @@ void DemoGame::onInit(core::Application& app)
     ground_ = Mesh(gpu, primitives::plane(200.0f, 100.0f), "ground"); // 200 x 200, texture repeated 100x
 
     crateTexture_ = gfx::Texture::fromFile(gpu, core::assetPath("textures/crate.png"));
+    gfx::TextureDesc normalMap;
+    normalMap.srgb = false; // directions, not colours: no sRGB decoding
+    normalMap.debugName = "crate normals";
+    crateNormals_ = gfx::Texture::fromFile(gpu, core::assetPath("textures/crate_normal.png"), normalMap);
     checkerTexture_ = makeCheckerTexture(gpu);
 
     // Clear to the fog colour, so distant geometry fades into the "sky".
@@ -591,6 +595,10 @@ void DemoGame::onDebugUI(core::Application& app)
     bool wireframe = meshRenderer_->wireframe();
     if (ImGui::Checkbox("Wireframe", &wireframe))
         meshRenderer_->setWireframe(wireframe);
+    ImGui::SameLine();
+    bool normalMaps = meshRenderer_->normalMaps();
+    if (ImGui::Checkbox("Normal maps", &normalMaps)) // off: the crates go flat
+        meshRenderer_->setNormalMaps(normalMaps);
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         int mode = int(cameraMode_);
@@ -692,6 +700,8 @@ void DemoGame::onDebugUI(core::Application& app)
         const ImVec2 size(96.0f * scale, 96.0f * scale);
         ImGui::Image(ui.texture(crateTexture_), size);
         ImGui::SameLine();
+        ImGui::Image(ui.texture(crateNormals_), size);
+        ImGui::SameLine();
         ImGui::Image(ui.texture(checkerTexture_), size);
     }
     ImGui::End();
@@ -712,12 +722,15 @@ void DemoGame::drawScene(float alpha)
     meshRenderer_->draw(ground_, glm::mat4(1.0f), ground);
 
     // Centrepiece: a big crate, and a ring of crates around it, all twelve in one draw call
-    // (instancing: the same mesh and material, a matrix for each copy).
-    meshRenderer_->draw(cube_, bigCrateMatrix(spin), {&crateTexture_});
+    // (instancing: the same mesh and material, a matrix for each copy). The normal map
+    // gives the frame, brace and planks their bevels and grooves.
+    render3d::Material crate{&crateTexture_};
+    crate.normalTexture = &crateNormals_;
+    meshRenderer_->draw(cube_, bigCrateMatrix(spin), crate);
     glm::mat4 ring[kRing];
     for (int i = 0; i < kRing; ++i)
         ring[i] = ringCrateMatrix(i, spin);
-    meshRenderer_->drawInstanced(cube_, ring, {&crateTexture_});
+    meshRenderer_->drawInstanced(cube_, ring, crate);
 
     // The forest: hundreds of trees, one draw call for the trunks and one for the crowns.
     const std::span<const glm::mat4> trees(trees_.data(), size_t(treesShown_));

@@ -36,12 +36,13 @@ struct FrameUniforms {
 };
 
 // Must match the push_constant block in shaders/common.glsl. At most 128 bytes: the
-// minimum every GPU guarantees.
+// minimum every GPU guarantees (this is all of it).
 struct PushConstants {
     glm::mat4 model;
     glm::vec4 color;    // linear base colour and alpha
     glm::vec4 emissive; // rgb = linear glow; a = alpha cutoff (0 = none)
     glm::vec4 material; // x = roughness, y = metallic, z = 1 if unlit, w = first joint (skinned)
+    glm::vec4 surface;  // x = normal map strength (0 = no normal map); yzw unused
 };
 static_assert(sizeof(PushConstants) <= 128);
 
@@ -112,6 +113,7 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
     materialSetLayout_ = gfx::DescriptorLayoutBuilder()
                              .add(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
                              .add(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
+                             .add(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
                              .build(ctx.device());
 
     auto builder = gfx::PipelineBuilder()
@@ -121,6 +123,7 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
                        .vertexAttribute(1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal))
                        .vertexAttribute(2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv))
                        .vertexAttribute(3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color))
+                       .vertexAttribute(6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, tangent))
                        .cullMode(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
                        .dynamicCulling() // per draw: double-sided materials, mirrored nodes
                        .depthTest(true, true, VK_COMPARE_OP_LESS)
@@ -212,7 +215,7 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
         f.instances.write(&identity, sizeof(identity));
         f.set = descriptors_.allocate(frameSetLayout_).set;
         f.materialSets = std::make_unique<gfx::DescriptorAllocator>();
-        f.materialSets->init(ctx.device(), 64, {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2.0f}}, /*allowFree*/ false);
+        f.materialSets->init(ctx.device(), 64, {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3.0f}}, /*allowFree*/ false);
         gfx::DescriptorWriter()
             .buffer(0, f.uniforms.handle(), sizeof(FrameUniforms), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
             .image(1, shadowMap_.view(), shadowSampler_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -224,6 +227,13 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
     }
 
     white_ = gfx::Texture::solid(ctx, 255, 255, 255);
+    const uint8_t straightOut[4] = {128, 128, 255, 255}; // (0, 0, 1): the surface's own normal
+    gfx::TextureDesc flatDesc;
+    flatDesc.srgb = false;
+    flatDesc.mipmaps = false;
+    flatDesc.filter = VK_FILTER_NEAREST;
+    flatDesc.debugName = "flat normal";
+    flatNormal_ = gfx::Texture::fromPixels(ctx, 1, 1, straightOut, flatDesc);
 }
 
 MeshRenderer::~MeshRenderer()
@@ -506,13 +516,15 @@ std::span<const glm::mat4> MeshRenderer::visibleCopies(std::span<const glm::mat4
     return visible_;
 }
 
-void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission)
+void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission,
+                                const gfx::Texture* normal)
 {
     const gfx::Texture* a = baseColor ? baseColor : &white_;
     const gfx::Texture* e = emission ? emission : &white_;
+    const gfx::Texture* n = normal ? normal : &flatNormal_;
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (const PerFrame::Cached& c : frame_->cache)
-        if (c.baseColor == a && c.emission == e) {
+        if (c.baseColor == a && c.emission == e && c.normal == n) {
             set = c.set;
             break;
         }
@@ -523,8 +535,10 @@ void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Textur
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
             .image(1, e->view(), e->sampler(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            .image(2, n->view(), n->sampler(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
             .update(ctx_.device(), set);
-        frame_->cache.push_back({a, e, set});
+        frame_->cache.push_back({a, e, n, set});
     }
     if (set != boundTexture_) {
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, active_->layout(), 1, 1, &set, 0, nullptr);
@@ -595,13 +609,16 @@ void MeshRenderer::drawMesh(const Mesh& mesh, const glm::mat4& model, const Mate
                             const Instances& copies)
 {
     usePipeline(false);
-    bindTextures(material.texture, material.emissiveTexture);
+    // The shadow pass only needs the base colour (for alpha); it shares the sets all the same.
+    const bool normalMap = material.normalTexture && normalMaps_ && pass_ != Pass::Shadow;
+    bindTextures(material.texture, material.emissiveTexture, normalMap ? material.normalTexture : nullptr);
 
     PushConstants pc;
     pc.model = model;
     pc.color = glm::vec4(srgbToLinear(glm::vec3(material.color)), material.color.a);
     pc.emissive = glm::vec4(srgbToLinear(material.emissive) * material.emissiveStrength, 0.0f);
     pc.material = glm::vec4(material.roughness, material.metallic, 0.0f, 0.0f);
+    pc.surface = glm::vec4(normalMap ? material.normalScale : 0.0f, 0.0f, 0.0f, 0.0f);
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
     drawCopies(mesh, nullptr, copies, material.doubleSided, glm::determinant(glm::mat3(model)) < 0.0f);
@@ -738,7 +755,9 @@ void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim,
 
     const bool skinned = firstJoint >= 0;
     usePipeline(skinned);
-    bindTextures(model.texture(mat.baseColorTexture), model.texture(mat.emissiveTexture));
+    const gfx::Texture* normalMap =
+        normalMaps_ && pass_ != Pass::Shadow ? model.texture(mat.normalTexture) : nullptr;
+    bindTextures(model.texture(mat.baseColorTexture), model.texture(mat.emissiveTexture), normalMap);
     if (boundGeometry_ != &model.geometry()) {
         model.geometry().bind(cmd_);
         boundGeometry_ = &model.geometry();
@@ -755,6 +774,7 @@ void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim,
     pc.color = mat.baseColor; // glTF colours are already linear
     pc.emissive = glm::vec4(mat.emissive, mat.alphaMode == AlphaMode::Mask ? mat.alphaCutoff : 0.0f);
     pc.material = glm::vec4(mat.roughness, mat.metallic, mat.unlit ? 1.0f : 0.0f, skinned ? float(firstJoint) : 0.0f);
+    pc.surface = glm::vec4(normalMap ? mat.normalScale : 0.0f, 0.0f, 0.0f, 0.0f);
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
     drawCopies(model.geometry(), &prim, copies, mat.doubleSided, glm::determinant(glm::mat3(matrix)) < 0.0f);

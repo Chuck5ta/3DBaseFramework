@@ -3,6 +3,7 @@
 
 #include "common.glsl"
 #include "instance.glsl"
+#include "tangents.glsl"
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
@@ -22,7 +23,8 @@ void main()
     mat3 normalMatrix = transpose(inverse(mat3(model)));
 
     outWorldPos = world.xyz;
-    outNormal = normalMatrix * inNormal;
+    outNormal = normalize(normalMatrix * inNormal);
+    writeTangentFrame(model, outNormal);
     outUV = inUV;
     outColor = inColor;
     gl_Position = frame.viewProjection * world;

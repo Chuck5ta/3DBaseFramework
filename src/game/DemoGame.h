@@ -48,6 +48,7 @@ private:
     render3d::Mesh sphere_;
     render3d::Mesh ground_;
     gfx::Texture crateTexture_;
+    gfx::Texture crateNormals_; // its normal map: bevels, grooves and grain
     gfx::Texture checkerTexture_;
 
     float cameraSpeedBoost_ = 1.0f; // eases between normal and fast movement (fly camera)

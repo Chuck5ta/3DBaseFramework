@@ -1,5 +1,7 @@
 #include "render3d/Mesh.h"
 
+#include "render3d/Tangents.h"
+
 #include <glm/common.hpp>
 #include <glm/gtc/constants.hpp>
 
@@ -33,6 +35,7 @@ MeshData cube(float size)
         m.vertices.push_back({c - f.u * h + f.v * h, f.normal, {0.0f, 0.0f}});
         m.indices.insert(m.indices.end(), {base, base + 1, base + 2, base + 2, base + 3, base});
     }
+    generateTangents(m); // ready for a normal map
     return m;
 }
 
@@ -48,6 +51,7 @@ MeshData plane(float size, float uvRepeat)
         {{-h, 0.0f, -h}, n, {0.0f, 0.0f}},
     };
     m.indices = {0, 1, 2, 2, 3, 0};
+    generateTangents(m); // ready for a normal map
     return m;
 }
 
@@ -71,6 +75,7 @@ MeshData sphere(float radius, uint32_t segments, uint32_t rings)
             const uint32_t b = a + stride;           // bottom-left
             m.indices.insert(m.indices.end(), {a, b, b + 1, b + 1, a + 1, a});
         }
+    generateTangents(m); // ready for a normal map
     return m;
 }
 

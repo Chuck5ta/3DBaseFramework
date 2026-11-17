@@ -109,6 +109,7 @@ src/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
     Frustum.h/.cpp            the six planes of a view; is a (transformed) box or sphere in it?
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
+    Tangents.h/.cpp           generateTangents: MikkTSpace tangents for normal maps
     Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose, ModelAnimation, skins
     ModelAnimator.h/.cpp      plays a model's animations into a ModelPose (blending, loops, moments)
     Raycast.h/.cpp            Ray; distance to a plane, sphere or (transformed) box
@@ -121,6 +122,7 @@ src/
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
   instance.glsl               instancing: the instance matrix buffer (include, every vertex shader)
+  tangents.glsl               normal maps: the tangent frame (include, mesh.vert and mesh_skinned.vert)
   mesh.vert, mesh.frag        the mesh shaders (mesh.frag also reads the shadow map)
   shadow.vert, shadow.frag    the shadow pass: depth from the sun (alpha-masked parts cut out)
   skin.glsl                   skinning: joints, weights and the joint matrix buffer (include)
@@ -132,7 +134,8 @@ assets/                       runtime data (copied next to the executable)
   fonts/                      Roboto Medium + its licence
   sounds/                     demo sounds (CC0) + README
   models/                     drone, gunner (rigid parts), soldier (skinned), rifle, tree (CC0) + README
-tools/                        Python scripts that generate the demo's models and sounds
+  textures/                   crate.png and its normal map, crate_normal.png
+tools/                        Python scripts that generate the demo's models, sounds and normal map
 cmake/                        Dependencies.cmake, Shaders.cmake
 ```
 
@@ -346,12 +349,18 @@ whenever the current one is exhausted; optional per-set freeing) and `Descriptor
 
 **`render3d::Mesh` and `MeshData`**
 
-- `Vertex { vec3 position; vec3 normal; vec2 uv; vec4 color; }` (48 bytes; `color` is a
-  linear vertex colour, white by default, used by glTF models that have one).
+- `Vertex { vec3 position; vec3 normal; vec2 uv; vec4 color; vec4 tangent; }` (64 bytes;
+  `color` is a linear vertex colour, white by default, used by glTF models that have one;
+  `tangent` is the direction u runs across the surface plus a handedness sign in `w`, for
+  normal maps, all zero when there are none).
+- `generateTangents(MeshData&)` (`Tangents.h`) fills in the tangents with MikkTSpace
+  (§6.9); a second overload works on a range of shared arrays and copies vertices where
+  two triangles need different tangents. The primitives call it, so they're ready for a
+  normal map.
 - `MeshData` = vertices + `uint32` indices, triangles **counter-clockwise** seen from the
   front.
 - `primitives::cube(size)` (24 vertices, per-face normals/UVs), `plane(size, uvRepeat)`
-  (XZ plane facing +Y), `sphere(radius, segments, rings)`.
+  (XZ plane facing +Y), `sphere(radius, segments, rings)`, all with tangents.
 - `Mesh` uploads `MeshData` into **device-local** vertex and index buffers once (via
   staging) and draws itself with `draw(cmd)`: bind buffers + one `vkCmdDrawIndexed`.
   `bind(cmd)` + `drawRange(cmd, firstIndex, indexCount, vertexOffset)` draw part of it
@@ -400,13 +409,19 @@ images, or one `.glb`), parsed with cgltf.
   moved by their joint matrices and joined. A bent vertex is a weighted average of where
   its joints would put it, so it always lies inside (no skinning on the CPU).
 - **Materials** (`ModelMaterial`): base colour factor and texture, emissive factor (times
-  `KHR_materials_emissive_strength`) and texture, metallic and roughness factors, alpha
-  mode (opaque, mask with cutoff, blend), double-sided, `KHR_materials_unlit`. The
+  `KHR_materials_emissive_strength`) and texture, **normal texture and its scale**,
+  metallic and roughness factors, alpha mode (opaque, mask with cutoff, blend),
+  double-sided, `KHR_materials_unlit`. The
   spec-gloss extension falls back to its diffuse colour and texture.
 - **Textures**: PNG and JPEG (stb_image) from a buffer view, a data URI or a file beside
   the `.gltf`; per-texture filter and per-axis wrap (`TextureDesc::wrap`/`wrapV`), mipmaps,
-  sRGB.
-- **Not supported** (warned about, the rest still loads): metallic-roughness, normal and
+  sRGB (linear for textures used as normal maps).
+- **Tangents** for parts with a normal map: the file's `TANGENT` attribute if it has one,
+  otherwise `generateTangents` at load (MikkTSpace, as glTF specifies and Blender exports;
+  checked against Blender's own tangents in Khronos' NormalTangentMirrorTest: identical).
+  Vertices that need two tangents are copied, with their joints and weights. Parts
+  without a normal map get no tangents (and no extra vertices).
+- **Not supported** (warned about, the rest still loads): metallic-roughness and
   occlusion textures, morph targets, cameras, lights, KTX2/WebP images. Files that *require* Draco or meshopt compression are refused with a message
   saying how to export without it.
 - Bounds (`boundsMin/Max`, `size`, `center`) are of the default pose, in model units;
@@ -535,12 +550,14 @@ different calls: `draw(model, ...)` bends them (§6.6). Many copies at once:
 part (§6.7); `instancesUsed()` / `maxInstances()`. Frustum culling is on by default (§6.8):
 `setFrustumCulling(bool)`, `setCullingFrozen(bool)` (keep the frustums of that moment, to
 look at them from outside), `culled()` / `shadowCulled()` (parts and copies left out),
-`triangles()` / `shadowTriangles()`. It needs a depth buffer, and says so at start-up if
-there isn't one.
+`triangles()` / `shadowTriangles()`. Normal maps (§6.9): `Material::normalTexture` /
+`normalScale`, or a model's own; `setNormalMaps(bool)` switches them all off to compare. It
+needs a depth buffer, and says so at start-up if there isn't one.
 
-- `Material { texture, color, emissive, emissiveStrength, emissiveTexture, roughness,
-  metallic, doubleSided, castShadows }`: textures may be `nullptr` (an internal 1×1 white
-  texture is used); colours are sRGB. A model brings its own `ModelMaterial`s (linear
+- `Material { texture, color, emissive, emissiveStrength, emissiveTexture, normalTexture,
+  normalScale, roughness, metallic, doubleSided, castShadows }`: textures may be `nullptr`
+  (an internal 1×1 white texture, or a flat normal, is used); colours are sRGB; the normal
+  texture is loaded with `TextureDesc::srgb = false`. A model brings its own `ModelMaterial`s (linear
   colours, as in glTF); models always cast shadows, except their Blend parts.
 - `SceneLighting`: sun direction/colour/intensity, sky and ground ambient colours with an
   ambient intensity, fog colour and density, and `shadows`. All colours are sRGB.
@@ -872,10 +889,10 @@ flowchart LR
         ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map;<br/>the joint and instance matrix buffers"]
     end
     subgraph perMaterial["Per texture change"]
-        tex["Set 1: base colour + emission<br/>(two combined image samplers)"]
+        tex["Set 1: base colour + emission + normal map<br/>(three combined image samplers)"]
     end
-    subgraph perObject["Per draw (push constants, 112 bytes)"]
-        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit, first joint"]
+    subgraph perObject["Per draw (push constants, 128 bytes)"]
+        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit, first joint<br/>vec4 normal map strength"]
     end
     ubo --> sh["mesh.vert / mesh.frag"]
     tex --> sh
@@ -888,19 +905,21 @@ flowchart LR
 | Set 0, binding 1 (comparison sampler, fragment) | the shadow map | never (one image, rewritten by each shadow pass) |
 | Set 0, binding 2 (storage buffer, vertex) | joint matrices of the skinned models drawn this frame (`maxJoints` × 64 bytes) | appended to by each skinned draw, in that frame's own buffer |
 | Set 0, binding 3 (storage buffer, vertex) | instance matrices (`maxInstances` × 64 bytes); entry 0 is the identity, for single draws | appended to by each `drawInstanced`, in that frame's own buffer |
-| Set 1, bindings 0 and 1 (samplers, fragment) | base colour and emission textures | when either texture changes between draws |
-| Push constants (vertex + fragment) | model matrix (instanced: the part's matrix within the model), colour, emissive + alpha cutoff, roughness/metallic/unlit, first joint matrix (skinned) | every draw |
+| Set 1, bindings 0, 1 and 2 (samplers, fragment) | base colour, emission and normal textures | when any of them changes between draws |
+| Push constants (vertex + fragment) | model matrix (instanced: the part's matrix within the model), colour, emissive + alpha cutoff, roughness/metallic/unlit, first joint matrix (skinned), normal map strength (0 = none) | every draw |
 | Vertex binding 1 (skinned only) | the model's `SkinVertex`es: joints and weights | when the skinned model drawn changes |
 | Dynamic state | cull mode, front face | when a draw needs different culling (double-sided material, mirrored node) |
 
-- The push-constant block is **112 bytes**, within the 128 every Vulkan GPU must
+- The push-constant block is **128 bytes**, exactly the size every Vulkan GPU must
   support, so it works everywhere without querying limits. A `static_assert` protects it.
+  It's full: the next per-draw value has to share a `vec4` (three floats of `surface` are
+  free) or move to a buffer.
 - The **normal matrix** (`transpose(inverse(mat3(model)))`) is computed in the vertex
   shader, so normals stay correct under non-uniform scaling and the push constants have
   room for material values.
-- **Set 1** holds a pair of textures (base colour, emission), so it can't be the texture's
-  own set: sets are allocated from a **per-frame pool** that is reset when that frame comes
-  round again, with a small cache so each texture pair gets one set per frame. No set
+- **Set 1** holds three textures (base colour, emission, normal), so it can't be the
+  texture's own set: sets are allocated from a **per-frame pool** that is reset when that
+  frame comes round again, with a small cache so each combination gets one set per frame. No set
   outlives its textures.
 - **Per-frame uniform buffers**: one host-visible UBO and descriptor set per frame in
   flight, so writing this frame's camera never races with the GPU reading last frame's.
@@ -937,7 +956,7 @@ sequenceDiagram
             MR->>MR: box outside the frustum: skip it (count it as culled)
         end
         alt textures differ from last draw
-            MR->>Cmd: bind set 1 (base colour + emission)
+            MR->>Cmd: bind set 1 (base colour + emission + normal map)
         end
         MR->>Cmd: set cull mode / front face if they changed
         opt a skinned node of a model
@@ -947,7 +966,7 @@ sequenceDiagram
         opt drawInstanced
             MR->>MR: keep the copies whose box is in the frustum, append their matrices to the frame's instance buffer (once per call)
         end
-        MR->>Cmd: push constants (model, colour, emissive, material, first joint)
+        MR->>Cmd: push constants (model, colour, emissive, material, first joint, normal strength)
         MR->>Cmd: bind vertex/index buffers (if changed), vkCmdDrawIndexed<br/>(instances: 1 at entry 0, or the copies, mirrored ones as a second draw)
     end
     G->>MR: end()
@@ -964,7 +983,7 @@ sequenceDiagram
 | Depth | test + write, `LESS` | test + write, `LESS` | test + write, `LESS`, into the shadow map's format |
 | Colour | swapchain format | swapchain format | one attachment of format `UNDEFINED` (depth only) |
 | Blending | opaque (a fourth pipeline, for Blend parts: alpha blending, no depth writes) | opaque | — |
-| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`) | same | position, uv, colour (no normal) |
+| Vertex input | binding 0: position (`R32G32B32`), normal (`R32G32B32`), uv (`R32G32`), colour (`R32G32B32A32`), tangent (`R32G32B32A32`, location 6) | same | position, uv, colour (no normal or tangent) |
 
 Each has a **skinned twin** (solid, blend, wireframe and shadow: eight in all), built from
 the same `PipelineBuilder` with `mesh_skinned.vert` or `shadow_skinned.vert` and a second
@@ -983,9 +1002,10 @@ Alpha-masked parts use `discard` in the fragment shader. Under SPIR-V 1.6 that c
 
 ```
 albedo   = texture(uv) · material colour · vertex colour      (discarded if alpha < cutoff)
-N        = normalize(normal)   (flipped for back faces, e.g. double-sided or wireframe)
+N        = normalize(normal)   bent by the normal map, if any (§6.9);
+           flipped for back faces, e.g. double-sided or wireframe
 ambient  = mix(groundColour, skyColour, N.y · 0.5 + 0.5)      hemisphere light
-sun      = sunlight(position, N)                               1 lit … 0 in shadow (§6.5)
+sun      = sunlight(position, geometry normal)                 1 lit … 0 in shadow (§6.5)
 diffuse  = sunColour · max(N·L, 0) · sun                        Lambert
 shininess = 2^(10·(1 − roughness) + 1)                          roughness 0.5 → 64
 strength  = 0.5 · (1 − roughness) · mix(1, 3, metallic)         roughness 0.5 → 0.25
@@ -1194,7 +1214,58 @@ flowchart LR
   the main pass and about 650 in the shadow pass: 17–24 thousand triangles drawn instead of
   135 thousand.
 
-### 6.9 Text
+### 6.9 Normal maps
+
+A normal map stores, per texel, which way the surface faces, relative to the surface: x
+along the tangent (the way the texture's u runs), y along the bitangent (the way v runs,
+**up** the image), z straight out. Bevels, grooves and grain catch the light without the
+triangles to make them; the outline stays the mesh's.
+
+```mermaid
+flowchart LR
+    subgraph load["At load (CPU)"]
+        mesh["positions, normals, UVs"] --> mikk["generateTangents<br/>(MikkTSpace; UV v flipped<br/>to count up, as Blender does)"]
+        file["glTF TANGENT<br/>(if the file has it)"] --> tan
+        mikk --> tan["Vertex::tangent<br/>xyz + sign"]
+    end
+    subgraph vert["Vertex shader (tangents.glsl)"]
+        tan --> tw["T = normalize(model · t)<br/>N = normalize(normal matrix · n)<br/>B = sign · det-sign · cross(N, T)"]
+    end
+    subgraph frag["mesh.frag"]
+        map["normal map texel<br/>× 2 − 1, xy × strength"] --> mix
+        tw --> mix["N' = normalize(x·T + y·B + z·N)<br/>(interpolated, not renormalised)"]
+        mix --> light["lighting (§6.4)"]
+    end
+```
+
+- **Tangents.** MikkTSpace answers per triangle corner; a vertex shared by corners that
+  need different tangents (a UV seam the vertices didn't split, a mirrored half) is copied,
+  never averaged, as MikkTSpace requires. Its V axis counts up the image, as in Blender:
+  `getTexCoord` hands it `1 − v`. The result matches Blender's exported tangents exactly
+  (NormalTangentMirrorTest: 15,720 corners, worst difference 0.0°, every sign the same).
+- **The MikkTSpace pixel transform.** Per vertex the normal and tangent are made unit
+  length and the bitangent rebuilt as `sign · cross(N, T)`; per pixel the three
+  interpolated vectors are combined without renormalising them first. That's the inverse
+  of what MikkTSpace-based bakers do, so baked maps show no seams.
+- **Mirrored copies** (negative determinant) flip the bitangent's sign in the vertex
+  shader, so a mirrored model's bumps still face the light correctly.
+- **Convention:** OpenGL / glTF / Blender (green = up). A DirectX-style map (green = down)
+  needs its green channel inverted.
+- **Strength:** `normalScale` (glTF's `normalTexture.scale`) multiplies x and y before the
+  normal is rebuilt; 0 or no texture, or a vertex without a tangent, uses the surface's
+  own normal. `setNormalMaps(false)` turns all of them off.
+- **Shadows** are looked up with the surface's own normal (the normal offset of §6.5), so
+  the map doesn't move shadow edges.
+- **Data, not colour:** normal maps are loaded linear (`TextureDesc::srgb = false`;
+  `Model` does it for the textures its materials use as normal maps). Mipmaps average the
+  directions, so a fine pattern looks softer from far away.
+- **Cost:** the vertex grows from 48 to 64 bytes (every mesh), one texture read per pixel,
+  a few multiplies; the shadow pass doesn't read it.
+- **The demo** gives the crates a normal map (`assets/textures/crate_normal.png`, made by
+  `tools/make_crate_normal.py` from the crate texture's layout): bevelled frame and brace,
+  grooves between the planks, a little grain.
+
+### 6.10 Text
 
 ```mermaid
 flowchart LR
@@ -1283,6 +1354,7 @@ maps, roughness, masks) must use `TextureDesc::srgb = false`.
 | Dear ImGui | 1.92.9 | debug UI, with its SDL3 and Vulkan backends | static library `imgui` |
 | nlohmann/json | 3.12.0 | JSON: Aseprite sprite sheets, settings and saves | header only |
 | cgltf | 1.15 | glTF 2.0 parsing (`.gltf`, `.glb`) for `render3d::Model` | header (impl in `render3d/Model.cpp`; fetched by both projects so `Dependencies.cmake` stays identical, used by Game3D only) |
+| MikkTSpace | pinned commit | tangents for normal maps (`render3d/Tangents.cpp`) | static library `mikktspace`; declared in Game3D's own `CMakeLists.txt`, not in the shared `Dependencies.cmake` |
 
 Global definitions: `VK_NO_PROTOTYPES`, `GLM_FORCE_DEPTH_ZERO_TO_ONE`,
 `GLM_FORCE_RADIANS`. On Linux, `third_party` also links `pthread`, `dl` and `m` for
@@ -1337,6 +1409,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Add your own geometry | Fill `render3d::MeshData` (CCW triangles, normals, UVs) and construct a `Mesh` |
 | Load models | `render3d::Model::load(gpu, path)` (glTF 2.0), drawn with `MeshRenderer::draw(model, transform, pose)` |
 | Add a skinned character | Blender: mesh + Armature, *Ctrl+P > With Automatic Weights*, one Action per animation; export glTF with *Skinning* on and at most 4 influences per vertex. Load and draw it like any model; play its Actions with a `ModelAnimator` |
+| Add bumps and detail with a normal map | Load it with `TextureDesc::srgb = false` and set `material.normalTexture` (the primitives have tangents; call `generateTangents(data)` on your own `MeshData`). From Blender, an image through a *Normal Map* node into the material's *Normal* input exports as glTF's normal texture, which `Model` uses (§6.9; tested with Khronos' sample files, not yet with a Blender export of yours) |
 | Draw many copies (trees, rocks, crowds) | `meshes.drawInstanced(model, matrices)` or `drawInstanced(mesh, matrices, material)`: one draw call per part for all of them (§6.7); a bigger `maxInstances` for more than ~8000 copies with shadows |
 | Skip work for things off screen | `render3d::Frustum(camera.viewProjection()).intersects(boundsMin, boundsMax, matrix)`, as `MeshRenderer` does for drawing (§6.8). For very large worlds, cull groups of objects (a grid of cells) before testing each one |
 | Draw something whose vertex shader moves vertices (wind, waves) | Make its mesh's box big enough for the movement, or culling may leave it out while part of it is on screen |
@@ -1361,11 +1434,12 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | VMA for memory | Correct, efficient suballocation without writing an allocator | Third-party header |
 | One descriptor set per texture | Binding a texture is one call; no caches that can go stale | One set per texture (cheap); not bindless |
 | Forward rendering | Simplest path to correct lighting with one main light; works well on the Deck | Many dynamic lights need clustered/forward+ or deferred later |
-| Per-object data in push constants (112 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; `drawInstanced` covers many copies of one thing |
+| Per-object data in push constants (128 B, the guaranteed maximum) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; `drawInstanced` covers many copies of one thing |
 | Frustum culling inside `MeshRenderer`, per part and per copy, against each pass's own frustum | Every game gets it with no code; the shadow pass culls against the shadow map, so off-screen casters still cast; the instance buffer only holds visible copies; the picture is identical with it off | The CPU visits every object every pass (no hierarchy or grid); boxes, not tighter shapes; a vertex shader that moves vertices beyond the mesh's box would be culled too early |
 | Instancing through a per-frame matrix buffer and `gl_InstanceIndex`, entry 0 the identity | No extra pipelines or vertex formats: the same four vertex shaders serve single and instanced draws, skinned or not, in both passes; the game passes plain matrices | Copies share material and pose (no per-copy colour yet); every single draw pays one matrix read per vertex; matrices are re-uploaded each pass even when they never change |
 | Normal matrix computed in the vertex shader | Frees push-constant space for material values; correct under non-uniform scale | An `inverse()` per vertex (cheap for game-sized meshes) |
-| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No normal maps or morph targets yet; whole model in memory |
+| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No morph targets yet; whole model in memory |
+| Tangents in every `Vertex`, by MikkTSpace, the frame rebuilt the MikkTSpace way in the shaders | Normal maps baked in Blender (or any MikkTSpace baker, such as CharacterCreator's) line up with no seams; one vertex format for every mesh; mirrored UVs and mirrored copies work | 16 more bytes per vertex even for meshes without a normal map; vertices copied where tangents split; the push constants are now full |
 | Per-instance `ModelPose` instead of mutable nodes | One loaded model, many copies each in its own pose (rotors at different angles); the `Model` stays read-only | The game keeps a pose per copy |
 | Rigid-part animation (node TRS) first, skinning on top | Covers mechanical models and characters built from parts (the owner's mix-and-match style); bones are nodes too, so skinning reuses the same poses, animator and sockets | — |
 | Linear blend skinning on the GPU, joint matrices in a per-frame storage buffer | The standard method, what glTF and Blender expect; no per-draw descriptor updates (an offset in the push constants picks the joints); shadows bend for free with a skinned shadow shader | Joints twist and lose volume at extreme bends ("candy wrapper" wrists); dual-quaternion skinning would fix that. The matrices are recomputed for each pass |
@@ -1393,8 +1467,9 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 
 ## 13. Known limitations and roadmap
 
-- Models: no morph targets, normal/occlusion/metallic-roughness textures, KTX2/WebP
-  images or Draco/meshopt compression yet. Skinning is linear blend, 4 joints per vertex.
+- Models: no morph targets, occlusion/metallic-roughness textures, KTX2/WebP images or
+  Draco/meshopt compression yet. Normal maps use the first UV map only; no parallax or
+  detail maps. Skinning is linear blend, 4 joints per vertex.
   One animation plays at a time per animator (plus blends); layering (legs walking, arms
   firing) is up to the game, by combining two poses.
 - One directional light only, so only the sun casts shadows. One shadow map (no

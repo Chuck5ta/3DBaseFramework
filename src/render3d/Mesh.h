@@ -16,6 +16,10 @@ struct Vertex {
     glm::vec3 normal;
     glm::vec2 uv;
     glm::vec4 color{1.0f}; // linear RGBA, multiplied with the material (glTF COLOR_0)
+    // For normal maps: the direction u runs across the surface (xyz), and w = +1 or -1
+    // for which way v runs (-1 where UVs are mirrored). All zero = none: normal maps are
+    // then ignored. generateTangents (Tangents.h) fills it in.
+    glm::vec4 tangent{0.0f};
 };
 
 // CPU-side geometry. Triangles are counter-clockwise when seen from the front.
@@ -24,6 +28,7 @@ struct MeshData {
     std::vector<uint32_t> indices;
 };
 
+// These come with tangents, ready for a normal map.
 namespace primitives {
 MeshData cube(float size = 1.0f);
 // Flat XZ plane facing +Y, centred on the origin. uvRepeat tiles the texture.

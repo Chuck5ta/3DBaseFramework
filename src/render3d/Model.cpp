@@ -1,5 +1,7 @@
 #include "render3d/Model.h"
 
+#include "render3d/Tangents.h"
+
 #include "core/Log.h"
 #include "gfx/VulkanContext.h"
 
@@ -247,8 +249,8 @@ struct Loader {
             mm.emissive = glm::make_vec3(m.emissive_factor) *
                           (m.has_emissive_strength ? m.emissive_strength.emissive_strength : 1.0f);
             mm.emissiveTexture = textureFor(m.emissive_texture, mm.name, "emission");
-            if (m.normal_texture.texture)
-                warn("Material '" + mm.name + "': normal maps aren't used yet");
+            mm.normalTexture = textureFor(m.normal_texture, mm.name, "normal");
+            mm.normalScale = m.normal_texture.scale;
             mm.alphaMode = m.alpha_mode == cgltf_alpha_mode_mask    ? AlphaMode::Mask
                            : m.alpha_mode == cgltf_alpha_mode_blend ? AlphaMode::Blend
                                                                     : AlphaMode::Opaque;
@@ -281,6 +283,10 @@ struct Loader {
         const bool haveNormals = nAcc && nAcc->count == count && readFloats(nAcc, 3, nrm);
         const cgltf_accessor* uvAcc = findAttribute(p, cgltf_attribute_type_texcoord);
         const bool haveUV = uvAcc && uvAcc->count == count && readFloats(uvAcc, 2, uv);
+        std::vector<float> tan; // the file's own tangents, if it has them (xyz + handedness)
+        const cgltf_accessor* tAcc = findAttribute(p, cgltf_attribute_type_tangent);
+        const bool haveTangents = haveNormals && tAcc && tAcc->count == count &&
+                                  cgltf_num_components(tAcc->type) == 4 && readFloats(tAcc, 4, tan);
         const cgltf_accessor* cAcc = findAttribute(p, cgltf_attribute_type_color);
         size_t colorComponents = cAcc ? cgltf_num_components(cAcc->type) : 0;
         const bool haveColor = cAcc && cAcc->count == count && (colorComponents == 3 || colorComponents == 4) &&
@@ -358,6 +364,10 @@ struct Loader {
             v.position = glm::make_vec3(&pos[size_t(i) * 3]);
             v.normal = haveNormals ? glm::make_vec3(&nrm[size_t(i) * 3]) : glm::vec3(0.0f, 1.0f, 0.0f);
             v.uv = haveUV ? glm::make_vec2(&uv[size_t(i) * 2]) : glm::vec2(0.0f);
+            if (haveTangents) {
+                v.tangent = glm::make_vec4(&tan[size_t(i) * 4]);
+                v.tangent.w = v.tangent.w < 0.0f ? -1.0f : 1.0f;
+            }
             v.color = glm::vec4(1.0f);
             if (haveColor)
                 for (size_t c = 0; c < colorComponents; ++c)
@@ -390,6 +400,21 @@ struct Loader {
             }
         }
         prim.indexCount = uint32_t(out.indices.size()) - prim.firstIndex;
+        prim.material = indexOf(p.material, gltf.materials);
+
+        // A normal map needs tangents: the file's, or MikkTSpace's (as Blender would make them).
+        const bool normalMapped = prim.material >= 0 && out.materials[size_t(prim.material)].normalTexture >= 0;
+        if (normalMapped && !haveUV) {
+            warn("Mesh '" + meshName + "': a part with a normal map but no UV map; drawn without the normal map");
+        } else if (normalMapped && !haveTangents) {
+            generateTangents(out.vertices, out.indices, prim.firstIndex, prim.indexCount, uint32_t(prim.vertexOffset),
+                             [&](uint32_t from) {
+                                 if (haveSkin) {
+                                     const SkinVertex copy = out.skinVertices[from];
+                                     out.skinVertices.push_back(copy);
+                                 }
+                             });
+        }
 
         prim.boundsMin = glm::vec3(std::numeric_limits<float>::max());
         prim.boundsMax = glm::vec3(-std::numeric_limits<float>::max());
@@ -398,7 +423,6 @@ struct Loader {
             prim.boundsMin = glm::min(prim.boundsMin, v);
             prim.boundsMax = glm::max(prim.boundsMax, v);
         }
-        prim.material = indexOf(p.material, gltf.materials);
         prim.skinned = haveSkin;
         return true;
     }
@@ -792,6 +816,10 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
                                                       data.skinVertices.size() * sizeof(SkinVertex),
                                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, (debugName + " joints").c_str());
 
+    std::vector<bool> isNormalMap(data.textures.size(), false); // data, not colour: no sRGB decoding
+    for (const ModelMaterial& mat : data.materials)
+        if (mat.normalTexture >= 0 && size_t(mat.normalTexture) < isNormalMap.size())
+            isNormalMap[size_t(mat.normalTexture)] = true;
     for (const ModelTexture& t : data.textures) {
         const ModelImage* img = t.image >= 0 ? &data.images[size_t(t.image)] : nullptr;
         if (!img || img->rgba.empty()) {
@@ -799,7 +827,7 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
             continue;
         }
         gfx::TextureDesc desc;
-        desc.srgb = true; // colour images
+        desc.srgb = !isNormalMap[m.textures_.size()]; // colour images are sRGB; normal maps are data
         desc.mipmaps = true;
         desc.filter = t.filter;
         desc.wrap = t.wrapU;

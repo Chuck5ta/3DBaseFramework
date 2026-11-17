@@ -24,6 +24,21 @@ option(GAME_WINDOWS_CONSOLE "Show a console window on Windows (log output)" ON)
 include(cmake/Dependencies.cmake)
 include(cmake/Shaders.cmake)
 
+# --- MikkTSpace: tangents for normal maps (render3d/Tangents.cpp) ---------------------
+# Worked out the way Blender, glTF and most bakers do, so baked normal maps line up.
+# Game3D only, so it's here rather than in Dependencies.cmake (shared with Game2D).
+FetchContent_Declare(mikktspace
+    GIT_REPOSITORY https://github.com/mmikk/MikkTSpace.git
+    GIT_TAG        3e895b49d05ea07e4c2133156cfa94369e19e409
+    SOURCE_SUBDIR  _download_only)
+FetchContent_MakeAvailable(mikktspace)
+add_library(mikktspace STATIC ${mikktspace_SOURCE_DIR}/mikktspace.c)
+target_include_directories(mikktspace SYSTEM PUBLIC ${mikktspace_SOURCE_DIR})
+if(UNIX)
+    target_link_libraries(mikktspace PRIVATE m)
+endif()
+set_target_properties(mikktspace PROPERTIES FOLDER "third_party")
+
 # --- Game executable -----------------------------------------------------------
 # New .cpp/.h files under src/ are picked up automatically on the next build.
 file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS
@@ -34,7 +49,7 @@ add_executable(${PROJECT_NAME} ${GAME_SOURCES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "src" FILES ${GAME_SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 third_party imgui)
+target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 third_party imgui mikktspace)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive- /utf-8 /MP)
