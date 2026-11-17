@@ -9,8 +9,8 @@ textures, lighting and fog, a fly camera driven by mouse, keyboard and gamepad,
 animation on the fixed timestep with interpolation, a 2D text HUD on top of the 3D scene,
 3D sound with Doppler, audio effects, a debug UI, 3D models from Blender (glTF), animated,
 a third-person camera that follows a walking character and keeps out of walls,
-shadows from the sun, a skinned character that bends at the joints, and a forest drawn
-with instancing.
+shadows from the sun, a skinned character that bends at the joints, a forest drawn
+with instancing, and frustum culling, which leaves out what can't be seen.
 
 **Before you start:** the project builds and runs (see [BUILDING.md](BUILDING.md)). For
 background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECTURE.md).
@@ -34,6 +34,7 @@ background on any class used here, see [GAME3D_ARCHITECTURE.md](GAME3D_ARCHITECT
 | [15](#step-15--shadows-from-the-sun) | A shadow pass in `onPreRender`, `drawScene` | Everything casts shadows on the ground and on each other; **G** switches them off |
 | [16](#step-16--a-skinned-soldier) | A skinned model (one mesh bent by its bones) | The player's elbows and knees bend smoothly; the gunner keeps his rigid parts |
 | [17](#step-17--a-forest-instancing) | Instancing: many copies in one draw call | A forest of 800 trees around the scene, in two draw calls |
+| [18](#step-18--out-of-sight-frustum-culling) | Frustum culling, triangle counts, a frozen view | The same picture with most of the forest left out; freeze it and fly out to see |
 
 > Every code listing in this tutorial was compiled (with warnings as errors) and run with
 > Vulkan validation enabled, step by step. If something doesn't work, compare with
@@ -2280,8 +2281,8 @@ Things to notice:
   don't. See-through (Blend) parts of models never cast; alpha-masked ones (leaves,
   fences) cut their holes out of the shadow too.
 - **The cost.** The scene is drawn twice: 72 draw calls on screen and 71 for the shadows
-  in this scene. Drawing depth only is cheap, but with thousands of objects you'd skip
-  those too far from the camera, or use instancing (Step 17).
+  in this scene. Drawing depth only is cheap, but with thousands of objects you'd use
+  instancing (Step 17) and leave out what the sun's view doesn't reach (Step 18).
 
 **Try it:** in the debug UI, drag *Sun direction* down towards the horizon for long
 evening shadows. Change *Softness* from 0 (hard, pixelated edges) to 3, and *Distance* to
@@ -2583,9 +2584,8 @@ Things to notice:
 - **See-through parts** can't be drawn in one go: each copy has to be sorted by distance
   against everything else see-through. `drawInstanced` queues them one copy at a time, as
   `draw()` would.
-- **Every copy is drawn**, on screen or not, in both passes. For 800 trees that's nothing
-  for a GPU. For tens of thousands, skip the copies the camera can't see before calling
-  `drawInstanced` (see *Where to go next*).
+- **Every copy is drawn**, on screen or not, in both passes, for now. Step 18 leaves out
+  the ones that can't be seen.
 - **Collisions are your code.** The renderer only draws. The player's `pushOut` and the
   camera's ray tests use the same matrices, so what you see is what stops you. They check
   all 800 trees (or those near the camera), which is quick; for many more, a grid that
@@ -2599,6 +2599,84 @@ find its way between the trunks.
 
 **Run it:** a pine forest rings the scene, fading into the fog, its shadows falling across
 the clearing; the ring of crates and all 800 trees take three draw calls.
+
+---
+
+## Step 18 — Out of sight (frustum culling)
+
+Stand in the clearing and look around: you only ever see part of the forest. The rest is
+behind you or off to the side, yet Step 17 hands the GPU every tree, twice (once for the
+shadows). The GPU runs the vertex shader for all of them, only to find that their
+triangles land off screen. **Frustum culling** leaves those out before they're drawn.
+
+- **The frustum** is the space the camera can see: a pyramid with its top cut off, between
+  the near and far planes. Its six sides are planes, and they can be read straight out of
+  `camera.viewProjection()`: `render3d::Frustum` does that.
+- **Boxes, not triangles.** Testing every triangle would cost more than drawing it. Instead
+  each thing is tested by a box around it: a mesh's box, each part of a model, the whole
+  model for each copy of a `drawInstanced`. If the box is wholly outside one of the six
+  planes, nothing in it can be on screen.
+- **The shadow pass** has its own frustum: the box the sun's shadow map covers. A tree
+  behind you is culled from the main pass but still drawn into the shadow map if its
+  shadow falls in front of you.
+- **Skinned characters** move outside their rest pose (an arm raised above the head), so
+  their box is worked out for each pose: each bone gets the box around the vertices it
+  moves, and those boxes move with the bones (`Model::skinBounds`).
+
+`MeshRenderer` does all of this for every `draw` and `drawInstanced`, so your code
+doesn't change; it's on by default. What you'll add is a way to watch it work.
+
+In **`MyGame.cpp`**'s `onDebugUI`, add a triangle count after the draw calls:
+
+```cpp
+    ImGui::Text("Triangles: %u (+%u for shadows)", meshRenderer_->triangles(), meshRenderer_->shadowTriangles());
+```
+
+and a section with the switches, before the `"Lighting"` section:
+
+```cpp
+    if (ImGui::CollapsingHeader("Culling")) {
+        bool culling = meshRenderer_->frustumCulling();
+        if (ImGui::Checkbox("Frustum culling", &culling)) // off: watch the triangles go up
+            meshRenderer_->setFrustumCulling(culling);
+        bool frozen = meshRenderer_->cullingFrozen();
+        if (ImGui::Checkbox("Freeze", &frozen)) // then fly out and look back
+            meshRenderer_->setCullingFrozen(frozen);
+        ImGui::Text("Culled: %u (+%u for shadows)", meshRenderer_->culled(), meshRenderer_->shadowCulled());
+    }
+```
+
+Things to notice:
+
+- **Triangles, not draw calls.** Instancing already made the forest two draw calls, and it
+  still is; culling cuts what each call draws. Looking out from the clearing into the
+  forest, the debug UI shows about 24,000 triangles where all of them are 135,000, and
+  about 700 trees and parts culled. Untick *Frustum culling* and the numbers jump back up.
+- **The same picture.** Culling only leaves out what can't reach the screen (or the shadow
+  map), so turning it off changes nothing you can see. Shadows of trees behind you still
+  fall in front of you.
+- **Freeze** keeps the camera's and the sun's frustums as they are at that moment. Switch to
+  the fly camera (**C**), tick *Freeze*, then fly up and back and look down: only a wedge of
+  forest is there, the part the camera could see, and only the shadows the shadow map could
+  hold. (Turn the *Fog density* down in the *Lighting* section to see further.)
+- **Counting.** *Culled* counts meshes, model parts, skinned characters and instanced copies
+  left out. The instance buffer only holds the copies that are drawn, so *Instance
+  matrices* drops too.
+- **Your own use.** `render3d::Frustum` works on its own: build one from
+  `camera_.viewProjection()` and ask `intersects(boundsMin, boundsMax, matrix)` before doing
+  work for something that might be off screen (updating its animation, spawning effects).
+- **Cost.** Each test is a few dot products, about 15 nanoseconds in an optimised build:
+  the 812 copies take about 12 microseconds per pass. Every object is still visited; for
+  tens of thousands, group them first (see *Where to go next*).
+- **One catch:** the box is made from the mesh's vertices. If a vertex shader of yours
+  moved vertices further out (trees swaying in the wind), make the box bigger, or that
+  object could vanish while a bit of it is still on screen.
+
+**Try it:** in the fly camera, look straight up at the sky: the main pass draws nothing at
+all (0 draw calls), but the shadow pass still draws what casts shadows around you.
+
+**Run it:** the scene looks exactly as before, but the triangle count drops as you turn
+away from the forest and climbs as you look into it.
 
 **That's the complete demo.** Your `MyGame` now behaves exactly like `DemoGame`. You can
 delete `DemoGame.h/.cpp` from your own projects once you no longer need them for reference.
@@ -2626,9 +2704,10 @@ Ideas, roughly in order of difficulty, each building on what you've used here:
 6. **Sharper shadows further away.** One shadow map spreads its texels over the whole
    shadow distance. *Cascades* split the view into 2–4 ranges, near to far, each with its
    own map: sharp shadows at your feet and shadows reaching to the horizon.
-7. **Culling.** Skip what the camera can't see: test each tree's bounding sphere against
-   the camera's view (its six planes, from `camera.viewProjection()`) and pass only the
-   visible ones to `drawInstanced`. For a huge forest, cull square patches of trees first.
+7. **Culling bigger worlds.** Culling still visits every object. For a forest of 50,000
+   trees, keep them in square patches (a grid of cells), test each patch's box with a
+   `render3d::Frustum` first, and pass only the trees of visible patches to
+   `drawInstanced`.
 8. **Physics.** Jolt Physics, stepped in `onFixedUpdate`.
 9. **Saving tuned values.** Store `lighting_` with `core::SaveData` from a "Save" button in
    the debug UI and load it in `onInit`, so tuned values survive a restart.

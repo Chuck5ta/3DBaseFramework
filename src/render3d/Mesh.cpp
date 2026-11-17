@@ -1,5 +1,6 @@
 #include "render3d/Mesh.h"
 
+#include <glm/common.hpp>
 #include <glm/gtc/constants.hpp>
 
 #include <cmath>
@@ -82,6 +83,13 @@ Mesh::Mesh(gfx::VulkanContext& ctx, const MeshData& data, const char* debugName)
                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, debugName);
     indices_ = gfx::Buffer::createWithData(ctx, data.indices.data(), data.indices.size() * sizeof(uint32_t),
                                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, debugName);
+    if (!data.vertices.empty()) {
+        boundsMin_ = boundsMax_ = data.vertices[0].position;
+        for (const Vertex& v : data.vertices) {
+            boundsMin_ = glm::min(boundsMin_, v.position);
+            boundsMax_ = glm::max(boundsMax_, v.position);
+        }
+    }
 }
 
 void Mesh::draw(VkCommandBuffer cmd, uint32_t instanceCount, uint32_t firstInstance) const

@@ -814,6 +814,28 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
     m.animations_ = data.animations;
     m.boundsMin_ = data.boundsMin;
     m.boundsMax_ = data.boundsMax;
+
+    // Each joint's box: every vertex it has a say in, for skinBounds().
+    m.jointBounds_.resize(data.skins.size());
+    for (size_t s = 0; s < data.skins.size(); ++s)
+        m.jointBounds_[s].assign(data.skins[s].joints.size(), {glm::vec3(std::numeric_limits<float>::max()),
+                                                                glm::vec3(-std::numeric_limits<float>::max())});
+    for (const ModelNode& n : data.nodes) {
+        if (n.mesh < 0 || n.skin < 0)
+            continue;
+        std::vector<JointBounds>& boxes = m.jointBounds_[size_t(n.skin)];
+        for (const ModelPrimitive& p : data.meshes[size_t(n.mesh)].primitives)
+            for (uint32_t k = p.firstIndex; k < p.firstIndex + p.indexCount; ++k) {
+                const size_t v = size_t(p.vertexOffset) + data.indices[k];
+                const SkinVertex& sv = data.skinVertices[v];
+                for (int c = 0; c < 4; ++c)
+                    if (sv.weights[c] > 0.0f && size_t(sv.joints[c]) < boxes.size()) {
+                        JointBounds& b = boxes[size_t(sv.joints[c])];
+                        b.min = glm::min(b.min, data.vertices[v].position);
+                        b.max = glm::max(b.max, data.vertices[v].position);
+                    }
+            }
+    }
     return m;
 }
 
@@ -884,6 +906,29 @@ void Model::jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, 
     out.resize(s.joints.size());
     for (size_t j = 0; j < s.joints.size(); ++j)
         out[j] = nodeMatrices[size_t(s.joints[j])] * s.inverseBind[j];
+}
+
+bool Model::skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max) const
+{
+    // A bent vertex is a weighted average of where each of its joints would put it, so it
+    // lies within the boxes those joints carry: the box around them all holds it.
+    min = glm::vec3(std::numeric_limits<float>::max());
+    max = -min;
+    const std::vector<JointBounds>& boxes = jointBounds_[size_t(skin)];
+    for (size_t j = 0; j < boxes.size() && j < joints.size(); ++j) {
+        const JointBounds& b = boxes[j];
+        if (b.min.x > b.max.x)
+            continue; // this joint moves nothing
+        // The box as the joint turns it, then the upright box around that.
+        const glm::mat4& m = joints[j];
+        const glm::vec3 centre = glm::vec3(m * glm::vec4((b.min + b.max) * 0.5f, 1.0f));
+        const glm::vec3 half = (b.max - b.min) * 0.5f;
+        const glm::vec3 reach = glm::abs(glm::vec3(m[0])) * half.x + glm::abs(glm::vec3(m[1])) * half.y +
+                                glm::abs(glm::vec3(m[2])) * half.z;
+        min = glm::min(min, centre - reach);
+        max = glm::max(max, centre + reach);
+    }
+    return min.x <= max.x;
 }
 
 } // namespace render3d

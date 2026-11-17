@@ -6,6 +6,7 @@
 #include "gfx/Renderer.h"
 #include "gfx/Texture.h"
 #include "render3d/Camera3D.h"
+#include "render3d/Frustum.h"
 #include "render3d/Mesh.h"
 #include "render3d/Model.h"
 
@@ -89,7 +90,13 @@ struct SceneLighting {
 //
 // The matrices go into this frame's instance buffer (set 0, binding 3); the vertex shader
 // picks each copy's matrix by its gl_InstanceIndex. Every copy shares the material and
-// the pose, and every copy is drawn, on screen or not.
+// the pose.
+//
+// Frustum culling: whatever is wholly outside the camera's view isn't drawn (in the shadow
+// pass: outside the shadow map). Each part of a Model is tested by its box, a skinned
+// mesh by the box around its bent pose, and each copy of a drawInstanced by the box
+// around the whole model; only the copies left go into the instance buffer. Nothing to
+// do: it's on unless you call setFrustumCulling(false).
 //
 // Per-frame data (camera, lights) lives in a uniform buffer (set 0); the base colour and
 // emission textures are set 1; the model matrix and material values are push constants.
@@ -123,12 +130,24 @@ public:
     void drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose = nullptr);
     void end();
 
+    // Frustum culling (on by default). Frozen, it keeps the camera's and the sun's view
+    // of the moment it froze: fly away and look back to see what is being left out.
+    void setFrustumCulling(bool enabled) { frustumCulling_ = enabled; }
+    bool frustumCulling() const { return frustumCulling_; }
+    void setCullingFrozen(bool frozen) { cullingFrozen_ = frozen; }
+    bool cullingFrozen() const { return cullingFrozen_; }
+
     void setWireframe(bool enabled) { wireframe_ = enabled && wireframePipeline_.valid(); }
     bool wireframe() const { return wireframe_; }
     bool wireframeSupported() const { return wireframePipeline_.valid(); }
 
     uint32_t drawCalls() const { return drawCalls_; }
     uint32_t shadowDrawCalls() const { return shadowDrawCalls_; }
+    // Parts and copies left out by frustum culling this frame, and the triangles drawn.
+    uint32_t culled() const { return culled_; }
+    uint32_t shadowCulled() const { return shadowCulled_; }
+    uint32_t triangles() const { return triangles_; }
+    uint32_t shadowTriangles() const { return shadowTriangles_; }
     // Joint matrices used so far this frame (both passes), and how many fit.
     uint32_t jointsUsed() const { return jointsUsed_; }
     uint32_t maxJoints() const { return maxJoints_; }
@@ -161,6 +180,23 @@ private:
     float shadowDepthRange_ = 1.0f;  // metres from the map's near to far plane
     uint64_t shadowFrame_ = ~uint64_t(0); // frameNumber of the last shadow pass
     uint32_t shadowDrawCalls_ = 0;
+    uint32_t shadowCulled_ = 0;
+    uint32_t shadowTriangles_ = 0;
+
+    // Frustum culling: the current pass's frustum, and the latest of each pass (kept as
+    // they are while frozen).
+    Frustum frustum_, viewFrustum_, shadowFrustum_;
+    bool frustumCulling_ = true;
+    bool cullingFrozen_ = false;
+    bool cull_ = false; // this pass culls
+    uint32_t culled_ = 0;
+    uint32_t triangles_ = 0;
+    // True if the box min..max placed by `matrix` may be in view (or this pass doesn't
+    // cull); counts it as culled otherwise.
+    bool visible(const glm::vec3& min, const glm::vec3& max, const glm::mat4& matrix);
+    // The copies whose box (min..max, placed by each matrix) may be in view.
+    std::span<const glm::mat4> visibleCopies(std::span<const glm::mat4> all, const glm::vec3& min,
+                                             const glm::vec3& max);
 
     enum class Pass { None, Shadow, SkippedShadow, Main };
 
@@ -187,7 +223,8 @@ private:
     void drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix, int firstJoint,
                        const Instances& copies);
     void usePipeline(bool skinned);
-    int uploadJoints(const Model& model, int skin); // returns the first joint's index, or -1
+    // Uploads joints_ (from Model::jointMatrices): returns the first joint's index, or -1.
+    int uploadJoints();
 
     struct BlendedDraw {
         const Model* model;
@@ -201,6 +238,7 @@ private:
     std::vector<glm::mat4> modelSpace_;   // scratch: node matrices without the transform
     std::vector<glm::mat4> joints_;       // scratch
     std::vector<glm::mat4> instances_;    // scratch: matrices sorted, the mirrored ones last
+    std::vector<glm::mat4> visible_;      // scratch: the copies that passed frustum culling
 
     struct PerFrame {
         gfx::Buffer uniforms;

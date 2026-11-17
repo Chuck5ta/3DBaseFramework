@@ -585,6 +585,7 @@ void DemoGame::onDebugUI(core::Application& app)
     }
 
     ImGui::Text("Draw calls: %u (+%u for shadows)", meshRenderer_->drawCalls(), meshRenderer_->shadowDrawCalls());
+    ImGui::Text("Triangles: %u (+%u for shadows)", meshRenderer_->triangles(), meshRenderer_->shadowTriangles());
     ImGui::Text("Joint matrices: %u of %u", meshRenderer_->jointsUsed(), meshRenderer_->maxJoints());
     ImGui::Text("Instance matrices: %u of %u", meshRenderer_->instancesUsed(), meshRenderer_->maxInstances());
     bool wireframe = meshRenderer_->wireframe();
@@ -625,6 +626,15 @@ void DemoGame::onDebugUI(core::Application& app)
         ImGui::Checkbox("Instancing", &instanceTrees_); // off: watch the draw calls go up
     }
 
+    if (ImGui::CollapsingHeader("Culling")) {
+        bool culling = meshRenderer_->frustumCulling();
+        if (ImGui::Checkbox("Frustum culling", &culling)) // off: watch the triangles go up
+            meshRenderer_->setFrustumCulling(culling);
+        bool frozen = meshRenderer_->cullingFrozen();
+        if (ImGui::Checkbox("Freeze", &frozen)) // then fly out and look back
+            meshRenderer_->setCullingFrozen(frozen);
+        ImGui::Text("Culled: %u (+%u for shadows)", meshRenderer_->culled(), meshRenderer_->shadowCulled());
+    }
     if (ImGui::CollapsingHeader("Lighting")) {
         ImGui::Checkbox("Animate sun", &animateSun_);
         if (ImGui::SliderFloat3("Sun direction", &lighting_.sunDirection.x, -1.0f, 1.0f)) {

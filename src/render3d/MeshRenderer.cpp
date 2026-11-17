@@ -4,6 +4,7 @@
 #include "core/Paths.h"
 #include "gfx/VulkanContext.h"
 
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/mat3x3.hpp>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace render3d {
 
@@ -73,6 +75,17 @@ float srgbToLinear(float c)
 glm::vec3 srgbToLinear(const glm::vec3& c)
 {
     return {srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b)};
+}
+
+// Grows lo..hi to hold the box min..max placed by `m`.
+void growBounds(glm::vec3& lo, glm::vec3& hi, const glm::vec3& min, const glm::vec3& max, const glm::mat4& m)
+{
+    const glm::vec3 centre = glm::vec3(m * glm::vec4((min + max) * 0.5f, 1.0f));
+    const glm::vec3 half = (max - min) * 0.5f;
+    const glm::vec3 reach =
+        glm::abs(glm::vec3(m[0])) * half.x + glm::abs(glm::vec3(m[1])) * half.y + glm::abs(glm::vec3(m[2])) * half.z;
+    lo = glm::min(lo, centre - reach);
+    hi = glm::max(hi, centre + reach);
 }
 
 } // namespace
@@ -293,6 +306,8 @@ void MeshRenderer::writeFrameUniforms(uint32_t frameIndex, const Camera3D& camer
 void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& camera, const SceneLighting& light)
 {
     shadowDrawCalls_ = 0;
+    shadowCulled_ = 0;
+    shadowTriangles_ = 0;
     if (!light.shadows.enabled || light.shadows.strength <= 0.0f || light.shadows.distance <= 0.0f) {
         pass_ = Pass::SkippedShadow; // draw() calls do nothing until endShadows
         return;
@@ -306,6 +321,11 @@ void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& 
 
     fitShadowMap(camera, light);
     shadowFrame_ = frame.frameNumber;
+    // Only what is inside the shadow map's box can cast into it.
+    if (!cullingFrozen_)
+        shadowFrustum_ = Frustum(shadowMatrix_);
+    frustum_ = shadowFrustum_;
+    cull_ = frustumCulling_;
     writeFrameUniforms(frame.frameIndex, camera, light, true);
 
     PerFrame& f = frames_[frame.frameIndex];
@@ -377,6 +397,12 @@ void MeshRenderer::begin(const gfx::FrameContext& frame, const Camera3D& camera,
     pass_ = Pass::Main;
     cmd_ = frame.cmd;
     drawCalls_ = 0;
+    culled_ = 0;
+    triangles_ = 0;
+    if (!cullingFrozen_)
+        viewFrustum_ = Frustum(camera.viewProjection());
+    frustum_ = viewFrustum_;
+    cull_ = frustumCulling_;
     boundTexture_ = VK_NULL_HANDLE;
     boundGeometry_ = nullptr;
     boundSkin_ = nullptr;
@@ -416,9 +442,8 @@ void MeshRenderer::usePipeline(bool skinned)
     }
 }
 
-int MeshRenderer::uploadJoints(const Model& model, int skin)
+int MeshRenderer::uploadJoints()
 {
-    model.jointMatrices(skin, modelSpace_, joints_);
     if (jointsUsed_ + joints_.size() > maxJoints_) {
         if (!warnedJoints_)
             LOG_WARN("MeshRenderer: more than %u joint matrices this frame; some skinned models aren't drawn "
@@ -458,6 +483,27 @@ bool MeshRenderer::uploadInstances(std::span<const glm::mat4> matrices, Instance
                             VkDeviceSize(out.first) * sizeof(glm::mat4));
     instancesUsed_ += out.count;
     return true;
+}
+
+bool MeshRenderer::visible(const glm::vec3& min, const glm::vec3& max, const glm::mat4& matrix)
+{
+    if (!cull_ || frustum_.intersects(min, max, matrix))
+        return true;
+    ++(pass_ == Pass::Shadow ? shadowCulled_ : culled_);
+    return false;
+}
+
+std::span<const glm::mat4> MeshRenderer::visibleCopies(std::span<const glm::mat4> all, const glm::vec3& min,
+                                                       const glm::vec3& max)
+{
+    if (!cull_)
+        return all;
+    visible_.clear();
+    for (const glm::mat4& m : all)
+        if (frustum_.intersects(min, max, m))
+            visible_.push_back(m);
+    (pass_ == Pass::Shadow ? shadowCulled_ : culled_) += uint32_t(all.size() - visible_.size());
+    return visible_;
 }
 
 void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission)
@@ -521,12 +567,16 @@ void MeshRenderer::drawCopies(const Mesh& geometry, const ModelPrimitive* prim, 
             geometry.draw(cmd_, groups[g], first);
         first += groups[g];
         ++(pass_ == Pass::Shadow ? shadowDrawCalls_ : drawCalls_);
+        (pass_ == Pass::Shadow ? shadowTriangles_ : triangles_) +=
+            (prim ? prim->indexCount : geometry.indexCount()) / 3 * groups[g];
     }
 }
 
 void MeshRenderer::draw(const Mesh& mesh, const glm::mat4& model, const Material& material)
 {
     if (pass_ == Pass::SkippedShadow || (pass_ == Pass::Shadow && !material.castShadows))
+        return;
+    if (!visible(mesh.boundsMin(), mesh.boundsMax(), model))
         return;
     drawMesh(mesh, model, material, {});
 }
@@ -535,8 +585,9 @@ void MeshRenderer::drawInstanced(const Mesh& mesh, std::span<const glm::mat4> mo
 {
     if (models.empty() || pass_ == Pass::SkippedShadow || (pass_ == Pass::Shadow && !material.castShadows))
         return;
+    const std::span<const glm::mat4> shown = visibleCopies(models, mesh.boundsMin(), mesh.boundsMax());
     Instances copies;
-    if (uploadInstances(models, copies))
+    if (!shown.empty() && uploadInstances(shown, copies))
         drawMesh(mesh, glm::mat4(1.0f), material, copies); // the instance matrices place each copy
 }
 
@@ -576,12 +627,18 @@ void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const Mo
                 model.nodeMatrices(glm::mat4(1.0f), pose, modelSpace_);
                 modelSpaceReady = true;
             }
-            firstJoint = uploadJoints(model, node.skin);
+            model.jointMatrices(node.skin, modelSpace_, joints_);
+            glm::vec3 lo, hi; // the whole bent mesh, tested at once
+            if (cull_ && model.skinBounds(node.skin, joints_, lo, hi) && !visible(lo, hi, transform))
+                continue;
+            firstJoint = uploadJoints();
             if (firstJoint < 0)
                 continue; // out of room (warned)
         }
         const glm::mat4& matrix = skinned ? transform : nodeMatrices_[size_t(n)];
         for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
+            if (!skinned && !visible(prim.boundsMin, prim.boundsMax, matrix))
+                continue; // a rigid part, tested on its own
             const bool blend = prim.material >= 0 &&
                                model.materials()[size_t(prim.material)].alphaMode == AlphaMode::Blend;
             if (blend && pass_ == Pass::Shadow) {
@@ -602,21 +659,50 @@ void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> 
 {
     if (!model.valid() || transforms.empty() || pass_ == Pass::SkippedShadow)
         return;
-    Instances copies;
-    if (!uploadInstances(transforms, copies))
-        return; // out of room (warned)
     // Each part is placed within the model by its node (the push constants), and the model
     // by each copy's matrix (the instance buffer): instance * node, in the vertex shader.
     model.nodeMatrices(glm::mat4(1.0f), pose, modelSpace_);
+
+    // Culling: each copy is tested by the box around the whole model in this pose.
+    std::span<const glm::mat4> shown = transforms;
+    if (cull_) {
+        glm::vec3 lo(std::numeric_limits<float>::max()), hi(-std::numeric_limits<float>::max());
+        for (int n = 0; n < model.nodeCount(); ++n) {
+            const ModelNode& node = model.node(n);
+            if (node.mesh < 0)
+                continue;
+            glm::vec3 min, max;
+            if (node.skin >= 0 && model.skinVertices().valid()) {
+                model.jointMatrices(node.skin, modelSpace_, joints_);
+                if (model.skinBounds(node.skin, joints_, min, max))
+                    growBounds(lo, hi, min, max, glm::mat4(1.0f));
+            } else {
+                for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives)
+                    growBounds(lo, hi, prim.boundsMin, prim.boundsMax, modelSpace_[size_t(n)]);
+            }
+        }
+        if (lo.x <= hi.x)
+            shown = visibleCopies(transforms, lo, hi);
+        if (shown.empty())
+            return; // all off screen
+    }
+    Instances copies;
+    if (!uploadInstances(shown, copies))
+        return; // out of room (warned)
+
     for (int n = 0; n < model.nodeCount(); ++n) {
         const ModelNode& node = model.node(n);
         if (node.mesh < 0)
             continue;
         // Skinned: bent once for the shared pose, the joints already in model space.
         const bool skinned = node.skin >= 0 && model.skinVertices().valid();
-        const int firstJoint = skinned ? uploadJoints(model, node.skin) : -1;
-        if (skinned && firstJoint < 0)
-            continue; // out of room (warned)
+        int firstJoint = -1;
+        if (skinned) {
+            model.jointMatrices(node.skin, modelSpace_, joints_);
+            firstJoint = uploadJoints();
+            if (firstJoint < 0)
+                continue; // out of room (warned)
+        }
         const glm::mat4 matrix = skinned ? glm::mat4(1.0f) : modelSpace_[size_t(n)];
         for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
             const bool blend = prim.material >= 0 &&
@@ -627,7 +713,7 @@ void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> 
                 // See-through parts are sorted one copy at a time (and drawn one at a time,
                 // in end()): each copy must go over whatever is behind it.
                 const glm::vec4 centre((prim.boundsMin + prim.boundsMax) * 0.5f, 1.0f);
-                for (const glm::mat4& t : transforms) {
+                for (const glm::mat4& t : shown) {
                     const glm::mat4 m = t * matrix;
                     blended_.push_back({&model, &prim, m, glm::length(glm::vec3(m * centre) - cameraPosition_),
                                         firstJoint});

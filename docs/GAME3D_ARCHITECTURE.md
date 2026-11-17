@@ -107,13 +107,15 @@ src/
     Animation.h/.cpp          SpriteSheet (grid or Aseprite JSON), clips, Animator
   render3d/
     Camera3D.h/.cpp           perspective camera (yaw/pitch, Vulkan clip conventions)
+    Frustum.h/.cpp            the six planes of a view; is a (transformed) box or sphere in it?
     Mesh.h/.cpp               Vertex, MeshData, primitives::cube/plane/sphere, GPU Mesh
     Model.h/.cpp              glTF 2.0 models (cgltf): ModelData, Model, ModelPose, ModelAnimation, skins
     ModelAnimator.h/.cpp      plays a model's animations into a ModelPose (blending, loops, moments)
     Raycast.h/.cpp            Ray; distance to a plane, sphere or (transformed) box
     ThirdPersonCamera.h/.cpp  follow/orbit camera with zoom, shoulder offset and collision
     MeshRenderer.h/.cpp       lit, textured forward renderer for meshes and models, with sun shadows,
-                              GPU skinning and instancing; Material, SceneLighting, ShadowSettings
+                              GPU skinning, instancing and frustum culling; Material, SceneLighting,
+                              ShadowSettings
   game/
     DemoGame.h/.cpp           example scene: fly and third-person cameras, a walking player
 shaders/                      GLSL sources (compiled to SPIR-V at build time)
@@ -353,7 +355,8 @@ whenever the current one is exhausted; optional per-set freeing) and `Descriptor
 - `Mesh` uploads `MeshData` into **device-local** vertex and index buffers once (via
   staging) and draws itself with `draw(cmd)`: bind buffers + one `vkCmdDrawIndexed`.
   `bind(cmd)` + `drawRange(cmd, firstIndex, indexCount, vertexOffset)` draw part of it
-  (a model's parts share one `Mesh`).
+  (a model's parts share one `Mesh`). `boundsMin()` / `boundsMax()`: the box around its
+  vertices, for frustum culling.
 
 **`render3d::Model`, `ModelData`, `ModelPose`**: glTF 2.0 models (`.gltf` + `.bin` +
 images, or one `.glb`), parsed with cgltf.
@@ -391,7 +394,11 @@ images, or one `.glb`), parsed with cgltf.
   (`JOINTS_1`) is ignored with a warning (4 per vertex). As glTF specifies, the skinned
   node's own transform is ignored. `jointMatrices(skin, nodeMatrices, out)` gives
   `nodeMatrix[joint] · inverseBind[joint]` for each joint: the matrix that takes a
-  bind-pose vertex to where that joint has moved it.
+  bind-pose vertex to where that joint has moved it. `skinBounds(skin, joints, min, max)`
+  gives the box around the mesh as those matrices bend it, for culling: at load, each joint
+  gets the box around the bind-pose vertices it moves at all; each frame those boxes are
+  moved by their joint matrices and joined. A bent vertex is a weighted average of where
+  its joints would put it, so it always lies inside (no skinning on the CPU).
 - **Materials** (`ModelMaterial`): base colour factor and texture, emissive factor (times
   `KHR_materials_emissive_strength`) and texture, metallic and roughness factors, alpha
   mode (opaque, mask with cutoff, blend), double-sided, `KHR_materials_unlit`. The
@@ -459,6 +466,20 @@ line of sight and mouse picking.
   inside a shape (a trigger volume, say) isn't blocked by it.
 - No triangle-mesh tests yet: games describe their colliders with these shapes.
 
+**`render3d::Frustum`**: what a view-projection matrix can see, as six planes (left, right,
+bottom, top, near, far) with unit normals pointing in, read straight out of the matrix
+(Gribb & Hartmann, for Vulkan's `0 <= z <= w`). Works for perspective and orthographic
+matrices alike (the sun's shadow map is one).
+
+- `Frustum(camera.viewProjection())`; a default-constructed one contains everything.
+- `intersects(min, max, transform = identity)`: could any of the box `min..max`, placed by
+  a model matrix, be inside? The box is tested as placed (turned and scaled, not the
+  upright box around it), one plane at a time: a box just outside a corner can still
+  answer true, a box partly inside never answers false. `intersectsSphere(centre,
+  radius)`. `planes()` for anything else.
+- `MeshRenderer` culls with it (§6.8); games can use it to skip other work for things off
+  screen (animation, effects).
+
 **`render3d::ThirdPersonCamera`**: follows a target from behind and orbits around it.
 
 - Public settings: `yaw`/`pitch` (Camera3D's convention: the view direction), `distance`
@@ -511,8 +532,11 @@ for shadows `beginShadows(frame, camera, lighting)` / `endShadows()` around the 
 different calls: `draw(model, ...)` bends them (§6.6). Many copies at once:
 `drawInstanced(mesh, models, material)` and `drawInstanced(model, transforms, pose)` take a
 `std::span<const glm::mat4>` (a vector or array) and draw every copy in one draw call per
-part (§6.7); `instancesUsed()` / `maxInstances()`. It needs a depth buffer, and says so at
-start-up if there isn't one.
+part (§6.7); `instancesUsed()` / `maxInstances()`. Frustum culling is on by default (§6.8):
+`setFrustumCulling(bool)`, `setCullingFrozen(bool)` (keep the frustums of that moment, to
+look at them from outside), `culled()` / `shadowCulled()` (parts and copies left out),
+`triangles()` / `shadowTriangles()`. It needs a depth buffer, and says so at start-up if
+there isn't one.
 
 - `Material { texture, color, emissive, emissiveStrength, emissiveTexture, roughness,
   metallic, doubleSided, castShadows }`: textures may be `nullptr` (an internal 1×1 white
@@ -893,6 +917,8 @@ flowchart LR
 - **Instances:** `drawInstanced` uploads one matrix per copy and draws each part once with
   that many instances; the vertex shaders multiply each copy's matrix by the push-constant
   matrix (§6.7).
+- **Culling:** every draw, model part and copy is first tested against the pass's frustum:
+  the camera's in the main pass, the shadow map's box in the shadow pass (§6.8).
 
 ### 6.2 Draw flow
 
@@ -907,6 +933,9 @@ sequenceDiagram
     MR->>Cmd: bind pipeline (solid or wireframe), bind set 0
     loop each object (a mesh, or each part of a model)
         G->>MR: draw(mesh, model, material) / draw(model, transform, pose)
+        opt frustum culling
+            MR->>MR: box outside the frustum: skip it (count it as culled)
+        end
         alt textures differ from last draw
             MR->>Cmd: bind set 1 (base colour + emission)
         end
@@ -916,7 +945,7 @@ sequenceDiagram
             MR->>Cmd: bind the skinned pipeline and the joint vertex buffer (if changed)
         end
         opt drawInstanced
-            MR->>MR: append the copies' matrices to the frame's instance buffer (once per call)
+            MR->>MR: keep the copies whose box is in the frustum, append their matrices to the frame's instance buffer (once per call)
         end
         MR->>Cmd: push constants (model, colour, emissive, material, first joint)
         MR->>Cmd: bind vertex/index buffers (if changed), vkCmdDrawIndexed<br/>(instances: 1 at entry 0, or the copies, mirrored ones as a second draw)
@@ -1107,13 +1136,65 @@ flowchart LR
 - **Blend parts** are queued one copy at a time, each with its own matrix
   (`instance · part`), and drawn in `end()` with the other see-through parts, farthest
   first.
-- **No culling:** every copy is drawn in both passes. Cull before the call (bounding
-  spheres against the view) when counts reach tens of thousands.
+- **Culling** keeps only the copies whose box is in view (§6.8): only those take room in
+  the buffer.
 - Cost: the matrices are written once per pass (64 bytes per copy); on the GPU, a matrix
   read and multiply per vertex. The demo's 800 trees are 2 draw calls per pass instead of
   1600.
 
-### 6.8 Text
+### 6.8 Frustum culling
+
+What the camera can't see needn't be drawn. Each pass has a `Frustum` (§3.3): `begin()`
+takes the camera's (`camera.viewProjection()`), `beginShadows()` the shadow map's
+(`shadowMatrix_`, a box reaching `kCasterReach` towards the sun, so tall things and the drone
+outside the view still cast into it). Every draw is tested against it before anything is
+bound or uploaded:
+
+| Call | What is tested | Against |
+|---|---|---|
+| `draw(mesh, matrix, material)` | the mesh's box (`Mesh::boundsMin/Max`), placed by `matrix` | once |
+| `draw(model, transform, pose)`, a rigid part | the primitive's box (`ModelPrimitive::bounds*`), placed by its node's matrix | per part, so a model half on screen draws only that half |
+| `draw(model, ...)`, a skinned node | `Model::skinBounds` for this pose, placed by `transform` | per node, before its joints are uploaded |
+| `drawInstanced(mesh, matrices, material)` | the mesh's box, placed by each matrix | per copy |
+| `drawInstanced(model, transforms, pose)` | one box around the whole model in this pose (every part, skinned ones bent), placed by each matrix | per copy, before the matrices are uploaded |
+
+```mermaid
+flowchart LR
+    cam["camera.viewProjection()<br/>(begin)"] --> fv["view frustum"]
+    sm["shadowMatrix_<br/>(beginShadows)"] --> fs["shadow frustum"]
+    fv --> f["this pass's frustum<br/>(kept as it is while frozen)"]
+    fs --> f
+    box["box in model space<br/>mesh, part, bent skin or whole model"] --> t{"placed by the matrix:<br/>outside any plane?"}
+    f --> t
+    t -->|yes| skip["skip, ++culled"]
+    t -->|no| draw["draw (or keep the copy<br/>for drawInstanced)"]
+```
+
+- **The test.** The box is placed by its matrix (a centre and three half-axes) and
+  compared with each plane in turn: it's out if, for some plane, the centre is further
+  outside than the box reaches. Exact for each plane; a box just outside a corner (outside
+  the frustum but not wholly behind any one plane) is still drawn. Mirrored and scaled
+  matrices work as they are.
+- **Exactly the same picture.** Only what can't touch the screen (or the shadow map) is
+  left out, so turning culling off changes nothing visible. The demo checks this pixel for
+  pixel.
+- **Skinned bounds** are conservative: the joints' boxes overlap and are joined into one
+  upright box, a little larger than the bent mesh (about 0.17 m across the diagonal, for the
+  soldier).
+- **Blend parts** are culled with the rest, before they're queued for sorting.
+- **Freezing** (`setCullingFrozen(true)`) keeps both frustums of that moment while the
+  camera moves on: fly out and see exactly what was left out. Debug use only.
+- **Counters:** `culled()` / `shadowCulled()` count the meshes, parts, skinned nodes and
+  copies left out; `triangles()` / `shadowTriangles()` the triangles drawn.
+- **The cost** is on the CPU: up to 6 plane tests per box, about 15 ns per box in an
+  optimised build on a desktop CPU, so the demo's 812 copies take about 12 µs per pass.
+  Without a spatial structure every object is still visited: for tens of thousands, cull
+  groups (patches of forest, rooms) first.
+- In the demo's forest, looking out from the clearing, about 700 of 812 copies are culled in
+  the main pass and about 650 in the shadow pass: 17–24 thousand triangles drawn instead of
+  135 thousand.
+
+### 6.9 Text
 
 ```mermaid
 flowchart LR
@@ -1257,6 +1338,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Load models | `render3d::Model::load(gpu, path)` (glTF 2.0), drawn with `MeshRenderer::draw(model, transform, pose)` |
 | Add a skinned character | Blender: mesh + Armature, *Ctrl+P > With Automatic Weights*, one Action per animation; export glTF with *Skinning* on and at most 4 influences per vertex. Load and draw it like any model; play its Actions with a `ModelAnimator` |
 | Draw many copies (trees, rocks, crowds) | `meshes.drawInstanced(model, matrices)` or `drawInstanced(mesh, matrices, material)`: one draw call per part for all of them (§6.7); a bigger `maxInstances` for more than ~8000 copies with shadows |
+| Skip work for things off screen | `render3d::Frustum(camera.viewProjection()).intersects(boundsMin, boundsMax, matrix)`, as `MeshRenderer` does for drawing (§6.8). For very large worlds, cull groups of objects (a grid of cells) before testing each one |
+| Draw something whose vertex shader moves vertices (wind, waves) | Make its mesh's box big enough for the movement, or culling may leave it out while part of it is on screen |
 | Add a new renderer (skybox, particles) | New class in `render3d/` following `MeshRenderer`: own `Pipeline` with `renderer.depthFormat()`, per-frame buffers indexed by `frame.frameIndex` |
 | Sharper or further shadows | Change `shadows.distance` and the constructor's `shadowMapSize`; for both at once, cascades: several maps for near-to-far slices of the view, fitted like `fitShadowMap` |
 | Shadows from other lights | Spot light: a perspective version of the sun's map; point light: a cube map. Same pattern: a depth-only pass in `onPreRender`, sampled in `mesh.frag` |
@@ -1279,6 +1362,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | One descriptor set per texture | Binding a texture is one call; no caches that can go stale | One set per texture (cheap); not bindless |
 | Forward rendering | Simplest path to correct lighting with one main light; works well on the Deck | Many dynamic lights need clustered/forward+ or deferred later |
 | Per-object data in push constants (112 B) | No per-object buffers or descriptor updates; works on every GPU | One draw call per object or model part; `drawInstanced` covers many copies of one thing |
+| Frustum culling inside `MeshRenderer`, per part and per copy, against each pass's own frustum | Every game gets it with no code; the shadow pass culls against the shadow map, so off-screen casters still cast; the instance buffer only holds visible copies; the picture is identical with it off | The CPU visits every object every pass (no hierarchy or grid); boxes, not tighter shapes; a vertex shader that moves vertices beyond the mesh's box would be culled too early |
 | Instancing through a per-frame matrix buffer and `gl_InstanceIndex`, entry 0 the identity | No extra pipelines or vertex formats: the same four vertex shaders serve single and instanced draws, skinned or not, in both passes; the game passes plain matrices | Copies share material and pose (no per-copy colour yet); every single draw pays one matrix read per vertex; matrices are re-uploaded each pass even when they never change |
 | Normal matrix computed in the vertex shader | Frees push-constant space for material values; correct under non-uniform scale | An `inverse()` per vertex (cheap for game-sized meshes) |
 | glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No normal maps or morph targets yet; whole model in memory |
@@ -1315,8 +1399,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
   firing) is up to the game, by combining two poses.
 - One directional light only, so only the sun casts shadows. One shadow map (no
   cascades): shadows reach `distance` (30 m) and fade out there; Blend (see-through)
-  parts cast none; constant softness. Every caster is drawn again for the shadow pass
-  (no culling of casters outside the map). A moving sun makes shadow edges crawl; keep
+  parts cast none; constant softness. A moving sun makes shadow edges crawl; keep
   `sunDirection` still, or change it very slowly.
 - Third-person camera: collision with simple shapes only (planes, spheres, boxes); it
   doesn't fade the player out when it moves in very close; no automatic swing behind a
@@ -1325,8 +1408,9 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 - Not PBR (roughness and metallic shape a Blinn-Phong highlight; image-based lighting and
   a proper BRDF would be the upgrade).
 - No anti-aliasing (MSAA, FXAA or TAA).
-- No frustum culling: every draw and every instance is drawn, in both passes. Instanced
-  copies share their material and pose (no per-copy colour or animation time).
+- Frustum culling tests every object every pass (no grid or tree to skip whole areas), and
+  no occlusion culling (things hidden behind others are still drawn). Instanced copies
+  share their material and pose (no per-copy colour or animation time).
 - No skybox (the fog-coloured clear colour stands in for the sky).
 - The debug UI uses one window (no ImGui docking or multi-viewport) and doesn't save its
   layout.

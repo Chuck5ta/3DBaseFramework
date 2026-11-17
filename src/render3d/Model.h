@@ -246,8 +246,18 @@ public:
     // has moved it, in model space, given the node matrices from nodeMatrices() with an
     // identity transform.
     void jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, std::vector<glm::mat4>& out) const;
+    // The box around everything a skin bends, as `joints` (from jointMatrices) bend it, in
+    // model space: for frustum culling. False if the skin moves no vertex.
+    bool skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max) const;
 
 private:
+    // For each skin, for each of its joints: the box around the vertices it moves at all,
+    // in the bind pose (min > max if none). Bent by that joint's matrix, each box holds
+    // where its vertices can be, so together they hold the whole bent mesh.
+    struct JointBounds {
+        glm::vec3 min, max;
+    };
+    std::vector<std::vector<JointBounds>> jointBounds_;
     Mesh geometry_;
     gfx::Buffer skinVertices_;
     std::vector<gfx::Texture> textures_;

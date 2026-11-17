@@ -7,7 +7,7 @@
 > (design and internals), `docs/TUTORIAL.md` (the demo built step by step) or
 > `docs/BUILDING.md` (Windows, Linux, Steam Deck builds).
 >
-> Framework state: **2026-11-15**. If the user's copy of the framework is older or newer,
+> Framework state: **2026-11-17**. If the user's copy of the framework is older or newer,
 > trust the source code over this file.
 
 ## 1. What it is
@@ -15,7 +15,7 @@
 An engine-free C++20 starter for **3D games** on Windows, Linux and Steam Deck. The game
 owns all the code: a thin platform layer (SDL3), a Vulkan 1.3 renderer with a depth buffer,
 a lit and textured forward renderer for meshes and **glTF models** (from Blender) with
-their **animations** and **skinning**, **instancing**, sun shadows, fly and third-person cameras, a 2D overlay for HUD text, 3D audio with effects and
+their **animations** and **skinning**, **instancing**, **frustum culling**, sun shadows, fly and third-person cameras, a 2D overlay for HUD text, 3D audio with effects and
 Doppler, and a debug UI. A demo scene (`DemoGame`: crates, spheres, a sun that can be animated, a humming
 crate, chiming spheres, a drone model circling with spinning rotors, an animated gunner
 built from rigid parts who tracks it, fires and reloads, a skinned player soldier you
@@ -40,8 +40,8 @@ src/
   core/                 Application (loop, hooks), Window, Input, Actions, GameState, SaveData, Paths, Log
   gfx/                  Vulkan: VulkanContext, Swapchain, Renderer, Buffer, Image,
                         Texture, Pipeline(Builder), Descriptors
-  render3d/             MeshRenderer (Material, SceneLighting, ShadowSettings; sun shadows, GPU skinning, instancing), Model (glTF, skins), ModelAnimator, Mesh (+ primitives),
-                        Camera3D, ThirdPersonCamera, Raycast
+  render3d/             MeshRenderer (Material, SceneLighting, ShadowSettings; sun shadows, GPU skinning, instancing, culling), Model (glTF, skins), ModelAnimator, Mesh (+ primitives),
+                        Camera3D, Frustum, ThirdPersonCamera, Raycast
   render2d/             SpriteBatch, Camera2D, Font, Animation (used for the HUD)
   audio/                AudioEngine (miniaudio): sounds, music, 3D, effects, Doppler
   debugui/              DebugUI (Dear ImGui)
@@ -416,7 +416,8 @@ farthest first). It stops with a message if the renderer has no depth buffer.
 emissiveTexture, roughness = 0.5, metallic = 0, doubleSided, castShadows = true}`.
 `setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
 `shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres), `jointsUsed()`,
-`maxJoints()`, `instancesUsed()`, `maxInstances()`. Per-object data travels
+`maxJoints()`, `instancesUsed()`, `maxInstances()`, `triangles()`, `shadowTriangles()`.
+Per-object data travels
 as push constants (one draw call per object or model part). Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
 
@@ -436,7 +437,27 @@ one-offs.
   copies (negative determinant) are sorted last and drawn as a second draw with the
   opposite winding. Blend parts are queued per copy for `end()`'s sorted pass.
 - Both passes append (each call costs its copy count twice with shadows); overflow skips
-  the call with one warning. No culling: every copy is drawn, in both passes.
+  the call with one warning. Only copies that pass frustum culling are uploaded.
+
+**Frustum culling** — automatic, nothing to call. `begin()` builds a `render3d::Frustum`
+from the camera, `beginShadows()` from the shadow map's box (which reaches 100 m towards the
+sun, so off-screen casters still cast). Each `draw(mesh)` is tested by `Mesh::boundsMin/Max`
+× its matrix; each rigid part of a model by its primitive's box × node matrix; a skinned
+node by `Model::skinBounds(skin, joints, min, max)` (per-joint bind-pose boxes moved by the
+joint matrices, computed in `Model::fromData`); each copy of a `drawInstanced` by one box
+around the whole posed model (or the mesh) × the copy's matrix, before upload. Blend parts
+are culled before they are queued.
+
+- The test is an oriented box against the six planes (conservative only at corners): the
+  picture is identical with culling off (checked pixel for pixel on six views, 2026-11-17).
+- `setFrustumCulling(bool)` (on by default), `setCullingFrozen(bool)` (keeps both frustums
+  of that moment: fly out and look), `culled()` / `shadowCulled()` (meshes, parts, skinned
+  nodes and copies left out).
+- `render3d::Frustum(viewProjection)` is public: `intersects(min, max, matrix)`,
+  `intersectsSphere(centre, radius)`, `planes()`; default-constructed = contains all. Use
+  it to skip game work off screen.
+- No spatial structure: every object is tested every pass (~15 ns per box, optimised).
+  A vertex shader that moves vertices beyond the mesh's box would need bigger bounds.
 
 **Shadows (sun only)** — the scene is drawn twice through the same calls, so put all 3D
 drawing in one function (the demo's `drawScene(alpha)`):
@@ -649,7 +670,9 @@ with a small xorshift (`random01`, the same on every compiler), drawn with one
 out, and trunk and crown boxes (`kTrunkBox`, `kCrownBox` × the tree's matrix) stop the
 camera (only trees within 15 m of the ray are tested). Debug UI → *Forest*: tree count
 slider and an *Instancing* checkbox (off: one `draw()` per tree, 1647 draw calls instead
-of 49).
+of 49). Debug UI → *Culling*: *Frustum culling* and *Freeze* checkboxes and the culled
+counts; the top lines show draw calls and triangles for both passes. Looking out from the
+clearing, about 700 of the 812 copies are culled (17–24k triangles instead of 135k).
 
 **`render3d::SceneLighting`** (all colours sRGB): `sunDirection` (the direction light
 travels), `sunColor`, `sunIntensity`, `skyColor` and `groundColor` (hemisphere ambient),
@@ -852,13 +875,12 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   feature is added, update `README.md`, `docs/GAME3D_ARCHITECTURE.md`, `docs/BUILDING.md` if
   relevant, the tutorial, **and this briefing**.
 
-## 13. Known limitations (as of 2026-11-15)
+## 13. Known limitations (as of 2026-11-17)
 
 **Roadmap (the owner's order):** model animation, third-person camera, shadows and
-skinned characters are all done (skinning 2026-11-15), and so is instancing (2026-11-15,
-first deferred, then asked for). Nothing is queued; ask the owner. Candidates:
-upper-body animation layering (walk + fire), shadow cascades, frustum culling (per
-instance and per draw), gamepad polish for the Steam Deck (the owner gets one late
+skinned characters are all done (skinning 2026-11-15), and so are instancing (2026-11-15)
+and frustum culling (2026-11-17). Nothing is queued; ask the owner. Candidates:
+upper-body animation layering (walk + fire), shadow cascades, gamepad polish for the Steam Deck (the owner gets one late
 November 2026). The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
@@ -871,10 +893,11 @@ can be mixed and matched from the same pieces.
   player fade when close, no auto-follow swing; no character controller.
 - One directional light; only it casts shadows: one shadow map (no cascades), so shadows
   stop at `shadows.distance` and are equally sharp near and far; constant softness; Blend
-  parts cast none; casters aren't culled for the shadow pass. Not PBR (roughness/metallic shape a Blinn-Phong
+  parts cast none. Not PBR (roughness/metallic shape a Blinn-Phong
   highlight), no anti-aliasing, no skybox (the fog-coloured
-  clear colour stands in), no frustum culling (every draw and every instance is drawn, in
-  both passes); instanced copies share material and pose (no per-copy colour).
+  clear colour stands in); culling has no spatial structure (every object is tested every
+  pass) and no occlusion culling; instanced copies share material and pose (no per-copy
+  colour).
 - Saves: no encryption/compression/cloud API (Steam Auto-Cloud works without code), no
   automatic `version` migration; window size/position aren't remembered.
 - Game states: no built-in transitions (fades) or menu widgets (copy the Game2D demo's

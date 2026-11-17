@@ -48,11 +48,15 @@ public:
 
     uint32_t indexCount() const { return indexCount_; }
     bool valid() const { return vertices_.valid(); }
+    // The box around its vertices (for frustum culling).
+    glm::vec3 boundsMin() const { return boundsMin_; }
+    glm::vec3 boundsMax() const { return boundsMax_; }
 
 private:
     gfx::Buffer vertices_;
     gfx::Buffer indices_;
     uint32_t indexCount_ = 0;
+    glm::vec3 boundsMin_{0.0f}, boundsMax_{0.0f};
 };
 
 } // namespace render3d
