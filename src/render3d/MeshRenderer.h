@@ -104,6 +104,13 @@ struct SceneLighting {
 // around the whole model; only the copies left go into the instance buffer. Nothing to
 // do: it's on unless you call setFrustumCulling(false).
 //
+// Morph targets (shape keys): pass one weight per entry of the model's weight list
+// (Model::defaultMorphWeights, Model::findMorphTarget) to draw or drawInstanced. The
+// weights go into this frame's weight buffer (set 0, binding 4), the model's offsets are
+// a storage buffer bound with its textures (set 1, binding 3), and the vertex shaders add
+// the weighted offsets to each vertex's position and normal before skinning, in both
+// passes. Targets at weight 0 cost nothing; a node whose weights are all 0 draws as usual.
+//
 // Normal maps: a Material's normalTexture, or a glTF material's normal texture, bends the
 // surface's normal per pixel along the vertex's tangent frame (Vertex::tangent), so light
 // catches grooves, bevels and grain that aren't in the geometry.
@@ -123,8 +130,11 @@ public:
     // skinned model drawn uses one per bone, twice with shadows). 8192 is 512 KB per frame.
     // maxInstances: how many instance matrices a frame can hold, shadow pass included (each
     // drawInstanced uses one per copy, twice with shadows). 16384 is 1 MB per frame.
+    // maxMorphWeights: how many morph target weights a frame can hold, shadow pass included
+    // (each morphed node drawn uses one per target of its mesh, twice with shadows). 65536
+    // is 256 KB per frame.
     MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize = 2048,
-                 uint32_t maxJoints = 8192, uint32_t maxInstances = 16384);
+                 uint32_t maxJoints = 8192, uint32_t maxInstances = 16384, uint32_t maxMorphWeights = 65536);
     ~MeshRenderer();
 
     // The shadow pass: call before the main pass begins (onPreRender), with the camera
@@ -135,10 +145,20 @@ public:
     void begin(const gfx::FrameContext& frame, const Camera3D& camera, const SceneLighting& lighting);
     void draw(const Mesh& mesh, const glm::mat4& model, const Material& material = {});
     void draw(const Model& model, const glm::mat4& transform, const ModelPose* pose = nullptr);
+    // The same, with the model's colours replaced: one linear RGBA per material of the model
+    // (model.materials()), used instead of that material's base colour. One Model can then
+    // be drawn in many colour schemes (a character creator's shirts, team colours). An empty
+    // span, or one shorter than the material list, keeps the file's colours for the rest.
+    // morphWeights: the model's morph target (shape key) weights, one per entry of
+    // model.defaultMorphWeights() (find one with model.findMorphTarget("Belly")). An empty
+    // span, or a shorter one, uses the file's weights for the rest.
+    void draw(const Model& model, const glm::mat4& transform, const ModelPose* pose,
+              std::span<const glm::vec4> materialColors, std::span<const float> morphWeights = {});
     // Instancing: a copy for each matrix, all with the same material (or, for a Model, the
     // same pose), in one draw call per part. A std::vector<glm::mat4> or array works here.
     void drawInstanced(const Mesh& mesh, std::span<const glm::mat4> models, const Material& material = {});
-    void drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose = nullptr);
+    void drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose = nullptr,
+                       std::span<const float> morphWeights = {});
     void end();
 
     // Frustum culling (on by default). Frozen, it keeps the camera's and the sun's view
@@ -169,6 +189,9 @@ public:
     // The same for instance matrices (entry 0 is kept for single copies, so this starts at 1).
     uint32_t instancesUsed() const { return instancesUsed_; }
     uint32_t maxInstances() const { return maxInstances_; }
+    // The same for morph target weights.
+    uint32_t morphWeightsUsed() const { return morphWeightsUsed_; }
+    uint32_t maxMorphWeights() const { return maxMorphWeights_; }
     uint32_t shadowMapSize() const { return shadowMap_.extent().width; }
     // How much ground one shadow-map texel covers, in metres, at the last beginShadows.
     float shadowTexelSize() const { return shadowTexel_; }
@@ -176,7 +199,8 @@ public:
 private:
     gfx::VulkanContext& ctx_;
     VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout materialSetLayout_ = VK_NULL_HANDLE; // binding 0 base colour, 1 emission, 2 normal
+    // binding 0 base colour, 1 emission, 2 normal; 3 the model's morph target offsets (vertex shaders)
+    VkDescriptorSetLayout materialSetLayout_ = VK_NULL_HANDLE;
     gfx::DescriptorAllocator descriptors_;
     gfx::Pipeline pipeline_;
     gfx::Pipeline blendPipeline_;     // see-through parts: blended, no depth writes
@@ -186,6 +210,7 @@ private:
     gfx::Pipeline skinnedPipeline_, skinnedBlendPipeline_, skinnedWireframePipeline_, skinnedShadowPipeline_;
     gfx::Texture white_;
     gfx::Texture flatNormal_; // "straight out": stands in when there's no normal map
+    gfx::Buffer noMorphs_;    // stands in for a model's morph offsets when it has none
     bool normalMaps_ = true;
 
     // Shadows: a depth image the sun "sees", and a sampler that compares against it.
@@ -220,7 +245,8 @@ private:
     void writeFrameUniforms(uint32_t frameIndex, const Camera3D& camera, const SceneLighting& lighting,
                             bool shadows);
     void fitShadowMap(const Camera3D& camera, const SceneLighting& lighting);
-    void bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission, const gfx::Texture* normal);
+    void bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission, const gfx::Texture* normal,
+                      const gfx::Buffer* morphs = nullptr);
     void setCulling(bool doubleSided, bool mirrored);
     // Which copies a draw makes: `count` matrices from `first` in the instance buffer, the
     // last `mirrored` of them mirrored (a negative scale, so drawn with the other winding).
@@ -237,11 +263,20 @@ private:
                     bool mirrored);
     void drawMesh(const Mesh& mesh, const glm::mat4& model, const Material& material, const Instances& copies);
     // firstJoint: where its joint matrices start in the joint buffer; -1 = not skinned.
+    // color: replaces the material's base colour (nullptr = the material's own).
+    // firstWeight: where its morph weights start in the weight buffer; -1 = not morphed.
     void drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix, int firstJoint,
-                       const Instances& copies);
+                       const Instances& copies, const glm::vec4* color = nullptr, int firstWeight = -1);
     void usePipeline(bool skinned);
     // Uploads joints_ (from Model::jointMatrices): returns the first joint's index, or -1.
     int uploadJoints();
+    // A node's morph weights for this draw (the given ones, the file's for the rest):
+    // fills morphWeights_ and returns true if any is not 0 (false = draw it unmorphed).
+    bool nodeMorphWeights(const Model& model, const ModelNode& node, std::span<const float> given);
+    // Uploads morphWeights_: returns the first weight's index, or -1 (out of room, warned).
+    int uploadMorphWeights();
+    // The box a node's morph targets can add, at morphWeights_ (zero if not morphed).
+    void morphReach(const Model& model, const ModelNode& node, bool morphed, glm::vec3& lo, glm::vec3& hi) const;
 
     struct BlendedDraw {
         const Model* model;
@@ -249,6 +284,9 @@ private:
         glm::mat4 matrix;
         float distance;
         int firstJoint;
+        glm::vec4 color;      // used if hasColor (a colour override from draw())
+        bool hasColor;
+        int firstWeight;      // morph weights, -1 = none
     };
     std::vector<BlendedDraw> blended_;
     std::vector<glm::mat4> nodeMatrices_; // scratch
@@ -256,11 +294,13 @@ private:
     std::vector<glm::mat4> joints_;       // scratch
     std::vector<glm::mat4> instances_;    // scratch: matrices sorted, the mirrored ones last
     std::vector<glm::mat4> visible_;      // scratch: the copies that passed frustum culling
+    std::vector<float> morphWeights_;     // scratch: one node's morph weights
 
     struct PerFrame {
         gfx::Buffer uniforms;
         gfx::Buffer joints;    // joint matrices of the skinned models drawn this frame
         gfx::Buffer instances; // matrices of the copies drawn by drawInstanced; [0] = identity
+        gfx::Buffer morphWeights; // morph target weights of the morphed nodes drawn this frame
         VkDescriptorSet set = VK_NULL_HANDLE;
         // Texture sets (base colour, emission, normal) used this frame, each with its set. Rebuilt every frame (the pool
         // is reset when the frame comes round again), so no set outlives its textures.
@@ -269,6 +309,7 @@ private:
             const gfx::Texture* baseColor;
             const gfx::Texture* emission;
             const gfx::Texture* normal;
+            const gfx::Buffer* morphs;
             VkDescriptorSet set;
         };
         std::vector<Cached> cache;
@@ -287,6 +328,9 @@ private:
     uint32_t maxInstances_ = 0;
     uint32_t instancesUsed_ = 1;
     bool warnedInstances_ = false;
+    uint32_t maxMorphWeights_ = 0;
+    uint32_t morphWeightsUsed_ = 0;
+    bool warnedMorphWeights_ = false;
     VkDescriptorSet boundTexture_ = VK_NULL_HANDLE;
     const Mesh* boundGeometry_ = nullptr;
     VkCullModeFlags cullMode_ = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;

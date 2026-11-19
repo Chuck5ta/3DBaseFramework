@@ -5,6 +5,7 @@
 
 #include "common.glsl"
 #include "instance.glsl"
+#include "morph.glsl"
 #include "skin.glsl"
 
 layout(location = 0) in vec3 inPosition;
@@ -18,5 +19,7 @@ void main()
 {
     outUV = inUV;
     outAlpha = inColor.a;
-    gl_Position = frame.shadowMatrix * instanceMatrix() * skinMatrix() * vec4(inPosition, 1.0);
+    vec3 position = inPosition;
+    applyMorphs(position); // shape keys first, so the shadow matches
+    gl_Position = frame.shadowMatrix * instanceMatrix() * skinMatrix() * vec4(position, 1.0);
 }

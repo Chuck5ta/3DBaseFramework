@@ -1,7 +1,8 @@
 // Shared declarations for mesh.vert / mesh.frag and shadow.vert / shadow.frag (and their
 // skinned versions). Included with #extension GL_GOOGLE_include_directive. The vertex
-// shaders also include instance.glsl (copies of a mesh in one draw) and, when skinned,
-// skin.glsl; mesh.vert and mesh_skinned.vert include tangents.glsl (for normal maps).
+// shaders also include instance.glsl (copies of a mesh in one draw), morph.glsl (shape
+// keys) and, when skinned, skin.glsl; mesh.vert and mesh_skinned.vert include
+// tangents.glsl (for normal maps).
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view;
@@ -25,6 +26,7 @@ layout(push_constant) uniform PushConstants {
     vec4 emissive;      // rgb = linear glow added on top; a = alpha cutoff (0 = none)
     vec4 material;      // x = roughness (0 glossy .. 1 matte), y = metallic, z = 1 if unlit,
                         // w = first joint matrix (skinned meshes, see skin.glsl)
-    vec4 surface;       // x = normal map strength (0 = none); yzw unused. 128 bytes in all:
-                        // the most every GPU is sure to allow
+    vec4 surface;       // x = normal map strength (0 = none); y, z, w = morph targets
+                        // (integers, see morph.glsl). 128 bytes in all: the most every
+                        // GPU is sure to allow, and every byte is used
 } object;

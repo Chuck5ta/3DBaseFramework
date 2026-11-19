@@ -70,12 +70,32 @@ bool readFloats(const cgltf_accessor* acc, size_t components, std::vector<float>
     return cgltf_accessor_unpack_floats(acc, out.data(), out.size()) == out.size();
 }
 
+const cgltf_accessor* findAttribute(const cgltf_attribute* attributes, cgltf_size count, cgltf_attribute_type type,
+                                    int index = 0)
+{
+    for (cgltf_size i = 0; i < count; ++i)
+        if (attributes[i].type == type && attributes[i].index == index)
+            return attributes[i].data;
+    return nullptr;
+}
+
 const cgltf_accessor* findAttribute(const cgltf_primitive& p, cgltf_attribute_type type, int index = 0)
 {
-    for (cgltf_size i = 0; i < p.attributes_count; ++i)
-        if (p.attributes[i].type == type && p.attributes[i].index == index)
-            return p.attributes[i].data;
-    return nullptr;
+    return findAttribute(p.attributes, p.attributes_count, type, index);
+}
+
+// Grows lo..hi by how far a mesh's morph targets can move a vertex at these weights: each
+// target adds its own box times its weight (a negative weight turns the box round).
+void growByMorphs(const ModelMesh& mesh, const float* weights, size_t count, glm::vec3& lo, glm::vec3& hi)
+{
+    for (size_t t = 0; t < mesh.targetMin.size() && t < count; ++t) {
+        const float w = weights[t];
+        if (w == 0.0f)
+            continue;
+        const glm::vec3 a = mesh.targetMin[t] * w, b = mesh.targetMax[t] * w;
+        lo += glm::min(a, b);
+        hi += glm::max(a, b);
+    }
 }
 
 // Image bytes (PNG/JPG...) from a buffer view, a data: URI or a file next to the model.
@@ -138,6 +158,7 @@ struct Loader {
     ModelData& out;
     std::set<std::string> warnedOnce;
     std::map<const cgltf_node*, int> nodeIndex; // glTF node -> index in out.nodes
+    std::vector<const cgltf_node*> sourceNodes; // index in out.nodes -> glTF node (or nullptr)
 
     void warn(const std::string& message)
     {
@@ -262,16 +283,14 @@ struct Loader {
     }
 
     // Converts one primitive to an indexed triangle list in out.vertices/out.indices.
-    bool loadPrimitive(const cgltf_primitive& p, const std::string& meshName, ModelPrimitive& prim)
+    bool loadPrimitive(const cgltf_primitive& p, ModelMesh& mesh, ModelPrimitive& prim)
     {
+        const std::string& meshName = mesh.name;
         if (p.type != cgltf_primitive_type_triangles && p.type != cgltf_primitive_type_triangle_strip &&
             p.type != cgltf_primitive_type_triangle_fan) {
             warn("Mesh '" + meshName + "': points and lines are skipped (only triangles are drawn)");
             return false;
         }
-        if (p.targets_count > 0)
-            warn("Mesh '" + meshName + "': shape keys (morph targets) aren't supported yet; the base shape is used");
-
         std::vector<float> pos, nrm, uv, col;
         const cgltf_accessor* posAcc = findAttribute(p, cgltf_attribute_type_position);
         if (!readFloats(posAcc, 3, pos)) {
@@ -377,8 +396,10 @@ struct Loader {
 
         prim.firstIndex = uint32_t(out.indices.size());
         prim.vertexOffset = int32_t(out.vertices.size());
+        std::vector<uint32_t> source; // for each vertex made, the file's vertex it came from (morph targets)
         if (haveNormals) {
             for (size_t i = 0; i < count; ++i) {
+                source.push_back(uint32_t(i));
                 out.vertices.push_back(vertex(uint32_t(i)));
                 if (haveSkin)
                     out.skinVertices.push_back(skinVertex(uint32_t(i)));
@@ -393,6 +414,7 @@ struct Loader {
                 a.normal = b.normal = c.normal = len > 0.0f ? n / len : glm::vec3(0.0f, 1.0f, 0.0f);
                 const uint32_t base = uint32_t(out.vertices.size()) - uint32_t(prim.vertexOffset);
                 out.vertices.insert(out.vertices.end(), {a, b, c});
+                source.insert(source.end(), {tris[t], tris[t + 1], tris[t + 2]});
                 out.indices.insert(out.indices.end(), {base, base + 1, base + 2});
                 if (haveSkin)
                     out.skinVertices.insert(out.skinVertices.end(),
@@ -413,8 +435,11 @@ struct Loader {
                                      const SkinVertex copy = out.skinVertices[from];
                                      out.skinVertices.push_back(copy);
                                  }
+                                 source.push_back(source[from - uint32_t(prim.vertexOffset)]);
                              });
         }
+        if (p.targets_count > 0)
+            loadMorphTargets(p, mesh, prim, source, count, haveNormals);
 
         prim.boundsMin = glm::vec3(std::numeric_limits<float>::max());
         prim.boundsMax = glm::vec3(-std::numeric_limits<float>::max());
@@ -435,10 +460,87 @@ struct Loader {
             mm.name = nameOr(m.name, "mesh", i);
             for (cgltf_size j = 0; j < m.primitives_count; ++j) {
                 ModelPrimitive prim;
-                if (loadPrimitive(m.primitives[j], mm.name, prim))
+                if (loadPrimitive(m.primitives[j], mm, prim))
                     mm.primitives.push_back(prim);
             }
+            const size_t targets = mm.targetMin.size();
+            if (targets > 0) {
+                // Blender writes the shape key names into the mesh's extras ("targetNames").
+                for (size_t t = 0; t < targets; ++t)
+                    mm.targetNames.push_back(t < m.target_names_count && m.target_names[t] && *m.target_names[t]
+                                                 ? std::string(m.target_names[t])
+                                                 : "target " + std::to_string(t));
+                mm.defaultWeights.assign(targets, 0.0f);
+                if (m.weights_count == targets)
+                    mm.defaultWeights.assign(m.weights, m.weights + targets);
+            }
             out.meshes.push_back(std::move(mm));
+        }
+    }
+
+    // Reads a primitive's morph targets: each made vertex gets the offsets of the file's
+    // vertex it came from (`source`), all its targets together.
+    void loadMorphTargets(const cgltf_primitive& p, ModelMesh& mesh, ModelPrimitive& prim,
+                          const std::vector<uint32_t>& source, size_t count, bool useNormals)
+    {
+        const size_t targets = p.targets_count;
+        if (!mesh.targetMin.empty() && mesh.targetMin.size() != targets) {
+            warn("Mesh '" + mesh.name + "': its parts have different numbers of shape keys; a part's are ignored");
+            return;
+        }
+        std::vector<std::vector<float>> pos(targets), nrm(targets);
+        for (size_t t = 0; t < targets; ++t) {
+            const cgltf_morph_target& target = p.targets[t];
+            const cgltf_accessor* pa = findAttribute(target.attributes, target.attributes_count,
+                                                     cgltf_attribute_type_position);
+            const cgltf_accessor* na = findAttribute(target.attributes, target.attributes_count,
+                                                     cgltf_attribute_type_normal);
+            if (pa && (pa->count != count || !readFloats(pa, 3, pos[t]))) {
+                warn("Mesh '" + mesh.name + "': unreadable shape key positions; that shape key does nothing");
+                pos[t].clear();
+            }
+            if (useNormals && na && (na->count != count || !readFloats(na, 3, nrm[t]))) {
+                warn("Mesh '" + mesh.name + "': unreadable shape key normals; they're left as they are");
+                nrm[t].clear();
+            }
+            if (findAttribute(target.attributes, target.attributes_count, cgltf_attribute_type_tangent))
+                warn("Mesh '" + mesh.name + "': shape key tangents are ignored (the normals and positions are used)");
+        }
+        if (mesh.targetMin.empty()) {
+            mesh.targetMin.assign(targets, glm::vec3(0.0f));
+            mesh.targetMax.assign(targets, glm::vec3(0.0f));
+        }
+        prim.morphTargets = uint32_t(targets);
+        prim.morphFirst = uint32_t(out.morphDeltas.size());
+        out.morphDeltas.resize(out.morphDeltas.size() + source.size() * targets);
+        MorphDelta* d = out.morphDeltas.data() + prim.morphFirst;
+        for (size_t v = 0; v < source.size(); ++v)
+            for (size_t t = 0; t < targets; ++t, ++d) {
+                const size_t s = size_t(source[v]) * 3;
+                if (!pos[t].empty())
+                    d->position = glm::make_vec3(&pos[t][s]);
+                if (!nrm[t].empty())
+                    d->normal = glm::make_vec3(&nrm[t][s]);
+                mesh.targetMin[t] = glm::min(mesh.targetMin[t], d->position);
+                mesh.targetMax[t] = glm::max(mesh.targetMax[t], d->position);
+            }
+    }
+
+    // Each node with a morphed mesh gets its run of the model's weight list, at the file's
+    // weights: the node's own, else its mesh's (glTF's rule).
+    void assignMorphWeights()
+    {
+        for (size_t i = 0; i < out.nodes.size(); ++i) {
+            ModelNode& node = out.nodes[i];
+            if (node.mesh < 0 || out.meshes[size_t(node.mesh)].targetMin.empty())
+                continue;
+            const ModelMesh& mesh = out.meshes[size_t(node.mesh)];
+            node.firstMorphWeight = int(out.morphWeights.size());
+            const cgltf_node* src = i < sourceNodes.size() ? sourceNodes[i] : nullptr;
+            if (src && src->weights_count == mesh.defaultWeights.size())
+                out.morphWeights.insert(out.morphWeights.end(), src->weights, src->weights + src->weights_count);
+            else
+                out.morphWeights.insert(out.morphWeights.end(), mesh.defaultWeights.begin(), mesh.defaultWeights.end());
         }
     }
 
@@ -464,6 +566,7 @@ struct Loader {
         }
         const int index = int(out.nodes.size());
         nodeIndex[&n] = index;
+        sourceNodes.push_back(&n);
         out.nodes.push_back(std::move(node));
         for (cgltf_size i = 0; i < n.children_count; ++i)
             addNode(*n.children[i], index);
@@ -564,7 +667,8 @@ struct Loader {
                 case cgltf_animation_path_type_rotation: mc.path = AnimationPath::Rotation; break;
                 case cgltf_animation_path_type_scale: mc.path = AnimationPath::Scale; break;
                 default:
-                    warn("Animation '" + ma.name + "': shape key (morph target) animation isn't supported; skipped");
+                    warn("Animation '" + ma.name + "': shape key (morph target) animation isn't supported yet; "
+                         "skipped (set the weights in MeshRenderer::draw instead)");
                     continue;
                 }
                 const auto found = nodeIndex.find(ch.target_node);
@@ -633,7 +737,11 @@ struct Loader {
                         for (int c = 0; c < 4; ++c)
                             if (sv.weights[c] > 0.0f)
                                 m += joints[sv.joints[c]] * sv.weights[c];
-                        const glm::vec3 w = glm::vec3(m * glm::vec4(out.vertices[v].position, 1.0f));
+                        glm::vec3 position = out.vertices[v].position; // morphed first, at the file's weights
+                        for (uint32_t t = 0; t < p.morphTargets && n.firstMorphWeight >= 0; ++t)
+                            position += out.morphWeights[size_t(n.firstMorphWeight) + t] *
+                                        out.morphDeltas[p.morphFirst + size_t(out.indices[k]) * p.morphTargets + t].position;
+                        const glm::vec3 w = glm::vec3(m * glm::vec4(position, 1.0f));
                         lo = glm::min(lo, w);
                         hi = glm::max(hi, w);
                     }
@@ -641,15 +749,19 @@ struct Loader {
             }
             if (n.mesh < 0)
                 continue;
-            for (const ModelPrimitive& p : out.meshes[size_t(n.mesh)].primitives)
+            const ModelMesh& mesh = out.meshes[size_t(n.mesh)];
+            for (const ModelPrimitive& p : mesh.primitives) {
+                glm::vec3 pMin = p.boundsMin, pMax = p.boundsMax;
+                if (p.morphTargets > 0 && n.firstMorphWeight >= 0)
+                    growByMorphs(mesh, &out.morphWeights[size_t(n.firstMorphWeight)], p.morphTargets, pMin, pMax);
                 for (int c = 0; c < 8; ++c) {
-                    const glm::vec3 corner((c & 1) ? p.boundsMax.x : p.boundsMin.x,
-                                           (c & 2) ? p.boundsMax.y : p.boundsMin.y,
-                                           (c & 4) ? p.boundsMax.z : p.boundsMin.z);
+                    const glm::vec3 corner((c & 1) ? pMax.x : pMin.x, (c & 2) ? pMax.y : pMin.y,
+                                           (c & 4) ? pMax.z : pMin.z);
                     const glm::vec3 w = glm::vec3(world[i] * glm::vec4(corner, 1.0f));
                     lo = glm::min(lo, w);
                     hi = glm::max(hi, w);
                 }
+            }
         }
         if (lo.x > hi.x)
             lo = hi = glm::vec3(0.0f);
@@ -704,6 +816,7 @@ bool loadModelData(const std::string& path, ModelData& out, std::string* error)
     loader.loadMeshes();
     loader.loadNodes();
     loader.loadSkins();
+    loader.assignMorphWeights();
     loader.loadAnimations();
     loader.computeBounds();
     if (out.indices.empty())
@@ -815,6 +928,21 @@ Model Model::fromData(gfx::VulkanContext& gpu, const ModelData& data, const std:
         m.skinVertices_ = gfx::Buffer::createWithData(gpu, data.skinVertices.data(),
                                                       data.skinVertices.size() * sizeof(SkinVertex),
                                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, (debugName + " joints").c_str());
+    if (!data.morphDeltas.empty())
+        m.morphDeltas_ = gfx::Buffer::createWithData(gpu, data.morphDeltas.data(),
+                                                     data.morphDeltas.size() * sizeof(MorphDelta),
+                                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                     (debugName + " morph targets").c_str());
+    m.defaultMorphWeights_ = data.morphWeights;
+    m.morphWeightNode_.assign(data.morphWeights.size(), -1);
+    for (size_t i = 0; i < data.nodes.size(); ++i) {
+        const ModelNode& n = data.nodes[i];
+        if (n.firstMorphWeight < 0)
+            continue;
+        const size_t count = data.meshes[size_t(n.mesh)].targetNames.size();
+        for (size_t t = 0; t < count && size_t(n.firstMorphWeight) + t < m.morphWeightNode_.size(); ++t)
+            m.morphWeightNode_[size_t(n.firstMorphWeight) + t] = int(i);
+    }
 
     std::vector<bool> isNormalMap(data.textures.size(), false); // data, not colour: no sRGB decoding
     for (const ModelMaterial& mat : data.materials)
@@ -892,6 +1020,51 @@ int Model::findAnimation(std::string_view name) const
     return -1;
 }
 
+int Model::findMorphTarget(std::string_view name) const
+{
+    for (size_t w = 0; w < morphWeightNode_.size(); ++w)
+        if (morphTargetName(int(w)) == name)
+            return int(w);
+    if (warnedTargets_.insert(std::string(name)).second) {
+        std::string names;
+        for (size_t w = 0; w < morphWeightNode_.size() && names.size() < 400; ++w)
+            names += (names.empty() ? "" : ", ") + morphTargetName(int(w));
+        LOG_WARN("Model '%s' has no shape key (morph target) called '%.*s' (it has: %s)", name_.c_str(),
+                 int(name.size()), name.data(), names.empty() ? "none" : names.c_str());
+    }
+    return -1;
+}
+
+int Model::findMorphTarget(int node, std::string_view name) const
+{
+    if (node >= 0 && size_t(node) < nodes_.size() && nodes_[size_t(node)].firstMorphWeight >= 0) {
+        const ModelNode& n = nodes_[size_t(node)];
+        const std::vector<std::string>& names = meshes_[size_t(n.mesh)].targetNames;
+        for (size_t t = 0; t < names.size(); ++t)
+            if (names[t] == name)
+                return n.firstMorphWeight + int(t);
+    }
+    const std::string key = std::to_string(node) + ":" + std::string(name);
+    if (warnedTargets_.insert(key).second)
+        LOG_WARN("Model '%s': node %d has no shape key (morph target) called '%.*s'", name_.c_str(), node,
+                 int(name.size()), name.data());
+    return -1;
+}
+
+const std::string& Model::morphTargetName(int weight) const
+{
+    static const std::string none;
+    if (weight < 0 || size_t(weight) >= morphWeightNode_.size() || morphWeightNode_[size_t(weight)] < 0)
+        return none;
+    const ModelNode& n = nodes_[size_t(morphWeightNode_[size_t(weight)])];
+    return meshes_[size_t(n.mesh)].targetNames[size_t(weight - n.firstMorphWeight)];
+}
+
+void Model::morphReach(int mesh, const float* weights, size_t count, glm::vec3& lo, glm::vec3& hi) const
+{
+    growByMorphs(meshes_[size_t(mesh)], weights, count, lo, hi);
+}
+
 glm::mat4 Model::nodeMatrix(int node, const glm::mat4& transform, const ModelPose* pose) const
 {
     const bool usePose = pose && pose->size() == nodes_.size();
@@ -936,7 +1109,8 @@ void Model::jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, 
         out[j] = nodeMatrices[size_t(s.joints[j])] * s.inverseBind[j];
 }
 
-bool Model::skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max) const
+bool Model::skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max,
+                       const glm::vec3& morphLo, const glm::vec3& morphHi) const
 {
     // A bent vertex is a weighted average of where each of its joints would put it, so it
     // lies within the boxes those joints carry: the box around them all holds it.
@@ -948,9 +1122,11 @@ bool Model::skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3
         if (b.min.x > b.max.x)
             continue; // this joint moves nothing
         // The box as the joint turns it, then the upright box around that.
+        // Morph targets move the vertices before the joints do: grow the box by their reach.
+        const glm::vec3 bMin = b.min + morphLo, bMax = b.max + morphHi;
         const glm::mat4& m = joints[j];
-        const glm::vec3 centre = glm::vec3(m * glm::vec4((b.min + b.max) * 0.5f, 1.0f));
-        const glm::vec3 half = (b.max - b.min) * 0.5f;
+        const glm::vec3 centre = glm::vec3(m * glm::vec4((bMin + bMax) * 0.5f, 1.0f));
+        const glm::vec3 half = (bMax - bMin) * 0.5f;
         const glm::vec3 reach = glm::abs(glm::vec3(m[0])) * half.x + glm::abs(glm::vec3(m[1])) * half.y +
                                 glm::abs(glm::vec3(m[2])) * half.z;
         min = glm::min(min, centre - reach);

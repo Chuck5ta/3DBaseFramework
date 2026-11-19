@@ -3,6 +3,7 @@
 
 #include "common.glsl"
 #include "instance.glsl"
+#include "morph.glsl"
 #include "tangents.glsl"
 
 layout(location = 0) in vec3 inPosition;
@@ -18,12 +19,15 @@ layout(location = 3) out vec4 outColor;
 void main()
 {
     mat4 model = instanceMatrix();
-    vec4 world = model * vec4(inPosition, 1.0);
+    vec3 position = inPosition;
+    vec3 normal = inNormal;
+    applyMorphs(position, normal); // shape keys first, in the mesh's own space
+    vec4 world = model * vec4(position, 1.0);
     // Inverse-transpose keeps normals correct under non-uniform scaling.
     mat3 normalMatrix = transpose(inverse(mat3(model)));
 
     outWorldPos = world.xyz;
-    outNormal = normalize(normalMatrix * inNormal);
+    outNormal = normalize(normalMatrix * normal);
     writeTangentFrame(model, outNormal);
     outUV = inUV;
     outColor = inColor;

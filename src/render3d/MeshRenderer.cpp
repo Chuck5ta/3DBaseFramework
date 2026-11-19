@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 
 namespace render3d {
@@ -42,11 +43,21 @@ struct PushConstants {
     glm::vec4 color;    // linear base colour and alpha
     glm::vec4 emissive; // rgb = linear glow; a = alpha cutoff (0 = none)
     glm::vec4 material; // x = roughness, y = metallic, z = 1 if unlit, w = first joint (skinned)
-    glm::vec4 surface;  // x = normal map strength (0 = no normal map); yzw unused
+    glm::vec4 surface;  // x = normal map strength (0 = no normal map); y, z, w = morph targets
+                        // (integers, bit for bit): first weight, target count (0 = none), and
+                        // where vertex 0's offsets would start in the model's offsets
 };
 static_assert(sizeof(PushConstants) <= 128);
 
 constexpr VkShaderStageFlags kPushStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+// An integer carried bit for bit in a float push constant (read with floatBitsToInt).
+float intBits(int32_t v)
+{
+    float f;
+    std::memcpy(&f, &v, sizeof(f));
+    return f;
+}
 
 // How far towards the sun, beyond the shadowed area, things still cast shadows into it:
 // a drone 50 m up still shades the ground below.
@@ -92,8 +103,9 @@ void growBounds(glm::vec3& lo, glm::vec3& hi, const glm::vec3& min, const glm::v
 } // namespace
 
 MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uint32_t shadowMapSize,
-                           uint32_t maxJoints, uint32_t maxInstances)
-    : ctx_(ctx), maxJoints_(std::max(maxJoints, 1u)), maxInstances_(std::max(maxInstances, 2u))
+                           uint32_t maxJoints, uint32_t maxInstances, uint32_t maxMorphWeights)
+    : ctx_(ctx), maxJoints_(std::max(maxJoints, 1u)), maxInstances_(std::max(maxInstances, 2u)),
+      maxMorphWeights_(std::max(maxMorphWeights, 1u))
 {
     // Without a depth buffer, whatever is drawn last ends up in front.
     if (renderer.depthFormat() == VK_FORMAT_UNDEFINED)
@@ -104,16 +116,18 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
                           .add(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT) // shadow map
                           .add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // joint matrices
                           .add(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // instance matrices
+                          .add(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // morph weights
                           .build(ctx.device());
     descriptors_.init(ctx.device(), renderer.framesInFlight(),
                       {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1.0f},
                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1.0f},
-                       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2.0f}},
+                       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3.0f}},
                       /*allowFree*/ false);
     materialSetLayout_ = gfx::DescriptorLayoutBuilder()
                              .add(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
                              .add(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
                              .add(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT)
+                             .add(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT) // morph offsets
                              .build(ctx.device());
 
     auto builder = gfx::PipelineBuilder()
@@ -213,15 +227,20 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gfx::MemoryUsage::CpuToGpu, "instance matrices");
         const glm::mat4 identity(1.0f); // entry 0, for every draw of a single copy; never overwritten
         f.instances.write(&identity, sizeof(identity));
+        f.morphWeights = gfx::Buffer(ctx, VkDeviceSize(maxMorphWeights_) * sizeof(float),
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gfx::MemoryUsage::CpuToGpu, "morph weights");
         f.set = descriptors_.allocate(frameSetLayout_).set;
         f.materialSets = std::make_unique<gfx::DescriptorAllocator>();
-        f.materialSets->init(ctx.device(), 64, {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3.0f}}, /*allowFree*/ false);
+        f.materialSets->init(ctx.device(), 64,
+                             {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3.0f}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1.0f}},
+                             /*allowFree*/ false);
         gfx::DescriptorWriter()
             .buffer(0, f.uniforms.handle(), sizeof(FrameUniforms), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
             .image(1, shadowMap_.view(), shadowSampler_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
             .buffer(2, f.joints.handle(), f.joints.size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             .buffer(3, f.instances.handle(), f.instances.size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            .buffer(4, f.morphWeights.handle(), f.morphWeights.size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             .update(ctx.device(), f.set);
         frames_.push_back(std::move(f));
     }
@@ -234,6 +253,9 @@ MeshRenderer::MeshRenderer(gfx::VulkanContext& ctx, gfx::Renderer& renderer, uin
     flatDesc.filter = VK_FILTER_NEAREST;
     flatDesc.debugName = "flat normal";
     flatNormal_ = gfx::Texture::fromPixels(ctx, 1, 1, straightOut, flatDesc);
+    const MorphDelta nothing{};
+    noMorphs_ = gfx::Buffer::createWithData(ctx, &nothing, sizeof(nothing), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                            "no morph targets");
 }
 
 MeshRenderer::~MeshRenderer()
@@ -343,6 +365,7 @@ void MeshRenderer::beginShadows(const gfx::FrameContext& frame, const Camera3D& 
     f.cache.clear();
     jointsUsed_ = 0;
     instancesUsed_ = 1;
+    morphWeightsUsed_ = 0;
     frame_ = &f;
 
     // Wait for earlier frames to finish reading the map, then render into it. Its old
@@ -431,6 +454,7 @@ void MeshRenderer::begin(const gfx::FrameContext& frame, const Camera3D& camera,
         f.cache.clear();
         jointsUsed_ = 0;
         instancesUsed_ = 1;
+        morphWeightsUsed_ = 0;
     }
     frame_ = &f;
 
@@ -465,6 +489,46 @@ int MeshRenderer::uploadJoints()
     frame_->joints.write(joints_.data(), joints_.size() * sizeof(glm::mat4), VkDeviceSize(first) * sizeof(glm::mat4));
     jointsUsed_ += uint32_t(joints_.size());
     return first;
+}
+
+bool MeshRenderer::nodeMorphWeights(const Model& model, const ModelNode& node, std::span<const float> given)
+{
+    if (node.firstMorphWeight < 0 || !model.morphDeltas().valid())
+        return false;
+    const size_t first = size_t(node.firstMorphWeight);
+    const size_t count = model.meshes()[size_t(node.mesh)].targetNames.size();
+    const std::vector<float>& defaults = model.defaultMorphWeights();
+    morphWeights_.resize(count);
+    bool any = false;
+    for (size_t t = 0; t < count; ++t) {
+        morphWeights_[t] = first + t < given.size() ? given[first + t] : defaults[first + t];
+        any = any || morphWeights_[t] != 0.0f;
+    }
+    return any;
+}
+
+int MeshRenderer::uploadMorphWeights()
+{
+    if (morphWeightsUsed_ + morphWeights_.size() > maxMorphWeights_) {
+        if (!warnedMorphWeights_)
+            LOG_WARN("MeshRenderer: more than %u morph weights this frame; some models are drawn unmorphed "
+                     "(pass a bigger maxMorphWeights to the MeshRenderer)", maxMorphWeights_);
+        warnedMorphWeights_ = true;
+        return -1;
+    }
+    const int first = int(morphWeightsUsed_);
+    frame_->morphWeights.write(morphWeights_.data(), morphWeights_.size() * sizeof(float),
+                               VkDeviceSize(first) * sizeof(float));
+    morphWeightsUsed_ += uint32_t(morphWeights_.size());
+    return first;
+}
+
+void MeshRenderer::morphReach(const Model& model, const ModelNode& node, bool morphed, glm::vec3& lo,
+                              glm::vec3& hi) const
+{
+    lo = hi = glm::vec3(0.0f);
+    if (morphed)
+        model.morphReach(node.mesh, morphWeights_.data(), morphWeights_.size(), lo, hi);
 }
 
 bool MeshRenderer::uploadInstances(std::span<const glm::mat4> matrices, Instances& out)
@@ -517,14 +581,15 @@ std::span<const glm::mat4> MeshRenderer::visibleCopies(std::span<const glm::mat4
 }
 
 void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Texture* emission,
-                                const gfx::Texture* normal)
+                                const gfx::Texture* normal, const gfx::Buffer* morphs)
 {
     const gfx::Texture* a = baseColor ? baseColor : &white_;
     const gfx::Texture* e = emission ? emission : &white_;
     const gfx::Texture* n = normal ? normal : &flatNormal_;
+    const gfx::Buffer* m = morphs && morphs->valid() ? morphs : &noMorphs_;
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (const PerFrame::Cached& c : frame_->cache)
-        if (c.baseColor == a && c.emission == e && c.normal == n) {
+        if (c.baseColor == a && c.emission == e && c.normal == n && c.morphs == m) {
             set = c.set;
             break;
         }
@@ -537,8 +602,9 @@ void MeshRenderer::bindTextures(const gfx::Texture* baseColor, const gfx::Textur
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
             .image(2, n->view(), n->sampler(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            .buffer(3, m->handle(), m->size(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             .update(ctx_.device(), set);
-        frame_->cache.push_back({a, e, n, set});
+        frame_->cache.push_back({a, e, n, m, set});
     }
     if (set != boundTexture_) {
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, active_->layout(), 1, 1, &set, 0, nullptr);
@@ -618,7 +684,7 @@ void MeshRenderer::drawMesh(const Mesh& mesh, const glm::mat4& model, const Mate
     pc.color = glm::vec4(srgbToLinear(glm::vec3(material.color)), material.color.a);
     pc.emissive = glm::vec4(srgbToLinear(material.emissive) * material.emissiveStrength, 0.0f);
     pc.material = glm::vec4(material.roughness, material.metallic, 0.0f, 0.0f);
-    pc.surface = glm::vec4(normalMap ? material.normalScale : 0.0f, 0.0f, 0.0f, 0.0f);
+    pc.surface = glm::vec4(normalMap ? material.normalScale : 0.0f, 0.0f, intBits(0), 0.0f); // no morph targets
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
     drawCopies(mesh, nullptr, copies, material.doubleSided, glm::determinant(glm::mat3(model)) < 0.0f);
@@ -626,6 +692,12 @@ void MeshRenderer::drawMesh(const Mesh& mesh, const glm::mat4& model, const Mate
 }
 
 void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const ModelPose* pose)
+{
+    draw(model, transform, pose, {});
+}
+
+void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const ModelPose* pose,
+                        std::span<const glm::vec4> materialColors, std::span<const float> morphWeights)
 {
     if (!model.valid() || pass_ == Pass::SkippedShadow)
         return;
@@ -638,6 +710,10 @@ void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const Mo
         // A skinned mesh: its joints place it (in model space), then `transform` places the
         // model; the node's own transform is ignored, as glTF says.
         const bool skinned = node.skin >= 0 && model.skinVertices().valid();
+        // Morph targets: how far they can move the vertices, for culling.
+        const bool morphed = nodeMorphWeights(model, node, morphWeights);
+        glm::vec3 reachLo, reachHi;
+        morphReach(model, node, morphed, reachLo, reachHi);
         int firstJoint = -1;
         if (skinned) {
             if (!modelSpaceReady) {
@@ -646,33 +722,39 @@ void MeshRenderer::draw(const Model& model, const glm::mat4& transform, const Mo
             }
             model.jointMatrices(node.skin, modelSpace_, joints_);
             glm::vec3 lo, hi; // the whole bent mesh, tested at once
-            if (cull_ && model.skinBounds(node.skin, joints_, lo, hi) && !visible(lo, hi, transform))
+            if (cull_ && model.skinBounds(node.skin, joints_, lo, hi, reachLo, reachHi) && !visible(lo, hi, transform))
                 continue;
             firstJoint = uploadJoints();
             if (firstJoint < 0)
                 continue; // out of room (warned)
         }
+        const int firstWeight = morphed ? uploadMorphWeights() : -1; // -1 if out of room: drawn unmorphed
         const glm::mat4& matrix = skinned ? transform : nodeMatrices_[size_t(n)];
         for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
-            if (!skinned && !visible(prim.boundsMin, prim.boundsMax, matrix))
+            if (!skinned && !visible(prim.boundsMin + reachLo, prim.boundsMax + reachHi, matrix))
                 continue; // a rigid part, tested on its own
             const bool blend = prim.material >= 0 &&
                                model.materials()[size_t(prim.material)].alphaMode == AlphaMode::Blend;
+            const glm::vec4* color = prim.material >= 0 && size_t(prim.material) < materialColors.size()
+                                         ? &materialColors[size_t(prim.material)]
+                                         : nullptr;
             if (blend && pass_ == Pass::Shadow) {
                 continue; // see-through parts cast no shadow
             } else if (blend) {
                 // Later, farthest first: see-through parts must go over what's behind them.
                 // (For a skinned part, roughly: where it was before bending.)
                 const glm::vec3 centre = glm::vec3(matrix * glm::vec4((prim.boundsMin + prim.boundsMax) * 0.5f, 1.0f));
-                blended_.push_back({&model, &prim, matrix, glm::length(centre - cameraPosition_), firstJoint});
+                blended_.push_back({&model, &prim, matrix, glm::length(centre - cameraPosition_), firstJoint,
+                                    color ? *color : glm::vec4(1.0f), color != nullptr, firstWeight});
             } else {
-                drawPrimitive(model, prim, matrix, firstJoint, {});
+                drawPrimitive(model, prim, matrix, firstJoint, {}, color, firstWeight);
             }
         }
     }
 }
 
-void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose)
+void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> transforms, const ModelPose* pose,
+                                 std::span<const float> morphWeights)
 {
     if (!model.valid() || transforms.empty() || pass_ == Pass::SkippedShadow)
         return;
@@ -688,14 +770,15 @@ void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> 
             const ModelNode& node = model.node(n);
             if (node.mesh < 0)
                 continue;
-            glm::vec3 min, max;
+            glm::vec3 min, max, reachLo, reachHi;
+            morphReach(model, node, nodeMorphWeights(model, node, morphWeights), reachLo, reachHi);
             if (node.skin >= 0 && model.skinVertices().valid()) {
                 model.jointMatrices(node.skin, modelSpace_, joints_);
-                if (model.skinBounds(node.skin, joints_, min, max))
+                if (model.skinBounds(node.skin, joints_, min, max, reachLo, reachHi))
                     growBounds(lo, hi, min, max, glm::mat4(1.0f));
             } else {
                 for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives)
-                    growBounds(lo, hi, prim.boundsMin, prim.boundsMax, modelSpace_[size_t(n)]);
+                    growBounds(lo, hi, prim.boundsMin + reachLo, prim.boundsMax + reachHi, modelSpace_[size_t(n)]);
             }
         }
         if (lo.x <= hi.x)
@@ -720,6 +803,8 @@ void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> 
             if (firstJoint < 0)
                 continue; // out of room (warned)
         }
+        // Shared by every copy, like the pose.
+        const int firstWeight = nodeMorphWeights(model, node, morphWeights) ? uploadMorphWeights() : -1;
         const glm::mat4 matrix = skinned ? glm::mat4(1.0f) : modelSpace_[size_t(n)];
         for (const ModelPrimitive& prim : model.meshes()[size_t(node.mesh)].primitives) {
             const bool blend = prim.material >= 0 &&
@@ -733,17 +818,17 @@ void MeshRenderer::drawInstanced(const Model& model, std::span<const glm::mat4> 
                 for (const glm::mat4& t : shown) {
                     const glm::mat4 m = t * matrix;
                     blended_.push_back({&model, &prim, m, glm::length(glm::vec3(m * centre) - cameraPosition_),
-                                        firstJoint});
+                                        firstJoint, glm::vec4(1.0f), false, firstWeight});
                 }
             } else {
-                drawPrimitive(model, prim, matrix, firstJoint, copies);
+                drawPrimitive(model, prim, matrix, firstJoint, copies, nullptr, firstWeight);
             }
         }
     }
 }
 
 void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim, const glm::mat4& matrix,
-                                 int firstJoint, const Instances& copies)
+                                 int firstJoint, const Instances& copies, const glm::vec4* color, int firstWeight)
 {
     static const ModelMaterial plain = [] {
         ModelMaterial m;
@@ -757,7 +842,9 @@ void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim,
     usePipeline(skinned);
     const gfx::Texture* normalMap =
         normalMaps_ && pass_ != Pass::Shadow ? model.texture(mat.normalTexture) : nullptr;
-    bindTextures(model.texture(mat.baseColorTexture), model.texture(mat.emissiveTexture), normalMap);
+    const bool morphed = firstWeight >= 0 && prim.morphTargets > 0;
+    bindTextures(model.texture(mat.baseColorTexture), model.texture(mat.emissiveTexture), normalMap,
+                 morphed ? &model.morphDeltas() : nullptr);
     if (boundGeometry_ != &model.geometry()) {
         model.geometry().bind(cmd_);
         boundGeometry_ = &model.geometry();
@@ -771,10 +858,16 @@ void MeshRenderer::drawPrimitive(const Model& model, const ModelPrimitive& prim,
 
     PushConstants pc;
     pc.model = matrix;
-    pc.color = mat.baseColor; // glTF colours are already linear
+    pc.color = color ? *color : mat.baseColor; // glTF colours are already linear
     pc.emissive = glm::vec4(mat.emissive, mat.alphaMode == AlphaMode::Mask ? mat.alphaCutoff : 0.0f);
     pc.material = glm::vec4(mat.roughness, mat.metallic, mat.unlit ? 1.0f : 0.0f, skinned ? float(firstJoint) : 0.0f);
-    pc.surface = glm::vec4(normalMap ? mat.normalScale : 0.0f, 0.0f, 0.0f, 0.0f);
+    // Morph targets: the shader finds vertex v's offsets (v = gl_VertexIndex, which counts
+    // from the start of the model's vertices) at base + v * targets, so base is shifted
+    // back by this part's vertexOffset.
+    const int32_t targets = morphed ? int32_t(prim.morphTargets) : 0;
+    const int32_t base = morphed ? int32_t(prim.morphFirst) - prim.vertexOffset * targets : 0;
+    pc.surface = glm::vec4(normalMap ? mat.normalScale : 0.0f, intBits(morphed ? firstWeight : 0), intBits(targets),
+                           intBits(base));
     vkCmdPushConstants(cmd_, active_->layout(), kPushStages, 0, sizeof(pc), &pc);
 
     drawCopies(model.geometry(), &prim, copies, mat.doubleSided, glm::determinant(glm::mat3(matrix)) < 0.0f);
@@ -794,7 +887,8 @@ void MeshRenderer::end()
             frontFace_ = VK_FRONT_FACE_MAX_ENUM;
         }
         for (const BlendedDraw& d : blended_)
-            drawPrimitive(*d.model, *d.primitive, d.matrix, d.firstJoint, {});
+            drawPrimitive(*d.model, *d.primitive, d.matrix, d.firstJoint, {}, d.hasColor ? &d.color : nullptr,
+                          d.firstWeight);
         blended_.clear();
     }
     pass_ = Pass::None;

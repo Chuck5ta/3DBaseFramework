@@ -31,6 +31,15 @@
 // bends smoothly. The bones are nodes like any other, so animations, poses and sockets
 // work the same way, and MeshRenderer bends the mesh on the GPU as it draws it.
 //
+// Morph targets (Blender: shape keys) change a mesh's shape by blending in offsets:
+// "Smile", "Muscle", "Belly". Each has a weight, usually 0..1. A model numbers all of
+// its weights in one list (per node, in node order); draw it with your own weights:
+//
+//   const int belly = body_.findMorphTarget("Belly");          // once (-1 + warning if missing)
+//   std::vector<float> weights = body_.defaultMorphWeights();   // one per copy on screen
+//   weights[belly] = 0.7f;
+//   meshes.draw(body_, transform, &pose, {}, weights);           // MeshRenderer blends them on the GPU
+//
 // Units are metres and +Y is up. A model's front faces +Z (Blender's -Y after export).
 
 #include "gfx/Texture.h"
@@ -95,12 +104,30 @@ struct ModelPrimitive {
     int32_t vertexOffset = 0;
     int material = -1; // -1 = plain white
     bool skinned = false; // has joints and weights (in ModelData::skinVertices)
-    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // before any skinning
+    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f}; // before any skinning or morphing
+    // Morph targets: 0, or the mesh's target count. The offsets of the part's vertex v
+    // (counted from vertexOffset) for target t are ModelData::morphDeltas[morphFirst + v *
+    // morphTargets + t]: each vertex's offsets together.
+    uint32_t morphTargets = 0;
+    uint32_t morphFirst = 0;
 };
+
+// How far one morph target moves one vertex (glTF POSITION and NORMAL target data), at
+// weight 1. Added to the vertex times the weight, before skinning.
+struct MorphDelta {
+    glm::vec3 position{0.0f};
+    glm::vec3 normal{0.0f};
+};
+static_assert(sizeof(MorphDelta) == 24, "matches the shaders' morph.glsl (6 floats)");
 
 struct ModelMesh {
     std::string name;
     std::vector<ModelPrimitive> primitives;
+    // Morph targets (Blender: shape keys), the same for every part of the mesh.
+    std::vector<std::string> targetNames;  // Blender's shape key names ("target N" if the file has none)
+    std::vector<float> defaultWeights;     // glTF mesh.weights (zeros if none), one per target
+    // Per target: the box around its offsets at weight 1 (for bounds and culling).
+    std::vector<glm::vec3> targetMin, targetMax;
 };
 
 // Which joints move a vertex of a skinned mesh, and how much (glTF JOINTS_0 / WEIGHTS_0).
@@ -133,6 +160,9 @@ struct ModelNode {
     int mesh = -1;   // -1 = an empty (a pivot or group)
     int skin = -1;   // >= 0: the mesh is bent by this skin (and the node's own transform is ignored)
     NodeTransform transform;
+    // Morph targets of its mesh: where its weights start in the model's weight list
+    // (Model::defaultMorphWeights), or -1 if the mesh has none. As many as the mesh has targets.
+    int firstMorphWeight = -1;
 };
 
 class ModelPose;
@@ -169,6 +199,9 @@ struct ModelAnimation {
 struct ModelData {
     std::vector<Vertex> vertices;
     std::vector<SkinVertex> skinVertices; // empty, or one per vertex if anything is skinned
+    std::vector<MorphDelta> morphDeltas;  // the morph targets' offsets (see ModelPrimitive)
+    std::vector<float> morphWeights;      // the model's weight list, at the file's defaults
+                                          // (node.weights, else mesh.weights, else 0)
     std::vector<uint32_t> indices;
     std::vector<ModelMesh> meshes;
     std::vector<ModelMaterial> materials;
@@ -226,6 +259,18 @@ public:
     const std::vector<ModelMesh>& meshes() const { return meshes_; }
     const std::vector<ModelSkin>& skins() const { return skins_; }
 
+    // Morph targets (shape keys). All the model's weights in one list: each node with a
+    // morphed mesh has its run of them, from node(i).firstMorphWeight, in its mesh's target
+    // order. Draw with your own list (MeshRenderer::draw); missing entries use the defaults.
+    int morphWeightCount() const { return int(defaultMorphWeights_.size()); }
+    const std::vector<float>& defaultMorphWeights() const { return defaultMorphWeights_; }
+    // The index in the weight list of the first target with this name (any node), or of
+    // that node's target; -1 (and one warning) if there's none.
+    int findMorphTarget(std::string_view name) const;
+    int findMorphTarget(int node, std::string_view name) const;
+    // The name of the target a weight belongs to ("" if out of range).
+    const std::string& morphTargetName(int weight) const;
+
     // The model's size in its default pose (metres): for placing it on the ground,
     // scaling it to fit, or collision.
     glm::vec3 boundsMin() const { return boundsMin_; }
@@ -244,13 +289,20 @@ public:
     void nodeMatrices(const glm::mat4& transform, const ModelPose* pose, std::vector<glm::mat4>& out) const;
     // The joint vertex data (an invalid buffer if nothing is skinned).
     const gfx::Buffer& skinVertices() const { return skinVertices_; }
+    // The morph targets' offsets, as a storage buffer (an invalid buffer if none).
+    const gfx::Buffer& morphDeltas() const { return morphDeltas_; }
+    // The box a mesh's morph targets can add to its vertices at these weights (the node's
+    // run in the weight list; missing weights count as 0): grow a box by it.
+    void morphReach(int mesh, const float* weights, size_t count, glm::vec3& lo, glm::vec3& hi) const;
     // For each joint of a skin: the matrix taking a bind-pose vertex to where that joint
     // has moved it, in model space, given the node matrices from nodeMatrices() with an
     // identity transform.
     void jointMatrices(int skin, const std::vector<glm::mat4>& nodeMatrices, std::vector<glm::mat4>& out) const;
     // The box around everything a skin bends, as `joints` (from jointMatrices) bend it, in
-    // model space: for frustum culling. False if the skin moves no vertex.
-    bool skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max) const;
+    // model space: for frustum culling. False if the skin moves no vertex. Morphed meshes:
+    // pass the reach of their targets (morphReach), which grows every joint's box first.
+    bool skinBounds(int skin, const std::vector<glm::mat4>& joints, glm::vec3& min, glm::vec3& max,
+                    const glm::vec3& morphLo = glm::vec3(0.0f), const glm::vec3& morphHi = glm::vec3(0.0f)) const;
 
 private:
     // For each skin, for each of its joints: the box around the vertices it moves at all,
@@ -262,6 +314,9 @@ private:
     std::vector<std::vector<JointBounds>> jointBounds_;
     Mesh geometry_;
     gfx::Buffer skinVertices_;
+    gfx::Buffer morphDeltas_;
+    std::vector<float> defaultMorphWeights_;
+    std::vector<int> morphWeightNode_; // for each weight: its node
     std::vector<gfx::Texture> textures_;
     std::vector<ModelMaterial> materials_;
     std::vector<ModelMesh> meshes_;
@@ -272,6 +327,7 @@ private:
     std::string name_;
     mutable std::set<std::string, std::less<>> warned_;           // missing node names reported
     mutable std::set<std::string, std::less<>> warnedAnimations_; // missing animation names reported
+    mutable std::set<std::string, std::less<>> warnedTargets_;    // missing morph target names reported
 };
 
 } // namespace render3d

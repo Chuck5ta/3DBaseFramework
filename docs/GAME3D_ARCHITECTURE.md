@@ -123,6 +123,7 @@ shaders/                      GLSL sources (compiled to SPIR-V at build time)
   common.glsl                 shared uniform / push-constant declarations (include)
   instance.glsl               instancing: the instance matrix buffer (include, every vertex shader)
   tangents.glsl               normal maps: the tangent frame (include, mesh.vert and mesh_skinned.vert)
+  morph.glsl                  morph targets (shape keys): weights and offsets (include, every mesh vertex shader)
   mesh.vert, mesh.frag        the mesh shaders (mesh.frag also reads the shadow map)
   shadow.vert, shadow.frag    the shadow pass: depth from the sun (alpha-masked parts cut out)
   skin.glsl                   skinning: joints, weights and the joint matrix buffer (include)
@@ -391,7 +392,7 @@ images, or one `.glb`), parsed with cgltf.
   animated nodes' values at a time into a pose and leaves the others alone. The
   duration is the last keyframe's time. `findAnimation(name)` returns -1 and warns once,
   listing the model's animations. Shape key (morph weight) channels are skipped with a
-  warning.
+  warning (the game sets weights when drawing; see Morph targets below).
 - **Skins** (`ModelSkin`: Blender's armature): a list of joint nodes and an inverse bind
   matrix for each (identity if the file has none). A node with a mesh and a skin has
   `skin >= 0`; its primitives carry `JOINTS_0` (any integer type) and `WEIGHTS_0` (float or
@@ -421,8 +422,23 @@ images, or one `.glb`), parsed with cgltf.
   checked against Blender's own tangents in Khronos' NormalTangentMirrorTest: identical).
   Vertices that need two tangents are copied, with their joints and weights. Parts
   without a normal map get no tangents (and no extra vertices).
+- **Morph targets** (Blender's shape keys; §6.10): each primitive's `POSITION` and `NORMAL`
+  target offsets (sparse accessors too) go into `ModelData::morphDeltas` (`MorphDelta {
+  vec3 position; vec3 normal; }`, 24 bytes), each vertex's targets side by side; a
+  primitive records where its run starts (`morphFirst`) and how many targets it has
+  (`morphTargets`). Vertices the loader makes (flat-shading corners, copies for split
+  tangents) get the offsets of the file vertex they came from. A mesh keeps its targets'
+  names (`targetNames`, from Blender's `extras.targetNames`; "target N" otherwise), its
+  default weights (`mesh.weights`) and, per target, the box its offsets span (for bounds
+  and culling). **Weights** are numbered model-wide: each node with a morphed mesh owns
+  a run of `ModelData::morphWeights` from `ModelNode::firstMorphWeight`, at the node's own
+  `weights` if it has them, else the mesh's (glTF's rule). `Model::defaultMorphWeights()`,
+  `morphWeightCount()`, `findMorphTarget(name)` / `findMorphTarget(node, name)` (-1 and one
+  warning listing the names), `morphTargetName(i)`. Tangent offsets are ignored (one
+  warning); the default bounds use the default weights.
 - **Not supported** (warned about, the rest still loads): metallic-roughness and
-  occlusion textures, morph targets, cameras, lights, KTX2/WebP images. Files that *require* Draco or meshopt compression are refused with a message
+  occlusion textures, morph target animations and tangent offsets, cameras, lights,
+  KTX2/WebP images. Files that *require* Draco or meshopt compression are refused with a message
   saying how to export without it.
 - Bounds (`boundsMin/Max`, `size`, `center`) are of the default pose, in model units;
   skinned meshes are bent into the default pose on the CPU (at load) to measure them.
@@ -540,7 +556,9 @@ sequenceDiagram
 shadows from the sun, GPU skinning and instancing (details in §6). API:
 `MeshRenderer(gpu, renderer, shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384)`,
 `begin(frame, camera, lighting)`, `draw(mesh, modelMatrix, material)`,
-`draw(model, transform, pose = nullptr)`, `end()`, `setWireframe(bool)`, `drawCalls()`;
+`draw(model, transform, pose = nullptr)`, `draw(model, transform, pose, materialColors)`
+(one linear RGBA per material, replacing its base colour: one model in many colour schemes;
+a shorter or empty span keeps the file's colours), `end()`, `setWireframe(bool)`, `drawCalls()`;
 for shadows `beginShadows(frame, camera, lighting)` / `endShadows()` around the same
 `draw()` calls in `onPreRender`, `shadowDrawCalls()`, `shadowMapSize()`,
 `shadowTexelSize()`; for skinning `jointsUsed()` / `maxJoints()`. Skinned models need no
@@ -551,8 +569,12 @@ part (§6.7); `instancesUsed()` / `maxInstances()`. Frustum culling is on by def
 `setFrustumCulling(bool)`, `setCullingFrozen(bool)` (keep the frustums of that moment, to
 look at them from outside), `culled()` / `shadowCulled()` (parts and copies left out),
 `triangles()` / `shadowTriangles()`. Normal maps (§6.9): `Material::normalTexture` /
-`normalScale`, or a model's own; `setNormalMaps(bool)` switches them all off to compare. It
-needs a depth buffer, and says so at start-up if there isn't one.
+`normalScale`, or a model's own; `setNormalMaps(bool)` switches them all off to compare.
+Morph targets (§6.10): `draw(model, transform, pose, materialColors, morphWeights)` and
+`drawInstanced(model, transforms, pose, morphWeights)`, one weight per entry of
+`model.defaultMorphWeights()` (an empty or shorter span keeps the file's weights for the
+rest); `morphWeightsUsed()` / `maxMorphWeights()` (the constructor's sixth argument, 65536).
+It needs a depth buffer, and says so at start-up if there isn't one.
 
 - `Material { texture, color, emissive, emissiveStrength, emissiveTexture, normalTexture,
   normalScale, roughness, metallic, doubleSided, castShadows }`: textures may be `nullptr`
@@ -886,13 +908,13 @@ resources with it), `imageIndex`, `frameNumber` and `extent`.
 ```mermaid
 flowchart LR
     subgraph perFrame["Per frame (once in begin)"]
-        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map;<br/>the joint and instance matrix buffers"]
+        ubo["Set 0: FrameUniforms UBO<br/>view, projection, viewProjection,<br/>camera position, sun, sky/ground ambient, fog,<br/>shadow matrix + settings; the shadow map;<br/>the joint and instance matrix buffers;<br/>the morph weights"]
     end
-    subgraph perMaterial["Per texture change"]
-        tex["Set 1: base colour + emission + normal map<br/>(three combined image samplers)"]
+    subgraph perMaterial["Per texture (or morphed model) change"]
+        tex["Set 1: base colour + emission + normal map<br/>(three combined image samplers)<br/>+ the model's morph offsets (storage buffer)"]
     end
     subgraph perObject["Per draw (push constants, 128 bytes)"]
-        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit, first joint<br/>vec4 normal map strength"]
+        pc["mat4 model<br/>vec4 colour (linear)<br/>vec4 emissive + alpha cutoff<br/>vec4 roughness, metallic, unlit, first joint<br/>vec4 normal map strength, first weight,<br/>target count, offset base"]
     end
     ubo --> sh["mesh.vert / mesh.frag"]
     tex --> sh
@@ -905,19 +927,22 @@ flowchart LR
 | Set 0, binding 1 (comparison sampler, fragment) | the shadow map | never (one image, rewritten by each shadow pass) |
 | Set 0, binding 2 (storage buffer, vertex) | joint matrices of the skinned models drawn this frame (`maxJoints` × 64 bytes) | appended to by each skinned draw, in that frame's own buffer |
 | Set 0, binding 3 (storage buffer, vertex) | instance matrices (`maxInstances` × 64 bytes); entry 0 is the identity, for single draws | appended to by each `drawInstanced`, in that frame's own buffer |
+| Set 0, binding 4 (storage buffer, vertex) | morph target weights of the morphed nodes drawn this frame (`maxMorphWeights` floats) | appended to by each morphed draw, in that frame's own buffer |
 | Set 1, bindings 0, 1 and 2 (samplers, fragment) | base colour, emission and normal textures | when any of them changes between draws |
-| Push constants (vertex + fragment) | model matrix (instanced: the part's matrix within the model), colour, emissive + alpha cutoff, roughness/metallic/unlit, first joint matrix (skinned), normal map strength (0 = none) | every draw |
+| Set 1, binding 3 (storage buffer, vertex) | the model's morph offsets (`Model::morphDeltas()`), or a tiny empty buffer for everything else | when a morphed model's part is drawn after something else |
+| Push constants (vertex + fragment) | model matrix (instanced: the part's matrix within the model), colour, emissive + alpha cutoff, roughness/metallic/unlit, first joint matrix (skinned), normal map strength (0 = none), morph targets: first weight, target count (0 = none), offset base (integers, bit for bit) | every draw |
 | Vertex binding 1 (skinned only) | the model's `SkinVertex`es: joints and weights | when the skinned model drawn changes |
 | Dynamic state | cull mode, front face | when a draw needs different culling (double-sided material, mirrored node) |
 
 - The push-constant block is **128 bytes**, exactly the size every Vulkan GPU must
   support, so it works everywhere without querying limits. A `static_assert` protects it.
-  It's full: the next per-draw value has to share a `vec4` (three floats of `surface` are
-  free) or move to a buffer.
+  It's full, to the last float (morph targets took `surface.yzw`): the next per-draw value
+  has to move to a buffer (like the joints and weights, found by an index already pushed).
 - The **normal matrix** (`transpose(inverse(mat3(model)))`) is computed in the vertex
   shader, so normals stay correct under non-uniform scaling and the push constants have
   room for material values.
-- **Set 1** holds three textures (base colour, emission, normal), so it can't be the
+- **Set 1** holds three textures (base colour, emission, normal) and the drawn model's
+  morph offsets, so it can't be the
   texture's own set: sets are allocated from a **per-frame pool** that is reset when that
   frame comes round again, with a small cache so each combination gets one set per frame. No set
   outlives its textures.
@@ -1265,7 +1290,58 @@ flowchart LR
   `tools/make_crate_normal.py` from the crate texture's layout): bevelled frame and brace,
   grooves between the planks, a little grain.
 
-### 6.10 Text
+### 6.10 Morph targets
+
+Blender's shape keys, glTF's morph targets: each one moves every vertex of a mesh by its own
+offset (and turns its normal a little). A weight per target says how much of it to add, so
+sliders can change a body's shape ("Belly" 0.7, "Shoulders" 0.3) or a face's expression. It
+happens before skinning, in the mesh's own space, as glTF specifies, in both passes.
+
+```mermaid
+flowchart LR
+    file["glTF targets<br/>POSITION + NORMAL offsets"] --> load["loadModelData<br/>each vertex's targets together;<br/>made vertices copy their source's"]
+    load --> deltas["Model::morphDeltas()<br/>storage buffer (set 1, binding 3)"]
+    game["the game's weights<br/>(one list per model)"] --> up["draw(..., morphWeights)<br/>a node's weights, if any isn't 0"]
+    up --> wbuf["frame's weight buffer<br/>(set 0, binding 4)"]
+    deltas --> vs["vertex shader (morph.glsl)<br/>p += Σ w·dp, n += Σ w·dn<br/>then skinning, instancing"]
+    wbuf --> vs
+    pc["push constants surface.yzw<br/>first weight, count, base"] --> vs
+```
+
+- **Storage.** `MorphDelta { vec3 position; vec3 normal; }` (24 bytes, six floats in the
+  shader), all of a model's in one device-local storage buffer, laid out per vertex: vertex
+  `v`'s offset for target `t` is entry `base + v * count + t`, where `v` is
+  `gl_VertexIndex` (it includes the part's `vertexOffset`, so `base = morphFirst −
+  vertexOffset · count` is pushed). A vertex's targets are side by side, so one vertex's
+  reads are close together.
+- **Per draw.** For each node of a morphed mesh, `draw` picks its weights (the game's, the
+  file's for any missing), and if any isn't 0 writes them into the frame's weight buffer
+  (like joints) and pushes where they start. All 0 (or no targets): the target count pushed
+  is 0 and the shader skips the morph entirely, so unmorphed models cost one branch per
+  vertex. Instanced copies share the weights, like the pose.
+- **Per vertex** (`applyMorphs`), a loop over the targets: a weight of 0 skips its target
+  (the same for every vertex of the draw, so the branch is cheap); the others add six
+  floats each. The normal is renormalised after the normal matrix, as before.
+- **Culling.** At load each target gets the box its offsets span. Per draw the reach of
+  all targets at their weights (each box times its weight; a negative weight flips it) is
+  added to each rigid part's box, or to every joint's box before `skinBounds` bends them:
+  still conservative, so the picture is identical with culling on or off (checked).
+- **Set 1** carries the offsets because it's already per draw and cached per frame: a
+  morphed model's parts get their own sets (textures + its offsets); everything else binds
+  a 24-byte empty buffer there. The vertex stage now reads 4 storage buffers (joints,
+  instances, weights, offsets), exactly the minimum every Vulkan GPU allows
+  (`maxPerStageDescriptorStorageBuffers` ≥ 4).
+- **Not done:** tangent offsets (the tangent frame of a normal-mapped morphed mesh is the
+  unmorphed one; fine for gentle shapes), morph animation channels (weights come from the
+  game), more than one weight list per draw for meshes shared by two nodes in a pose.
+- **Checked** (cloud container, 2026-11-19, lavapipe): Khronos AnimatedMorphCube,
+  MorphPrimitivesTest and MorphStressTest (8 targets, negative weights), a test mesh with
+  split tangents and flat shading, and the MakeHuman body (14,517 + 2,120 vertices, skinned,
+  10 targets) posed with shadows, single and instanced: every picture identical, pixel for
+  pixel, to the same model morphed on the CPU; with all weights 0, identical to the body
+  without targets.
+
+### 6.11 Text
 
 ```mermaid
 flowchart LR
@@ -1412,6 +1488,7 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Add bumps and detail with a normal map | Load it with `TextureDesc::srgb = false` and set `material.normalTexture` (the primitives have tangents; call `generateTangents(data)` on your own `MeshData`). From Blender, an image through a *Normal Map* node into the material's *Normal* input exports as glTF's normal texture, which `Model` uses (§6.9; tested with Khronos' sample files, not yet with a Blender export of yours) |
 | Draw many copies (trees, rocks, crowds) | `meshes.drawInstanced(model, matrices)` or `drawInstanced(mesh, matrices, material)`: one draw call per part for all of them (§6.7); a bigger `maxInstances` for more than ~8000 copies with shadows |
 | Skip work for things off screen | `render3d::Frustum(camera.viewProjection()).intersects(boundsMin, boundsMax, matrix)`, as `MeshRenderer` does for drawing (§6.8). For very large worlds, cull groups of objects (a grid of cells) before testing each one |
+| Shape sliders (body shape, faces) | Shape keys in Blender, exported with glTF *Data > Shape Keys* on (the default); `findMorphTarget("Belly")` once, then pass a weight list (from `defaultMorphWeights()`) to `draw` (§6.10) |
 | Draw something whose vertex shader moves vertices (wind, waves) | Make its mesh's box big enough for the movement, or culling may leave it out while part of it is on screen |
 | Add a new renderer (skybox, particles) | New class in `render3d/` following `MeshRenderer`: own `Pipeline` with `renderer.depthFormat()`, per-frame buffers indexed by `frame.frameIndex` |
 | Sharper or further shadows | Change `shadows.distance` and the constructor's `shadowMapSize`; for both at once, cascades: several maps for near-to-far slices of the view, fitted like `fitShadowMap` |
@@ -1438,7 +1515,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 | Frustum culling inside `MeshRenderer`, per part and per copy, against each pass's own frustum | Every game gets it with no code; the shadow pass culls against the shadow map, so off-screen casters still cast; the instance buffer only holds visible copies; the picture is identical with it off | The CPU visits every object every pass (no hierarchy or grid); boxes, not tighter shapes; a vertex shader that moves vertices beyond the mesh's box would be culled too early |
 | Instancing through a per-frame matrix buffer and `gl_InstanceIndex`, entry 0 the identity | No extra pipelines or vertex formats: the same four vertex shaders serve single and instanced draws, skinned or not, in both passes; the game passes plain matrices | Copies share material and pose (no per-copy colour yet); every single draw pays one matrix read per vertex; matrices are re-uploaded each pass even when they never change |
 | Normal matrix computed in the vertex shader | Frees push-constant space for material values; correct under non-uniform scale | An `inverse()` per vertex (cheap for game-sized meshes) |
-| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | No morph targets yet; whole model in memory |
+| glTF 2.0 via cgltf, one `Mesh` per model | The format Blender and asset stores export; cgltf is one small header; one vertex/index buffer per model means few binds | Whole model in memory |
+| Morph targets on the GPU: offsets in a per-model storage buffer, weights per draw in a per-frame buffer, applied in the vertex shaders before skinning | No per-draw copies of the mesh; the same eight pipelines and vertex formats; skinning, instancing and shadows work with it unchanged; weights belong to the draw, so one `Model` shows many body shapes at once | Every vertex shader branches on the count (cheap); weights are re-uploaded each pass; tangent offsets ignored; the push constants are now completely full |
 | Tangents in every `Vertex`, by MikkTSpace, the frame rebuilt the MikkTSpace way in the shaders | Normal maps baked in Blender (or any MikkTSpace baker, such as CharacterCreator's) line up with no seams; one vertex format for every mesh; mirrored UVs and mirrored copies work | 16 more bytes per vertex even for meshes without a normal map; vertices copied where tangents split; the push constants are now full |
 | Per-instance `ModelPose` instead of mutable nodes | One loaded model, many copies each in its own pose (rotors at different angles); the `Model` stays read-only | The game keeps a pose per copy |
 | Rigid-part animation (node TRS) first, skinning on top | Covers mechanical models and characters built from parts (the owner's mix-and-match style); bones are nodes too, so skinning reuses the same poses, animator and sockets | — |
@@ -1467,8 +1545,8 @@ automatically. `*.glsl` files in the folder are treated as includes and trigger 
 
 ## 13. Known limitations and roadmap
 
-- Models: no morph targets, occlusion/metallic-roughness textures, KTX2/WebP images or
-  Draco/meshopt compression yet. Normal maps use the first UV map only; no parallax or
+- Models: no occlusion/metallic-roughness textures, KTX2/WebP images or Draco/meshopt
+  compression yet; morph targets without tangent offsets or weight animations. Normal maps use the first UV map only; no parallax or
   detail maps. Skinning is linear blend, 4 joints per vertex.
   One animation plays at a time per animator (plus blends); layering (legs walking, arms
   firing) is up to the game, by combining two poses.

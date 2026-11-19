@@ -14,7 +14,7 @@ a demo scene showing how they fit together.
 | Settings & saves | The player's settings (fullscreen, vsync, volumes, mute, rebound controls) remembered automatically; JSON save files with crash-safe writes, in the player's own folder (Steam Cloud friendly) | nlohmann/json |
 | GPU | Instance/device setup, swapchain, frames in flight, buffers, textures, pipelines | Vulkan 1.3 via volk + VMA |
 | 3D | Meshes + primitives (cube, plane, sphere), perspective camera, third-person follow camera (orbit, zoom, over-the-shoulder, keeps out of walls), ray tests (plane, sphere, box), sun + hemisphere ambient + fog lighting, normal maps (MikkTSpace tangents, so Blender bakes line up), soft sun shadows (a stable shadow map around the camera), instancing (hundreds of copies in one draw call), frustum culling (what the camera or the sun can't see isn't drawn), wireframe | your code, MikkTSpace |
-| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, normal-mapped, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; skinned meshes bent on the GPU (4 bones per vertex); named parts posed in code (spinning rotors, turrets) | cgltf |
+| Models | glTF 2.0 (`.glb`/`.gltf`, e.g. exported from Blender): textured, emissive, normal-mapped, alpha-masked and see-through materials; Blender animations played with blending, moments (`reached`) and sockets for attaching models; skinned meshes bent on the GPU (4 bones per vertex); shape keys (morph targets) blended on the GPU with weights per draw, for sliders; named parts posed in code (spinning rotors, turrets) | cgltf |
 | HUD & text | 2D overlay (sprites, rectangles) and TrueType text on top of the 3D scene | stb_truetype |
 | Audio | 3D positional sound with Doppler, sound effects, streamed music with crossfades, mixer, mute; effects: reverb, low-pass (per bus or per sound), high-pass, echo | miniaudio |
 | Debug UI | In-game tool windows (Debug builds): frame graph, GPU info, volumes, your own sliders and buttons | Dear ImGui |
@@ -127,11 +127,12 @@ src/
   render3d/
     Mesh                vertex/index buffers + primitives::cube/plane/sphere
     Tangents            generateTangents: MikkTSpace tangents for normal maps
-    Model               glTF 2.0 models: parts, materials, textures, poses, animations, skins
+    Model               glTF 2.0 models: parts, materials, textures, poses, animations, skins,
+                        shape keys (morph targets)
     ModelAnimator       plays a model's animations (blending, looping, moments)
     MeshRenderer        lit textured meshes and models (frame UBO, per-object push constants),
-                        sun shadows (a shadow pass in onPreRender), GPU skinning, normal maps,
-                        instancing, frustum culling
+                        sun shadows (a shadow pass in onPreRender), GPU skinning, morph targets,
+                        normal maps, instancing, frustum culling
     Camera3D            perspective camera (yaw/pitch, Vulkan clip conventions)
     Frustum             the six planes of a view: is a box or sphere in it?
     ThirdPersonCamera   follows a character: orbit, zoom, shoulder offset, collision
@@ -221,6 +222,14 @@ Tips
 - Skinned characters (one mesh bending at the joints): parent the mesh to an armature
   *With Automatic Weights* in Blender and export glTF with *Skinning* on. Load, animate and
   draw them exactly like rigid ones; the renderer bends them. Tutorial step 16.
+- One model in many colours (team colours, a character creator's outfits): pass one
+  linear colour per material, `meshes_->draw(model_, transform, &pose, colors)`; they
+  replace the materials' base colours for that draw.
+- Shape sliders (body shape, facial expressions): make shape keys in Blender (exported
+  as glTF morph targets), find one with `model_.findMorphTarget("Belly")`, keep a weight
+  list per character (`std::vector<float> w = model_.defaultMorphWeights()`, then
+  `w[belly] = 0.7f`) and draw with `meshes_->draw(model_, transform, &pose, {}, w)`. The
+  GPU blends them before skinning, shadows included.
 - Many copies of the same thing (trees, rocks, crates): put a matrix per copy in a
   `std::vector<glm::mat4>` and call `meshes_->drawInstanced(model_, matrices)` (or
   `drawInstanced(mesh, matrices, material)`): one draw call per part for all of them.

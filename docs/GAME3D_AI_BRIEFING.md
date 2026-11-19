@@ -1,5 +1,9 @@
 # Game3D — AI briefing
 
+> **All projects:** how this project fits with the owner's other projects, and which
+> briefings go in which Claude Project, is in `PROJECTS_AI_BRIEFING.md`
+> (`F:\Pojects\Claude\`, uploaded to every Claude Project).
+
 > **For the AI assistant.** This file is attached at the start of every chat about a game
 > built on the Game3D framework. It is the working summary of the framework: what
 > exists, how to use it correctly, the conventions, and how this user likes to work.
@@ -7,7 +11,7 @@
 > (design and internals), `docs/TUTORIAL.md` (the demo built step by step) or
 > `docs/BUILDING.md` (Windows, Linux, Steam Deck builds).
 >
-> Framework state: **2026-11-17**. If the user's copy of the framework is older or newer,
+> Framework state: **2026-11-19**. If the user's copy of the framework is older or newer,
 > trust the source code over this file.
 
 ## 1. What it is
@@ -47,7 +51,7 @@ src/
   debugui/              DebugUI (Dear ImGui)
   game/                 DemoGame (the example); your game goes here
 shaders/                mesh.vert/.frag, shadow.vert/.frag, mesh_skinned.vert, shadow_skinned.vert, skin.glsl,
-                        instance.glsl, tangents.glsl, common.glsl, sprite.vert/.frag, imgui.frag
+                        instance.glsl, tangents.glsl, morph.glsl, common.glsl, sprite.vert/.frag, imgui.frag
 assets/                 fonts/ (Roboto), models/ (drone, gunner, soldier, rifle, tree .glb), sounds/, textures/ (crate + its normal map) (copied next to the exe)
 cmake/                  Dependencies.cmake, Shaders.cmake
 tools/                  make_drone.py, make_gunner.py, make_tree.py (+ gltf_builder.py), make_gunner_sounds.py,
@@ -410,20 +414,30 @@ maps, xyz along +u, w = ±1, all zero = none; 64 bytes) + `indices` (uint32). Pr
 segments, rings)`, all with tangents. For your own `MeshData` with a normal map, call
 `render3d::generateTangents(data)` (`render3d/Tangents.h`) before making the `Mesh`.
 
-**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384)`,
+**`render3d::MeshRenderer`** (`MeshRenderer(app.gpu(), app.renderer(), shadowMapSize = 2048, maxJoints = 8192, maxInstances = 16384, maxMorphWeights = 65536)`,
 needs `config.renderer.depthBuffer = true`):
 `begin(frame, camera, lighting)` → `draw(mesh, modelMatrix, Material)` and/or
 `draw(model, transform, &pose)` × n → `end()` (see-through model parts are drawn in `end()`,
 farthest first). It stops with a message if the renderer has no depth buffer.
+`draw(model, transform, pose, std::span<const glm::vec4> materialColors)` replaces the
+model's base colours: one **linear** RGBA per material, in `model.materials()` order (a
+shorter or empty span keeps the file's colours for the rest; see-through parts keep their
+override when sorted). One `Model`, many colour schemes: CharacterCreator's recoloured
+parts, team colours. It came from CharacterCreator (2026-11-17).
+`draw(model, transform, pose, materialColors, std::span<const float> morphWeights)` and
+`drawInstanced(model, matrices, pose, morphWeights)` set the model's **morph target (shape
+key) weights** for that draw (see Morph targets below).
 `Material{texture, color (sRGB tint), emissive (sRGB glow), emissiveStrength,
 emissiveTexture, normalTexture, normalScale = 1, roughness = 0.5, metallic = 0, doubleSided,
 castShadows = true}` (load a normal map with `TextureDesc::srgb = false`).
 `setNormalMaps(bool)` / `normalMaps()` (all normal maps on/off, to compare), `setWireframe(bool)`, `wireframe()`, `wireframeSupported()`, `drawCalls()`,
 `shadowDrawCalls()`, `shadowMapSize()`, `shadowTexelSize()` (metres), `jointsUsed()`,
-`maxJoints()`, `instancesUsed()`, `maxInstances()`, `triangles()`, `shadowTriangles()`.
+`maxJoints()`, `instancesUsed()`, `maxInstances()`, `morphWeightsUsed()`,
+`maxMorphWeights()`, `triangles()`, `shadowTriangles()`.
 Per-object data travels
 as push constants (one draw call per object or model part); the block is 128 bytes, the
-guaranteed maximum, and full (three floats of `surface` are spare). Build model matrices with
+guaranteed maximum, and **completely full** (morph targets took `surface.yzw`, as integers
+bit for bit): a new per-draw value must go in a buffer, found by an index already pushed. Build model matrices with
 `glm::translate/rotate/scale` (`<glm/gtc/matrix_transform.hpp>`).
 
 **Instancing** — many copies of one mesh or model in one draw call per part:
@@ -540,12 +554,50 @@ meshes.draw(drone_, transform, &pose_);       // pose optional (nullptr = as exp
   (`ModelMaterial::normalTexture`, `normalScale`), metallic and roughness factors, alpha
   modes (opaque, mask + cutoff, blend), double-sided, `KHR_materials_unlit`; per-texture
   filter and per-axis wrap. Ignored with a logged warning: metallic-roughness and
-  occlusion textures, morph targets, cameras, lights.
+  occlusion textures, morph target animations and tangent offsets, cameras, lights.
 - Normal-mapped parts get tangents at load: the file's `TANGENT`, or MikkTSpace
   (`generateTangents`, with UV v flipped to count up as Blender does; verified identical
   to Blender's tangents on Khronos' NormalTangentMirrorTest, 2026-11-17). Vertices needing
   two tangents are copied (with their skin data). Textures used as normal maps are
   uploaded linear.
+- **Morph targets (shape keys)**, added 2026-11-19 for CharacterCreator's body sliders
+  (built here first, then copied there):
+  - Loaded: each primitive's `POSITION` and `NORMAL` target offsets (sparse too) into
+    `ModelData::morphDeltas` (`MorphDelta{vec3 position; vec3 normal}`, 24 B), each vertex's
+    targets side by side; `ModelPrimitive::morphTargets` (count) and `morphFirst`. Vertices
+    the loader makes (flat-shading corners, tangent-split copies) take their source
+    vertex's offsets. `ModelMesh::targetNames` (Blender's `extras.targetNames`, else
+    "target N"), `defaultWeights` (`mesh.weights`), `targetMin/Max` (each target's offset box).
+  - **Weights are numbered model-wide**: each node with a morphed mesh owns a run from
+    `ModelNode::firstMorphWeight` (in its mesh's target order), at the node's `weights`,
+    else the mesh's, else 0. `model.defaultMorphWeights()`, `morphWeightCount()`,
+    `findMorphTarget("Belly")` / `findMorphTarget(node, name)` (-1 + one warning listing the
+    names), `morphTargetName(i)`. Bounds of the default pose include the default weights.
+  - Drawing: keep a `std::vector<float>` per character (start from
+    `defaultMorphWeights()`), set entries, pass it as `morphWeights` (empty or shorter span =
+    file weights for the rest). Weights live in the draw, not the `ModelPose` (the animator
+    rebuilds poses each update), so one `Model` shows many body shapes at once.
+  - GPU: per morphed node with any weight ≠ 0, its weights go into the frame's weight buffer
+    (set 0 binding 4, `maxMorphWeights` floats, reset with the joints; both passes append;
+    overflow draws unmorphed with one warning); the model's offsets are a storage buffer in
+    set 1 binding 3 (a 24-byte empty buffer for everything else); push constants
+    `surface.y/z/w` = first weight, target count (0 = off), base (`morphFirst −
+    vertexOffset·count`; the shader indexes `base + gl_VertexIndex·count + t`).
+    `morph.glsl`'s `applyMorphs` adds `Σ w·offset` to position and normal **before
+    skinning and instancing**, in all four vertex shaders (shadows too). Weight-0 targets
+    are skipped (uniform branch). The vertex stage now uses exactly 4 storage buffers, the
+    Vulkan minimum limit.
+  - Culling: per draw each target's box × its weight (negative flips) is added to rigid
+    parts' boxes and to every joint box (`skinBounds(..., morphLo, morphHi)`): identical
+    picture with culling on or off.
+  - Not done: tangent offsets (normal-mapped morphed meshes keep the unmorphed tangent
+    frame), weight animation channels, per-copy weights in `drawInstanced`.
+  - Checked 2026-11-19 (cloud container, lavapipe, validation on): Khronos
+    AnimatedMorphCube, MorphPrimitivesTest, MorphStressTest (negative weights), a split-
+    tangent/flat-shaded test mesh, and CharacterCreator's MakeHuman body (14,517-vertex
+    skin + eyes, 56 bones) with 10 test targets, posed, shadowed, single and instanced:
+    every picture pixel-identical to the same model morphed on the CPU; all-zero weights
+    identical to the body without targets. Not yet built in Visual Studio.
 - `render3d::loadModelData(path, data, &error)` loads into `ModelData` on the CPU only
   (tools and tests), returning false with a reason instead of stopping.
 - One `Model` in memory can be drawn many times with different transforms and poses.
@@ -903,19 +955,28 @@ fadeInSeconds, fadeOutPreviousSeconds = 1})` (crossfades from the current track)
   feature is added, update `README.md`, `docs/GAME3D_ARCHITECTURE.md`, `docs/BUILDING.md` if
   relevant, the tutorial, **and this briefing**.
 
-## 13. Known limitations (as of 2026-11-17)
+## 13. Known limitations (as of 2026-11-19)
 
 **Roadmap (the owner's order):** model animation, third-person camera, shadows and
 skinned characters are all done (skinning 2026-11-15), and so are instancing (2026-11-15)
 and frustum culling and normal maps (2026-11-17; normal maps asked for by the
-CharacterCreator project, stage 2 of its bake plan). Nothing is queued; ask the owner. Candidates:
+CharacterCreator project, stage 2 of its bake plan). The owner built and ran instancing,
+frustum culling and normal maps in Visual Studio 2022 with a clean log (2026-11-15 and
+2026-11-17). The colour-override `draw()` was added after that (2026-11-17) and copied,
+with the rest of `render3d/` and the shaders, into CharacterCreator; the owner built and
+ran both projects with it in Visual Studio 2022 the same day: all fine. **Next (decided 2026-11-19): Wild West Frontier** is to be made in Game3D, starting as
+soon as the owner can (the Unreal Engine 5 version is paused); `docs/WILD_WEST_FRONTIER_IN_GAME3D.md`
+lists what it needs and a suggested order. Morph targets for CharacterCreator's body
+sliders were built here on 2026-11-19 and copied into CharacterCreator (tested in the cloud
+container; not yet built in Visual Studio). Other candidates:
 upper-body animation layering (walk + fire), shadow cascades, gamepad polish for the Steam Deck (the owner gets one late
 November 2026). The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters
 can be mixed and matched from the same pieces.
 
-- Models: no morph targets, occlusion/metallic-roughness textures, KTX2/WebP images or
-  Draco/meshopt compression (refused with a message). Normal maps: first UV map only, no
+- Models: no occlusion/metallic-roughness textures, KTX2/WebP images or Draco/meshopt
+  compression (refused with a message); morph targets without tangent offsets or weight
+  animations. Normal maps: first UV map only, no
   parallax. Skinning is linear blend,
   4 joints per vertex. One animation per animator at a time (plus cross-fades); no
   per-body-part layering; no animation events beyond `reached(time)`.
