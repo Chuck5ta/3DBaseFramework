@@ -592,12 +592,17 @@ meshes.draw(drone_, transform, &pose_);       // pose optional (nullptr = as exp
     picture with culling on or off.
   - Not done: tangent offsets (normal-mapped morphed meshes keep the unmorphed tangent
     frame), weight animation channels, per-copy weights in `drawInstanced`.
+  - Writing them from Python: `tools/gltf_builder.py` (identical in CharacterCreator) takes
+    `Mesh.targets` (one (position offsets, normal offsets) pair per key, per vertex) and
+    `Builder.mesh(name, parts, target_names=[...], extras={...})`; every part of a mesh needs
+    the same key count. CharacterCreator's MakeHuman bodies have 13 keys (2026-11-19).
   - Checked 2026-11-19 (cloud container, lavapipe, validation on): Khronos
     AnimatedMorphCube, MorphPrimitivesTest, MorphStressTest (negative weights), a split-
     tangent/flat-shaded test mesh, and CharacterCreator's MakeHuman body (14,517-vertex
     skin + eyes, 56 bones) with 10 test targets, posed, shadowed, single and instanced:
     every picture pixel-identical to the same model morphed on the CPU; all-zero weights
-    identical to the body without targets. Not yet built in Visual Studio.
+    identical to the body without targets. The owner built and ran it in Visual Studio 2022
+    the same day: all fine.
 - `render3d::loadModelData(path, data, &error)` loads into `ModelData` on the CPU only
   (tools and tests), returning false with a reason instead of stopping.
 - One `Model` in memory can be drawn many times with different transforms and poses.
@@ -967,8 +972,8 @@ with the rest of `render3d/` and the shaders, into CharacterCreator; the owner b
 ran both projects with it in Visual Studio 2022 the same day: all fine. **Next (decided 2026-11-19): Wild West Frontier** is to be made in Game3D, starting as
 soon as the owner can (the Unreal Engine 5 version is paused); `docs/WILD_WEST_FRONTIER_IN_GAME3D.md`
 lists what it needs and a suggested order. Morph targets for CharacterCreator's body
-sliders were built here on 2026-11-19 and copied into CharacterCreator (tested in the cloud
-container; not yet built in Visual Studio). Other candidates:
+sliders were built here on 2026-11-19 and copied into CharacterCreator (the owner built and
+ran it in Visual Studio 2022 the same day: all fine). Other candidates:
 upper-body animation layering (walk + fire), shadow cascades, gamepad polish for the Steam Deck (the owner gets one late
 November 2026). The 3D "Drone Invaders" will have a soldier gunner on the
 gun turret (Load and Fire animations), built from swappable parts so other characters

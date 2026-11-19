@@ -13,6 +13,10 @@ in a node hierarchy, add keyframed animations, and write one .glb:
 Skinned meshes too: give a Mesh per-vertex joints and weights, add a skin (its joints
 and their bind pose) with Builder.skin, and put the mesh on a node with skin=.
 
+Shape keys (glTF morph targets) too: append (position offsets, normal offsets) to a Mesh's
+`targets`, one offset per vertex each, and name them with Builder.mesh(...,
+target_names=[...]). Every part of a mesh needs the same number of targets.
+
 Units are metres, +Y is up and the front faces +Z (the framework's conventions).
 Rotations are quaternions as (x, y, z, w), as glTF stores them.
 """
@@ -89,6 +93,8 @@ class Mesh:
         # For skinned meshes: per vertex, up to four joints (indices into the skin's joint
         # list) and how much each moves the vertex (weights adding up to 1).
         self.joints, self.weights = [], []
+        # Shape keys: [(position offsets, normal offsets), ...], each one per vertex.
+        self.targets = []
 
     def skinned(self):
         return len(self.joints) == len(self.pos) and len(self.pos) > 0
@@ -171,9 +177,11 @@ class Builder:
         self.materials.append(m)
         return len(self.materials) - 1
 
-    def mesh(self, name, parts):
-        """parts: [(Mesh, material index), ...]. Returns the mesh's index."""
-        self.meshes.append((name, parts))
+    def mesh(self, name, parts, target_names=None, extras=None):
+        """parts: [(Mesh, material index), ...]. target_names: the shape keys' names (written
+        as extras.targetNames, as Blender does); extras: more for the mesh's extras.
+        Returns the mesh's index."""
+        self.meshes.append((name, parts, list(target_names or []), dict(extras or {})))
         return len(self.meshes) - 1
 
     def node(self, name, parent=None, mesh=None, translation=(0, 0, 0), rotation=QUAT_IDENTITY, skin=None):
@@ -228,8 +236,11 @@ class Builder:
             return len(accessors) - 1
 
         gl_meshes = []
-        for name, parts in self.meshes:
+        for name, parts, target_names, extras in self.meshes:
             prims = []
+            counts = {len(m.targets) for m, _ in parts}
+            if len(counts) > 1:
+                raise ValueError('mesh %s: its parts have different numbers of shape keys' % name)
             for m, mat in parts:
                 attributes = dict(POSITION=add_floats(m.pos, 3, 34962, bounds=True),
                                   NORMAL=add_floats(m.nrm, 3, 34962),
@@ -237,8 +248,21 @@ class Builder:
                 if m.skinned():
                     attributes['JOINTS_0'] = add_joints(m.joints)
                     attributes['WEIGHTS_0'] = add_floats(m.weights, 4, 34962)
-                prims.append(dict(attributes=attributes, indices=add_indices(m.idx), material=mat))
-            gl_meshes.append(dict(name=name, primitives=prims))
+                prim = dict(attributes=attributes, indices=add_indices(m.idx), material=mat)
+                if m.targets:
+                    # POSITION offsets need their bounds (glTF requires them)
+                    prim['targets'] = [dict(POSITION=add_floats(dp, 3, 34962, bounds=True),
+                                            NORMAL=add_floats(dn, 3, 34962)) for dp, dn in m.targets]
+                prims.append(prim)
+            g = dict(name=name, primitives=prims)
+            targets = counts.pop() if counts else 0
+            if targets:
+                g['weights'] = [0.0] * targets
+                extras = dict(extras)
+                extras['targetNames'] = (target_names + ['target %d' % i for i in range(len(target_names), targets)])[:targets]
+            if extras:
+                g['extras'] = extras
+            gl_meshes.append(g)
 
         gl_nodes = []
         for i, n in enumerate(self.nodes):
@@ -283,7 +307,7 @@ class Builder:
         glb += struct.pack('<II', len(js), 0x4E4F534A) + js + struct.pack('<II', len(blob), 0x004E4942) + bytes(blob)
         with open(path, 'wb') as f:
             f.write(glb)
-        tris = sum(len(m.idx) // 3 for _, parts in self.meshes for m, _ in parts)
+        tris = sum(len(m.idx) // 3 for _, parts, _, _ in self.meshes for m, _ in parts)
         print('wrote %s: %d bytes, %d triangles, %d nodes, %d animations%s'
               % (path, len(glb), tris, len(self.nodes), len(self.animations),
                  ', %d joints' % sum(len(j) for _, j, _ in self.skins) if self.skins else ''))
